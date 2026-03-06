@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use arrow_array::RecordBatch;
@@ -1140,12 +1139,9 @@ async fn cmd_load(
     mode: LoadModeArg,
     json: bool,
 ) -> Result<()> {
-    let data_src = std::fs::read_to_string(data_path)
-        .wrap_err_with(|| format!("failed to read data: {}", data_path.display()))?;
-
     let db = Database::open(db_path).await?;
 
-    if let Err(err) = db.load_with_mode(&data_src, mode.into()).await {
+    if let Err(err) = db.load_file_with_mode(data_path, mode.into()).await {
         render_load_error(db_path, &err, json);
         return Err(err.into());
     }

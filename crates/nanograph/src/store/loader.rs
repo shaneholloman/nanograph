@@ -1,3 +1,4 @@
+use std::io::{BufRead, Cursor};
 use std::path::Path;
 
 use crate::catalog::schema_ir::SchemaIR;
@@ -12,7 +13,7 @@ mod jsonl;
 mod merge;
 
 pub(crate) use jsonl::{
-    json_values_to_array, load_jsonl_data, load_jsonl_data_with_name_seed, parse_date32_literal,
+    json_values_to_array, load_jsonl_reader_with_name_seed_at_path, parse_date32_literal,
     parse_date64_literal,
 };
 
@@ -30,6 +31,17 @@ pub(crate) async fn build_next_storage_for_load(
     data_source: &str,
     mode: LoadMode,
 ) -> Result<GraphStorage> {
+    let reader = Cursor::new(data_source.as_bytes());
+    build_next_storage_for_load_reader(db_path, existing, schema_ir, reader, mode).await
+}
+
+pub(crate) async fn build_next_storage_for_load_reader<R: BufRead>(
+    db_path: &Path,
+    existing: &GraphStorage,
+    schema_ir: &SchemaIR,
+    reader: R,
+    mode: LoadMode,
+) -> Result<GraphStorage> {
     let annotations = constraints::load_node_constraint_annotations(schema_ir)?;
     let key_props = annotations.key_props;
     if mode == LoadMode::Merge && key_props.is_empty() {
@@ -37,38 +49,43 @@ pub(crate) async fn build_next_storage_for_load(
             "load mode 'merge' requires at least one node @key property in schema".to_string(),
         ));
     }
-    let materialized_data = if embeddings::has_embedding_specs(schema_ir) {
-        embeddings::materialize_embeddings_for_load(db_path, schema_ir, data_source).await?
-    } else {
-        data_source.to_string()
-    };
 
     let mut incoming_storage = GraphStorage::new(existing.catalog.clone());
     if matches!(mode, LoadMode::Merge | LoadMode::Append) {
         incoming_storage.set_next_node_id(existing.next_node_id());
     }
-    match mode {
-        LoadMode::Overwrite => {
-            load_jsonl_data(&mut incoming_storage, &materialized_data, &key_props)?;
-        }
-        LoadMode::Merge => {
-            let key_seed = constraints::build_name_seed_for_keyed_load(existing, &key_props)?;
-            load_jsonl_data_with_name_seed(
-                &mut incoming_storage,
-                &materialized_data,
-                &key_props,
-                Some(&key_seed),
-            )?;
-        }
-        LoadMode::Append => {
-            let key_seed = constraints::build_name_seed_for_append(existing, &key_props)?;
-            load_jsonl_data_with_name_seed(
-                &mut incoming_storage,
-                &materialized_data,
-                &key_props,
-                Some(&key_seed),
-            )?;
-        }
+    let key_seed = match mode {
+        LoadMode::Overwrite => None,
+        LoadMode::Merge => Some(constraints::build_name_seed_for_keyed_load(
+            existing, &key_props,
+        )?),
+        LoadMode::Append => Some(constraints::build_name_seed_for_append(
+            existing, &key_props,
+        )?),
+    };
+
+    if embeddings::has_embedding_specs(schema_ir) {
+        let materialized_path =
+            embeddings::materialize_embeddings_for_load_to_tempfile(db_path, schema_ir, reader)
+                .await?;
+        let file = std::fs::File::open(&materialized_path)?;
+        let buffered = std::io::BufReader::new(file);
+        load_jsonl_reader_with_name_seed_at_path(
+            &mut incoming_storage,
+            db_path,
+            buffered,
+            &key_props,
+            key_seed.as_ref(),
+        )?;
+        let _ = std::fs::remove_file(materialized_path);
+    } else {
+        load_jsonl_reader_with_name_seed_at_path(
+            &mut incoming_storage,
+            db_path,
+            reader,
+            &key_props,
+            key_seed.as_ref(),
+        )?;
     }
 
     let mut next_storage = match mode {

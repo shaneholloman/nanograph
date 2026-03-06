@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::io::BufReader;
+use std::path::Path;
 
 use arrow_array::RecordBatch;
 use lance::dataset::WriteMode;
@@ -13,7 +15,9 @@ use crate::store::lance_io::{
     run_lance_delete_by_ids, run_lance_merge_insert_with_key, write_lance_batch,
     write_lance_batch_with_mode,
 };
-use crate::store::loader::{build_next_storage_for_load, json_values_to_array};
+use crate::store::loader::{
+    build_next_storage_for_load, build_next_storage_for_load_reader, json_values_to_array,
+};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::txlog::{CdcLogEntry, commit_manifest_and_logs};
 
@@ -43,6 +47,27 @@ impl Database {
             .await
     }
 
+    /// Load JSONL data from a file using compatibility defaults.
+    pub async fn load_file(&self, data_path: &Path) -> Result<()> {
+        let mode = if self
+            .schema_ir
+            .node_types()
+            .any(|node| node.properties.iter().any(|prop| prop.key))
+        {
+            LoadMode::Merge
+        } else {
+            LoadMode::Overwrite
+        };
+        self.load_file_with_mode(data_path, mode).await
+    }
+
+    /// Load JSONL data from a file using explicit semantics.
+    pub async fn load_file_with_mode(&self, data_path: &Path, mode: LoadMode) -> Result<()> {
+        let mut writer = self.lock_writer().await;
+        self.load_file_with_mode_locked(data_path, mode, &mut writer)
+            .await
+    }
+
     async fn load_with_mode_locked(
         &self,
         data_source: &str,
@@ -58,6 +83,26 @@ impl Database {
             node_types = storage.node_segments.len(),
             edge_types = storage.edge_segments.len(),
             "database load complete"
+        );
+
+        Ok(())
+    }
+
+    async fn load_file_with_mode_locked(
+        &self,
+        data_path: &Path,
+        mode: LoadMode,
+        writer: &mut DatabaseWriteGuard<'_>,
+    ) -> Result<()> {
+        info!(data_path = %data_path.display(), "starting database file load");
+        self.apply_mutation_plan_locked(MutationPlan::for_load_file(data_path, mode), writer)
+            .await?;
+        let storage = self.snapshot();
+        info!(
+            mode = ?mode,
+            node_types = storage.node_segments.len(),
+            edge_types = storage.edge_segments.len(),
+            "database file load complete"
         );
 
         Ok(())
@@ -115,12 +160,24 @@ impl Database {
         } = plan;
         let previous_storage = self.snapshot();
         let mut next_storage = match source {
-            MutationSource::Load { mode, data_source } => {
+            MutationSource::LoadString { mode, data_source } => {
                 build_next_storage_for_load(
                     &self.path,
                     previous_storage.as_ref(),
                     &self.schema_ir,
                     &data_source,
+                    mode,
+                )
+                .await?
+            }
+            MutationSource::LoadFile { mode, data_path } => {
+                let file = std::fs::File::open(&data_path)?;
+                let reader = BufReader::new(file);
+                build_next_storage_for_load_reader(
+                    &self.path,
+                    previous_storage.as_ref(),
+                    &self.schema_ir,
+                    reader,
                     mode,
                 )
                 .await?

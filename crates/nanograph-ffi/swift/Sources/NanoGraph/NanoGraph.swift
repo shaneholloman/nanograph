@@ -12,6 +12,25 @@ public enum NanoGraphError: Error, LocalizedError {
     }
 }
 
+public func decodeArrow(_ data: Data) throws -> Any {
+    guard !data.isEmpty else {
+        throw NanoGraphError.message("Arrow IPC payload is empty")
+    }
+
+    let ptr = data.withUnsafeBytes { rawBuffer -> UnsafeMutablePointer<CChar>? in
+        guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+            return nil
+        }
+        return nanograph_arrow_to_json(base, UInt(rawBuffer.count))
+    }
+    return try decodeOwnedJSONString(ptr)
+}
+
+public func decodeArrow<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    let raw = try decodeArrow(data)
+    return try decodeValue(type, from: raw)
+}
+
 public enum LoadMode: String {
     case overwrite
     case append
@@ -58,6 +77,16 @@ public final class Database {
         return Database(handle: handle)
     }
 
+    public static func openInMemory(schemaSource: String) throws -> Database {
+        let handle = schemaSource.withCString { schemaPtr in
+            nanograph_db_open_in_memory(schemaPtr)
+        }
+        guard let handle else {
+            throw NanoGraphError.message(Self.lastErrorMessage())
+        }
+        return Database(handle: handle)
+    }
+
     public func close() throws {
         try lock.withLock {
             guard let handle else {
@@ -78,6 +107,20 @@ public final class Database {
             let status = dataSource.withCString { dataPtr in
                 mode.rawValue.withCString { modePtr in
                     nanograph_db_load(handle, dataPtr, modePtr)
+                }
+            }
+            if status != 0 {
+                throw NanoGraphError.message(Self.lastErrorMessage())
+            }
+        }
+    }
+
+    public func loadFile(dataPath: String, mode: LoadMode) throws {
+        try lock.withLock {
+            let handle = try requireHandleLocked()
+            let status = dataPath.withCString { dataPathPtr in
+                mode.rawValue.withCString { modePtr in
+                    nanograph_db_load_file(handle, dataPathPtr, modePtr)
                 }
             }
             if status != 0 {
@@ -115,6 +158,28 @@ public final class Database {
                 nanograph_db_check(handle, querySourcePtr)
             }
             return try decodeOwnedJSONString(ptr)
+        }
+    }
+
+    public func runArrow(
+        querySource: String,
+        queryName: String,
+        params: Any? = nil
+    ) throws -> Data {
+        let paramsJSON = try encodeJSON(params)
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let bytes = querySource.withCString { querySourcePtr in
+                queryName.withCString { queryNamePtr in
+                    if let paramsJSON {
+                        return paramsJSON.withCString { paramsPtr in
+                            nanograph_db_run_arrow(handle, querySourcePtr, queryNamePtr, paramsPtr)
+                        }
+                    }
+                    return nanograph_db_run_arrow(handle, querySourcePtr, queryNamePtr, nil)
+                }
+            }
+            return try decodeOwnedBytes(bytes)
         }
     }
 
@@ -164,6 +229,17 @@ public final class Database {
         }
     }
 
+    public func isInMemory() throws -> Bool {
+        try lock.withLock {
+            let handle = try requireHandleLocked()
+            let status = nanograph_db_is_in_memory(handle)
+            if status == -1 {
+                throw NanoGraphError.message(Self.lastErrorMessage())
+            }
+            return status != 0
+        }
+    }
+
     public func run<T: Decodable>(
         _ type: T.Type,
         querySource: String,
@@ -208,6 +284,16 @@ public final class Database {
         let json = String(cString: ptr)
         return try decodeJSON(json)
     }
+
+    private func decodeOwnedBytes(_ bytes: NanoGraphBytes) throws -> Data {
+        guard let ptr = bytes.ptr else {
+            throw NanoGraphError.message(Self.lastErrorMessage())
+        }
+        defer {
+            nanograph_bytes_free(bytes)
+        }
+        return Data(bytes: ptr, count: Int(bytes.len))
+    }
 }
 
 private func encodeJSON(_ value: Any?) throws -> String? {
@@ -229,7 +315,25 @@ private func decodeJSON(_ json: String) throws -> Any {
     return try JSONSerialization.jsonObject(with: data, options: [])
 }
 
+private func decodeOwnedJSONString(_ ptr: UnsafeMutablePointer<CChar>?) throws -> Any {
+    guard let ptr else {
+        throw NanoGraphError.message(lastErrorMessage())
+    }
+    defer {
+        nanograph_string_free(ptr)
+    }
+    let json = String(cString: ptr)
+    return try decodeJSON(json)
+}
+
 private func decodeValue<T: Decodable>(_ type: T.Type, from value: Any) throws -> T {
     let data = try JSONSerialization.data(withJSONObject: value, options: [])
     return try JSONDecoder().decode(type, from: data)
+}
+
+private func lastErrorMessage() -> String {
+    guard let errPtr = nanograph_last_error_message() else {
+        return "Unknown NanoGraph FFI error"
+    }
+    return String(cString: errPtr)
 }

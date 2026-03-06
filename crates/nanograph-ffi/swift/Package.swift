@@ -25,8 +25,16 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("nanograph_ffi"),
                 // Package root is crates/nanograph-ffi/swift
-                .unsafeFlags(["-L", "../../../target/release"]),
-                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "../../../target/release"]),
+                .unsafeFlags(["-L", "../../../target/debug"], .when(configuration: .debug)),
+                .unsafeFlags(
+                    ["-Xlinker", "-rpath", "-Xlinker", "../../../target/debug"],
+                    .when(configuration: .debug)
+                ),
+                .unsafeFlags(["-L", "../../../target/release"], .when(configuration: .release)),
+                .unsafeFlags(
+                    ["-Xlinker", "-rpath", "-Xlinker", "../../../target/release"],
+                    .when(configuration: .release)
+                ),
             ]
         ),
         .testTarget(

@@ -13,3 +13,4 @@ crate-type = ["cdylib", "staticlib"]
 nanograph = { path = "../nanograph", version = "0.8.1" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+arrow-ipc = { workspace = true }

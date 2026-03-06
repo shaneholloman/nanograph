@@ -1,12 +1,17 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
+use std::io::Cursor;
+use std::mem;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use std::slice;
 use std::sync::{Mutex, OnceLock, RwLock};
 
+use arrow_ipc::reader::StreamReader;
 use tokio::runtime::Runtime;
 
 use nanograph::error::NanoError;
+use nanograph::json_output::record_batches_to_rust_json_rows;
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::store::database::{CleanupOptions, CompactOptions, Database, LoadMode};
@@ -16,6 +21,21 @@ type FfiResult<T> = std::result::Result<T, String>;
 
 const STATUS_OK: c_int = 0;
 const STATUS_ERR: c_int = -1;
+
+#[repr(C)]
+pub struct NanoGraphBytes {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+impl NanoGraphBytes {
+    const fn empty() -> Self {
+        Self {
+            ptr: ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
 
 thread_local! {
     static LAST_ERROR_CSTR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -74,6 +94,23 @@ fn json_result_to_ptr(result: FfiResult<serde_json::Value>) -> *mut c_char {
         Err(err) => {
             set_last_error(err);
             ptr::null_mut()
+        }
+    }
+}
+
+fn bytes_result_to_buffer(result: FfiResult<Vec<u8>>) -> NanoGraphBytes {
+    match result {
+        Ok(bytes) => {
+            let mut boxed = bytes.into_boxed_slice();
+            let len = boxed.len();
+            let ptr = boxed.as_mut_ptr();
+            mem::forget(boxed);
+            clear_last_error();
+            NanoGraphBytes { ptr, len }
+        }
+        Err(err) => {
+            set_last_error(err);
+            NanoGraphBytes::empty()
         }
     }
 }
@@ -290,6 +327,49 @@ fn run_query_json(
     }
 }
 
+fn run_query_arrow(
+    handle: &NanoGraphHandle,
+    query_source: &str,
+    query_name: &str,
+    params: Option<serde_json::Value>,
+) -> FfiResult<Vec<u8>> {
+    let query = find_named_query(query_source, query_name).map_err(to_ffi_input_err)?;
+    if query.mutation.is_some() {
+        return Err("runArrow only supports read queries; use run() for mutations".to_string());
+    }
+
+    let param_map =
+        json_params_to_param_map(params.as_ref(), &query.params, JsonParamMode::Standard)
+            .map_err(to_ffi_input_err)?;
+    let db = handle.db()?;
+    let prepared = db.prepare_read_query(&query).map_err(to_ffi_err)?;
+    let results = handle
+        .runtime
+        .block_on(prepared.execute(&param_map))
+        .map_err(to_ffi_err)?;
+    results.to_arrow_ipc().map_err(to_ffi_err)
+}
+
+fn arrow_bytes_to_json(data: *const u8, len: usize) -> FfiResult<serde_json::Value> {
+    if data.is_null() {
+        return Err("arrow data must not be null".to_string());
+    }
+    if len == 0 {
+        return Err("arrow data must not be empty".to_string());
+    }
+
+    // SAFETY: caller provides a non-null pointer and explicit length for the Arrow IPC buffer.
+    let bytes = unsafe { slice::from_raw_parts(data, len) };
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|err| format!("invalid Arrow IPC stream: {}", err))?;
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to decode Arrow IPC stream: {}", err))?;
+    Ok(serde_json::Value::Array(record_batches_to_rust_json_rows(
+        &batches,
+    )))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_last_error_message() -> *const c_char {
     let message = match last_error_slot().lock() {
@@ -318,6 +398,18 @@ pub extern "C" fn nanograph_string_free(value: *mut c_char) {
     // SAFETY: pointer must originate from CString::into_raw in this library.
     unsafe {
         let _ = CString::from_raw(value);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_bytes_free(value: NanoGraphBytes) {
+    if value.ptr.is_null() {
+        return;
+    }
+    // SAFETY: pointer and length must originate from Box<[u8]>::into_raw parts in this library.
+    unsafe {
+        let slice = ptr::slice_from_raw_parts_mut(value.ptr, value.len);
+        drop(Box::from_raw(slice));
     }
 }
 
@@ -356,6 +448,32 @@ pub extern "C" fn nanograph_db_open(db_path: *const c_char) -> *mut NanoGraphHan
         let runtime = Runtime::new().map_err(|e| format!("failed to create runtime: {}", e))?;
         let db = runtime
             .block_on(Database::open(db_path.as_ref()))
+            .map_err(to_ffi_err)?;
+        let handle = NanoGraphHandle::with_runtime(runtime, db);
+        Ok(Box::into_raw(Box::new(handle)))
+    })();
+
+    match result {
+        Ok(handle) => {
+            clear_last_error();
+            handle
+        }
+        Err(err) => {
+            set_last_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_db_open_in_memory(
+    schema_source: *const c_char,
+) -> *mut NanoGraphHandle {
+    let result: FfiResult<*mut NanoGraphHandle> = (|| {
+        let schema_source = parse_required_str("schema_source", schema_source)?;
+        let runtime = Runtime::new().map_err(|e| format!("failed to create runtime: {}", e))?;
+        let db = runtime
+            .block_on(Database::open_in_memory(&schema_source))
             .map_err(to_ffi_err)?;
         let handle = NanoGraphHandle::with_runtime(runtime, db);
         Ok(Box::into_raw(Box::new(handle)))
@@ -429,6 +547,38 @@ pub extern "C" fn nanograph_db_load(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nanograph_db_load_file(
+    handle: *mut NanoGraphHandle,
+    data_path: *const c_char,
+    mode: *const c_char,
+) -> c_int {
+    let data_path = match parse_required_str("data_path", data_path) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(err);
+            return STATUS_ERR;
+        }
+    };
+    let mode = match parse_required_str("mode", mode) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(err);
+            return STATUS_ERR;
+        }
+    };
+
+    to_status(with_handle(handle, |handle| {
+        let load_mode = parse_load_mode(&mode)?;
+        let db = handle.db()?;
+        handle
+            .runtime
+            .block_on(db.load_file_with_mode(std::path::Path::new(&data_path), load_mode))
+            .map_err(to_ffi_err)?;
+        Ok(())
+    }))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nanograph_db_run(
     handle: *mut NanoGraphHandle,
     query_source: *const c_char,
@@ -444,6 +594,29 @@ pub extern "C" fn nanograph_db_run(
         })
     })();
     json_result_to_ptr(result)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_db_run_arrow(
+    handle: *mut NanoGraphHandle,
+    query_source: *const c_char,
+    query_name: *const c_char,
+    params_json: *const c_char,
+) -> NanoGraphBytes {
+    let result = (|| {
+        let query_source = parse_required_str("query_source", query_source)?;
+        let query_name = parse_required_str("query_name", query_name)?;
+        let params = parse_optional_json(params_json)?;
+        with_handle(handle, |handle| {
+            run_query_arrow(handle, &query_source, &query_name, params)
+        })
+    })();
+    bytes_result_to_buffer(result)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_arrow_to_json(data: *const u8, len: usize) -> *mut c_char {
+    json_result_to_ptr(arrow_bytes_to_json(data, len))
 }
 
 #[unsafe(no_mangle)]
@@ -594,6 +767,27 @@ pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_ch
         }))
     });
     json_result_to_ptr(result)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_db_is_in_memory(handle: *mut NanoGraphHandle) -> c_int {
+    match with_handle(handle, |handle| {
+        let db = handle.db()?;
+        Ok(db.is_in_memory())
+    }) {
+        Ok(true) => {
+            clear_last_error();
+            1
+        }
+        Ok(false) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err);
+            STATUS_ERR
+        }
+    }
 }
 
 #[cfg(test)]

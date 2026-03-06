@@ -96,9 +96,9 @@ So the intended surface is:
 
 ### Open
 
-- [ ] Phase 3: add `open_in_memory()` on top of the shareable handle design
-- [ ] Phase 4: add streaming ingest / `loadFile`
-- [ ] Phase 5: evaluate JSON vector fast path after streaming ingest
+- [x] Phase 3: add `open_in_memory()` on top of the shareable handle design
+- [x] Phase 4: expose streaming ingest in TS / FFI / CLI after the landed core reader path
+- [x] Phase 5: evaluate JSON vector fast path after streaming ingest
 
 ### Deferred
 
@@ -156,30 +156,41 @@ This landed:
 Current caveat:
 - prepared reads trade persisted-dataset pushdown for snapshot isolation by freezing the in-memory view at prepare time
 
-### 4. `open_in_memory()`
+### 4. Completed: `open_in_memory()`
 
-Implement only the tempdir-backed variant.
+This landed as the tempdir-backed variant:
+- `Database::open_in_memory(schema_source)`
+- TS `Database.openInMemory(schemaSource)` plus `db.isInMemory()`
+- cloned handles keep the temp backing directory alive
+- the temp backing directory is removed when the last shared handle drops
+- `path()` still returns the real backing directory path for the lifetime of the handle
 
-Do not add a second non-Lance storage engine in this phase.
+Still deferred:
+- no pure in-memory backend that bypasses Lance or filesystem metadata
+- no special cross-process / reopen-by-path lifetime coordination for ephemeral databases beyond the owning shared handle
 
-### 5. Streaming ingest for large embedding graphs
+### 5. Completed: streaming ingest for large embedding graphs
 
-This is the main remaining performance fix for large embeddings.
-
-Scope:
+This landed:
 - reader-based loading in core
 - `Database::load_file(...)`
+- CLI `load` now uses the file-based path instead of buffering the payload into a string first
+- FFI `nanograph_db_load_file(...)`
 - TS `loadFile(...)`
-- bounded-memory batching and edge spooling for forward references
-- streaming `@embed` materialization and cache lookup so embedding schemas do not fall back to a whole-buffer rewrite
+- deterministic node / edge spooling with batched node flushes and forward-reference edge resolution
+- streaming `@embed` materialization and cache lookup so embedding schemas no longer fall back to a whole-buffer rewrite during load
 
 Explicitly defer more aggressive embedding pipeline work unless profiling proves the basic streaming transform is still the dominant bottleneck.
 
-### 6. JSON vector fast path
+### 6. Completed: JSON vector fast path evaluation
 
-Only do this after streaming ingest unless profiling shows `run()` JSON serialization is still a material bottleneck for users who cannot use `runArrow()`.
+This landed as a narrow optimization plus a measurement harness:
+- synthetic vector-heavy transport benchmark for `to_sdk_json()` vs Arrow IPC
+- fast path for `FixedSizeList<Float32>` JSON serialization to avoid recursive per-element dispatch
+- `runArrow()` remains the preferred path for large returned vectors
 
-This is an optimization, not a structural prerequisite.
+Current takeaway:
+- JSON is still materially slower for vector-heavy result sets even after the fast path, so the main recommendation does not change: use `runArrow()` when callers can consume columnar output.
 
 ## Acceptance Criteria
 

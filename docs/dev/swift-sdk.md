@@ -18,14 +18,15 @@ Swift Package that embeds NanoGraph via C ABI (`nanograph-ffi`). Same engine as 
 
 ```bash
 # 1. Build the Rust FFI library
-cargo build -p nanograph-ffi --release
+cargo build -p nanograph-ffi
 
-# 2. Build the Swift package
+# 2. Build or test the Swift package
 cd crates/nanograph-ffi/swift
 swift build
+swift test
 ```
 
-Produces `libnanograph_ffi.a` (static) and `libnanograph_ffi.dylib` (dynamic) in `target/release/`.
+The Swift package links `target/debug` for debug/test builds and `target/release` for release builds.
 
 ## Quick start
 
@@ -44,7 +45,7 @@ edge Knows: Person -> Person
 let data = [
     #"{"type":"Person","data":{"name":"Alice","age":30}}"#,
     #"{"type":"Person","data":{"name":"Bob","age":25}}"#,
-    #"{"type":"Knows","data":{"src":"Alice","dst":"Bob"}}"#,
+    #"{"edge":"Knows","from":"Alice","to":"Bob"}"#,
 ].joined(separator: "\n")
 
 let queries = """
@@ -64,7 +65,7 @@ query addPerson($name: String, $age: I32) {
 }
 """
 
-let db = try Database.create(dbPath: "my.nano", schemaSource: schema)
+let db = try Database.openInMemory(schemaSource: schema)
 try db.load(dataSource: data, mode: .overwrite)
 
 // Untyped read
@@ -88,6 +89,10 @@ let result = try db.run(querySource: queries, queryName: "addPerson",
                         params: ["name": "Carol", "age": 28])
 // ["affectedNodes": 1, "affectedEdges": 0]
 
+// Arrow IPC bytes for large read results
+let arrow = try db.runArrow(querySource: queries, queryName: "allPeople")
+let arrowRows = try decodeArrow(arrow) as! [[String: Any]]
+
 try db.close()
 ```
 
@@ -101,6 +106,10 @@ Create a new database from a schema string. Throws on invalid schema.
 
 Open an existing database. Throws if path doesn't exist.
 
+### `Database.openInMemory(schemaSource:)`
+
+Create a tempdir-backed database with automatic cleanup when the handle is released.
+
 ### `db.load(dataSource:mode:)`
 
 Load JSONL data into the database.
@@ -110,6 +119,14 @@ try db.load(dataSource: jsonlString, mode: .overwrite)
 ```
 
 `LoadMode`: `.overwrite`, `.append`, `.merge`.
+
+### `db.loadFile(dataPath:mode:)`
+
+Load JSONL data from a file path using the reader-based streaming ingest path.
+
+```swift
+try db.loadFile(dataPath: "/tmp/data.jsonl", mode: .overwrite)
+```
 
 ### `db.run(querySource:queryName:params:)`
 
@@ -122,6 +139,41 @@ let rows = try db.run(querySource: queries, queryName: "allPeople")
 // With params
 let rows = try db.run(querySource: queries, queryName: "byName", params: ["name": "Alice"])
 ```
+
+### `db.runArrow(querySource:queryName:params:)`
+
+Execute a named read query and return Arrow IPC bytes as `Data`.
+
+```swift
+let arrow = try db.runArrow(querySource: queries, queryName: "allPeople")
+```
+
+Use this for large result sets and vector-heavy reads.
+
+### `decodeArrow(_ data: Data)`
+
+Decode Arrow IPC bytes into Foundation values.
+
+```swift
+let arrow = try db.runArrow(querySource: queries, queryName: "allPeople")
+let rows = try decodeArrow(arrow) as! [[String: Any]]
+```
+
+### `decodeArrow(_:from:)`
+
+Typed decode overload for Arrow IPC bytes.
+
+```swift
+struct PersonRow: Decodable {
+    let name: String
+    let age: Int?
+}
+
+let arrow = try db.runArrow(querySource: queries, queryName: "allPeople")
+let rows = try decodeArrow([PersonRow].self, from: arrow)
+```
+
+This helper is a convenience path back to Swift values. If you need direct columnar Arrow consumption, keep using the raw `Data` payload with your own Arrow reader.
 
 ### `db.run(_:querySource:queryName:params:)`
 
@@ -199,6 +251,10 @@ let report = try db.doctor() as! [String: Any]
 // ["healthy": true, "issues": [], "warnings": [], "datasetsChecked": 2, ...]
 ```
 
+### `db.isInMemory()`
+
+Return `true` when the handle was created with `Database.openInMemory(...)`.
+
 ### `db.close()`
 
 Close the database and release resources. Idempotent — safe to call multiple times. Using the database after close throws `NanoGraphError.message("Database is closed")`.
@@ -220,6 +276,10 @@ do {
 ## Thread safety
 
 `Database` uses `NSLock` internally to serialize all handle operations. Safe to use from multiple threads, but calls are serialized — not concurrent.
+
+## Large embedding workloads
+
+For large graph loads, prefer `loadFile(...)` over building one giant JSONL string in Swift. For large returned vectors, prefer `runArrow(...)` over `run(...)`.
 
 ## Reopening a database
 

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{BooleanArray, RecordBatch};
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument};
 
@@ -170,7 +171,8 @@ struct CdcAnalyticsState {
 
 #[derive(Debug, Clone)]
 enum MutationSource {
-    Load { mode: LoadMode, data_source: String },
+    LoadString { mode: LoadMode, data_source: String },
+    LoadFile { mode: LoadMode, data_path: PathBuf },
     PreparedStorage(GraphStorage),
 }
 
@@ -184,7 +186,7 @@ struct MutationPlan {
 impl MutationPlan {
     fn for_load(data_source: &str, mode: LoadMode) -> Self {
         Self {
-            source: MutationSource::Load {
+            source: MutationSource::LoadString {
                 mode,
                 data_source: data_source.to_string(),
             },
@@ -193,9 +195,20 @@ impl MutationPlan {
         }
     }
 
+    fn for_load_file(data_path: &Path, mode: LoadMode) -> Self {
+        Self {
+            source: MutationSource::LoadFile {
+                mode,
+                data_path: data_path.to_path_buf(),
+            },
+            op_summary: load_mode_op_summary(mode).to_string(),
+            cdc_events: Vec::new(),
+        }
+    }
+
     fn append_mutation(data_source: &str, op_summary: &str) -> Self {
         Self {
-            source: MutationSource::Load {
+            source: MutationSource::LoadString {
                 mode: LoadMode::Append,
                 data_source: data_source.to_string(),
             },
@@ -206,7 +219,7 @@ impl MutationPlan {
 
     fn merge_mutation(data_source: &str, op_summary: &str) -> Self {
         Self {
-            source: MutationSource::Load {
+            source: MutationSource::LoadString {
                 mode: LoadMode::Merge,
                 data_source: data_source.to_string(),
             },
@@ -226,6 +239,7 @@ impl MutationPlan {
 
 pub struct DatabaseShared {
     path: PathBuf,
+    tempdir: Option<TempDir>,
     pub schema_ir: SchemaIR,
     pub catalog: Catalog,
     storage: RwLock<Arc<GraphStorage>>,
@@ -287,6 +301,23 @@ impl Database {
     /// Create a new database directory from schema source text.
     #[instrument(skip(schema_source), fields(db_path = %db_path.display()))]
     pub async fn init(db_path: &Path, schema_source: &str) -> Result<Self> {
+        Self::init_internal(db_path, schema_source, None).await
+    }
+
+    /// Create a new tempdir-backed database that cleans itself up when dropped.
+    pub async fn open_in_memory(schema_source: &str) -> Result<Self> {
+        let tempdir = tempfile::Builder::new()
+            .prefix("nanograph_in_memory_")
+            .tempdir()?;
+        let temp_path = tempdir.path().to_path_buf();
+        Self::init_internal(&temp_path, schema_source, Some(tempdir)).await
+    }
+
+    async fn init_internal(
+        db_path: &Path,
+        schema_source: &str,
+        tempdir: Option<TempDir>,
+    ) -> Result<Self> {
         info!("initializing database");
         // Parse and validate schema
         let schema_file = parse_schema(schema_source)?;
@@ -318,15 +349,13 @@ impl Database {
         let storage = GraphStorage::new(catalog.clone());
         info!("database initialized");
 
-        Ok(Database {
-            inner: Arc::new(DatabaseShared {
-                path: db_path.to_path_buf(),
-                schema_ir,
-                catalog,
-                storage: RwLock::new(Arc::new(storage)),
-                writer: Mutex::new(()),
-            }),
-        })
+        Ok(Self::from_parts(
+            db_path.to_path_buf(),
+            schema_ir,
+            catalog,
+            storage,
+            tempdir,
+        ))
     }
 
     /// Open an existing database.
@@ -411,15 +440,32 @@ impl Database {
             "database open complete"
         );
 
-        Ok(Database {
+        Ok(Self::from_parts(
+            db_path.to_path_buf(),
+            schema_ir,
+            catalog,
+            storage,
+            None,
+        ))
+    }
+
+    fn from_parts(
+        path: PathBuf,
+        schema_ir: SchemaIR,
+        catalog: Catalog,
+        storage: GraphStorage,
+        tempdir: Option<TempDir>,
+    ) -> Self {
+        Database {
             inner: Arc::new(DatabaseShared {
-                path: db_path.to_path_buf(),
+                path,
+                tempdir,
                 schema_ir,
                 catalog,
                 storage: RwLock::new(Arc::new(storage)),
                 writer: Mutex::new(()),
             }),
-        })
+        }
     }
 
     /// Get catalog reference for typechecking.
@@ -433,6 +479,10 @@ impl Database {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn is_in_memory(&self) -> bool {
+        self.tempdir.is_some()
     }
 
     pub(crate) async fn lock_writer(&self) -> DatabaseWriteGuard<'_> {

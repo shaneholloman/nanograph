@@ -363,6 +363,12 @@ fn test_dir(name: &str) -> TempDir {
         .unwrap()
 }
 
+fn write_data_file(dir: &TempDir, name: &str, data: &str) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(&path, data).unwrap();
+    path
+}
+
 #[test]
 fn trim_surrounding_quotes_single_quote_does_not_panic() {
     assert_eq!(trim_surrounding_quotes("'"), "'");
@@ -417,6 +423,32 @@ async fn test_open_fresh_db() {
 }
 
 #[tokio::test]
+async fn test_open_in_memory_loads_and_cleans_up_on_last_drop() {
+    let db = Database::open_in_memory(test_schema_src()).await.unwrap();
+    assert!(db.is_in_memory());
+
+    let db_path = db.path().to_path_buf();
+    assert!(db_path.exists());
+    assert!(db_path.join("schema.pg").exists());
+
+    db.load(test_data_src()).await.unwrap();
+    let storage = db.snapshot();
+    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    assert_eq!(persons.num_rows(), 3);
+
+    let clone = db.clone();
+    drop(db);
+    assert!(db_path.exists());
+
+    let clone_storage = clone.snapshot();
+    let clone_persons = clone_storage.get_all_nodes("Person").unwrap().unwrap();
+    assert_eq!(clone_persons.num_rows(), 3);
+
+    drop(clone);
+    assert!(!db_path.exists());
+}
+
+#[tokio::test]
 async fn test_load_and_reopen_preserves_data() {
     let dir = test_dir("load_reopen");
     let path = dir.path();
@@ -439,6 +471,81 @@ async fn test_load_and_reopen_preserves_data() {
     let knows_seg = &storage2.edge_segments["Knows"];
     assert_eq!(knows_seg.edge_ids.len(), 2);
     assert!(knows_seg.csr.is_some());
+}
+
+#[tokio::test]
+async fn test_load_file_matches_string_load() {
+    let string_dir = test_dir("load_string");
+    let file_dir = test_dir("load_file");
+    let input_dir = test_dir("load_file_input");
+
+    let string_db = Database::init(string_dir.path(), test_schema_src())
+        .await
+        .unwrap();
+    string_db
+        .load_with_mode(test_data_src(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let input_path = write_data_file(&input_dir, "graph.jsonl", test_data_src());
+    let file_db = Database::init(file_dir.path(), test_schema_src())
+        .await
+        .unwrap();
+    file_db
+        .load_file_with_mode(&input_path, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let string_storage = string_db.snapshot();
+    let file_storage = file_db.snapshot();
+
+    let string_persons = string_storage.get_all_nodes("Person").unwrap().unwrap();
+    let file_persons = file_storage.get_all_nodes("Person").unwrap().unwrap();
+    assert_eq!(string_persons, file_persons);
+
+    let string_companies = string_storage.get_all_nodes("Company").unwrap().unwrap();
+    let file_companies = file_storage.get_all_nodes("Company").unwrap().unwrap();
+    assert_eq!(string_companies, file_companies);
+
+    assert_eq!(
+        string_storage.edge_segments["Knows"].src_ids,
+        file_storage.edge_segments["Knows"].src_ids
+    );
+    assert_eq!(
+        string_storage.edge_segments["Knows"].dst_ids,
+        file_storage.edge_segments["Knows"].dst_ids
+    );
+    assert_eq!(
+        string_storage.edge_segments["WorksAt"].src_ids,
+        file_storage.edge_segments["WorksAt"].src_ids
+    );
+    assert_eq!(
+        string_storage.edge_segments["WorksAt"].dst_ids,
+        file_storage.edge_segments["WorksAt"].dst_ids
+    );
+}
+
+#[tokio::test]
+async fn test_load_file_handles_forward_reference_edges() {
+    let dir = test_dir("load_file_forward_refs");
+    let input_dir = test_dir("load_file_forward_refs_input");
+    let path = dir.path();
+    let data = r#"{"edge": "Knows", "from": "Alice", "to": "Bob"}
+{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Person", "data": {"name": "Bob", "age": 25}}
+"#;
+
+    let input_path = write_data_file(&input_dir, "forward_refs.jsonl", data);
+    let db = Database::init(path, keyed_schema_src()).await.unwrap();
+    db.load_file_with_mode(&input_path, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let storage = db.snapshot();
+    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    assert_eq!(persons.num_rows(), 2);
+    let knows = &storage.edge_segments["Knows"];
+    assert_eq!(knows.edge_ids.len(), 1);
 }
 
 #[tokio::test]

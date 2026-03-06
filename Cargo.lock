@@ -3819,6 +3819,7 @@ dependencies = [
 name = "nanograph-ffi"
 version = "0.8.1"
 dependencies = [
+ "arrow-ipc",
  "nanograph",
  "serde_json",
  "tokio",

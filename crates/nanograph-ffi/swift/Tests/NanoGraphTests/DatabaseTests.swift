@@ -44,12 +44,50 @@ final class DatabaseTests: XCTestCase {
       match { $p: Person { role: $role } }
       return { $p.name as name }
     }
+
+    query addPerson($name: String, $age: I32) {
+      insert Person { name: $name, age: $age }
+    }
+    """
+
+    private let searchSchema = """
+    node Signal {
+      slug: String @key
+      summary: String
+      embedding: Vector(3) @index
+    }
+    """
+
+    private let searchData = [
+        #"{"type":"Signal","data":{"slug":"sig-billing-delay","summary":"billing reconciliation delay due to missing invoice data","embedding":[1.0,0.0,0.0]}}"#,
+        #"{"type":"Signal","data":{"slug":"sig-referral-analytics","summary":"warm referral for analytics migration project","embedding":[0.0,1.0,0.0]}}"#,
+        #"{"type":"Signal","data":{"slug":"sig-procurement","summary":"enterprise procurement questionnaire backlog and mitigation owner tracking","embedding":[0.0,0.0,1.0]}}"#,
+    ].joined(separator: "\n")
+
+    private let searchQueries = """
+    query keyword($q: String) {
+      match {
+        $s: Signal
+        search($s.summary, $q)
+      }
+      return { $s.slug as slug }
+      order { $s.slug asc }
+    }
+
+    query nearest_q($vq: Vector(3)) {
+      match { $s: Signal }
+      return { $s.slug as slug, nearest($s.embedding, $vq) as score }
+      order { nearest($s.embedding, $vq) }
+      limit 3
+    }
     """
 
     func testInitLoadRunAndTypedDecode() throws {
         let (db, dbPath) = try freshDatabase()
         defer { cleanup(dbPath: dbPath) }
         defer { try? db.close() }
+
+        XCTAssertFalse(try db.isInMemory())
 
         let raw = try db.run(querySource: queries, queryName: "allPeople")
         let rows = try castRows(raw)
@@ -63,6 +101,19 @@ final class DatabaseTests: XCTestCase {
         let typedRows = try db.run([PersonRow].self, querySource: queries, queryName: "allPeople")
         XCTAssertEqual(typedRows.map(\.name), ["Alice", "Bob"])
         XCTAssertEqual(typedRows.map(\.age), [30, 25])
+    }
+
+    func testOpenInMemoryLoadsAndQueries() throws {
+        let db = try Database.openInMemory(schemaSource: schema)
+        defer { try? db.close() }
+
+        XCTAssertTrue(try db.isInMemory())
+        try db.load(dataSource: data, mode: .overwrite)
+
+        let raw = try db.run(querySource: queries, queryName: "allPeople")
+        let rows = try castRows(raw)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.compactMap { $0["name"] as? String }, ["Alice", "Bob"])
     }
 
     func testErrorDescriptionExposesMessage() {
@@ -144,6 +195,23 @@ final class DatabaseTests: XCTestCase {
         }
     }
 
+    func testLoadFileMatchesStringLoad() throws {
+        let dbPath = tempPath(prefix: "nanograph-swift-load-file")
+        let db = try Database.create(dbPath: dbPath, schemaSource: schema)
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        let dataPath = tempPath(prefix: "nanograph-swift-data")
+        defer { cleanup(dbPath: dataPath) }
+        try data.write(toFile: dataPath, atomically: true, encoding: .utf8)
+
+        try db.loadFile(dataPath: dataPath, mode: .overwrite)
+        let raw = try db.run(querySource: queries, queryName: "allPeople")
+        let rows = try castRows(raw)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.compactMap { $0["name"] as? String }, ["Alice", "Bob"])
+    }
+
     func testRunRejectsNonJSONParams() throws {
         let (db, dbPath) = try freshDatabase()
         defer { cleanup(dbPath: dbPath) }
@@ -162,7 +230,7 @@ final class DatabaseTests: XCTestCase {
         defer { try? db.close() }
 
         let checks = try db.check([CheckRow].self, querySource: queries)
-        XCTAssertEqual(checks.count, 2)
+        XCTAssertEqual(checks.count, 3)
         XCTAssertTrue(checks.allSatisfy { $0.status == "ok" })
 
         let describe = try db.describe(DescribeResult.self)
@@ -186,7 +254,7 @@ final class DatabaseTests: XCTestCase {
 
         let raw = try db.check(querySource: queries)
         let checks = try castRows(raw)
-        XCTAssertEqual(checks.count, 2)
+        XCTAssertEqual(checks.count, 3)
         XCTAssertTrue(checks.allSatisfy { ($0["status"] as? String) == "ok" })
         XCTAssertEqual((checks[0]["kind"] as? String), "read")
     }
@@ -215,6 +283,100 @@ final class DatabaseTests: XCTestCase {
         XCTAssertNotNil(report["datasetsChecked"] as? Int)
         XCTAssertNotNil(report["txRows"] as? Int)
         XCTAssertNotNil(report["cdcRows"] as? Int)
+    }
+
+    func testRunArrowReturnsDataForReadQueries() throws {
+        let (db, dbPath) = try freshDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        let data = try db.runArrow(querySource: queries, queryName: "allPeople")
+        XCTAssertFalse(data.isEmpty)
+
+        let raw = try decodeArrow(data)
+        let rows = try castRows(raw)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.compactMap { $0["name"] as? String }, ["Alice", "Bob"])
+    }
+
+    func testDecodeArrowSupportsTypedDecode() throws {
+        struct PersonRow: Decodable {
+            let name: String
+            let age: Int?
+        }
+
+        let (db, dbPath) = try freshDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        let data = try db.runArrow(querySource: queries, queryName: "allPeople")
+        let rows = try decodeArrow([PersonRow].self, from: data)
+        XCTAssertEqual(rows.map(\.name), ["Alice", "Bob"])
+        XCTAssertEqual(rows.map(\.age), [30, 25])
+    }
+
+    func testRunArrowRejectsMutations() throws {
+        let (db, dbPath) = try freshDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        XCTAssertThrowsError(
+            try db.runArrow(
+                querySource: queries,
+                queryName: "addPerson",
+                params: ["name": "Carol", "age": 28]
+            )
+        ) { error in
+            XCTAssertTrue(errorMessage(error).contains("runArrow only supports read queries"))
+        }
+    }
+
+    func testMutationsPersistAcrossReopen() throws {
+        let (db, dbPath) = try freshDatabase()
+        _ = try db.run(
+            querySource: queries,
+            queryName: "addPerson",
+            params: ["name": "Carol", "age": 28]
+        )
+        try db.close()
+
+        let reopened = try Database.open(dbPath: dbPath)
+        defer {
+            try? reopened.close()
+            cleanup(dbPath: dbPath)
+        }
+
+        let raw = try reopened.run(querySource: queries, queryName: "allPeople")
+        let rows = try castRows(raw)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows.compactMap { $0["name"] as? String }, ["Alice", "Bob", "Carol"])
+    }
+
+    func testKeywordSearchMatchesTokens() throws {
+        let (db, dbPath) = try freshSearchDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        let raw = try db.run(querySource: searchQueries, queryName: "keyword", params: ["q": "billing missing"])
+        let rows = try castRows(raw)
+        XCTAssertFalse(rows.isEmpty)
+        XCTAssertTrue(rows.contains { ($0["slug"] as? String) == "sig-billing-delay" })
+    }
+
+    func testNearestVectorRanksIdenticalVectorFirst() throws {
+        let (db, dbPath) = try freshSearchDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        let raw = try db.run(
+            querySource: searchQueries,
+            queryName: "nearest_q",
+            params: ["vq": [1.0, 0.0, 0.0]]
+        )
+        let rows = try castRows(raw)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows[0]["slug"] as? String, "sig-billing-delay")
+        XCTAssertNotNil(rows[0]["score"] as? Double)
     }
 
     func testOpenPreservesData() throws {
@@ -254,6 +416,13 @@ final class DatabaseTests: XCTestCase {
         let dbPath = tempPath(prefix: "nanograph-swift")
         let db = try Database.create(dbPath: dbPath, schemaSource: schema)
         try db.load(dataSource: data, mode: .overwrite)
+        return (db, dbPath)
+    }
+
+    private func freshSearchDatabase() throws -> (Database, String) {
+        let dbPath = tempPath(prefix: "nanograph-swift-search")
+        let db = try Database.create(dbPath: dbPath, schemaSource: searchSchema)
+        try db.load(dataSource: searchData, mode: .overwrite)
         return (db, dbPath)
     }
 

@@ -3,7 +3,7 @@
   "version": "0.8.1",
   "description": "NanoGraph — embedded typed property graph DB for TypeScript/Node.js",
   "main": "index.js",
-  "types": "index.d.ts",
+  "types": "types.d.ts",
   "napi": {
     "binaryName": "nanograph",
     "targets": [
@@ -35,6 +35,7 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "types.d.ts",
     "src/",
     "build.rs",
     "Cargo.toml"

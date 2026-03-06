@@ -9,7 +9,9 @@ Current status:
 - Duplicate logical field names are correct for load / persist / reopen / append / merge, but they currently opt out of the CDC-derived append / merge fast path and fall back to full dataset rewrites.
 - The shareable `Database` refactor is landed: `Database` is `Clone + Send + Sync`, mutations serialize through one internal writer path, and TS / FFI no longer hold external read mutexes.
 - Prepared reads freeze an in-memory snapshot for isolation across later mutations; one-shot reads still use the live snapshot and Lance pushdown.
-- The next embeddable API milestone is `open_in_memory()` and then streaming ingest.
+- Streaming ingest is landed across core and adapters: reader-based loading, `Database::load_file(...)`, TS `loadFile(...)`, FFI `nanograph_db_load_file(...)`, CLI file-based load, edge spooling for forward references, and streaming `@embed` materialization now avoid the extra whole-buffer rewrite.
+- Tempdir-backed `Database::open_in_memory(schema_source)` is landed in core and now exposed in TS as `Database.openInMemory(...)`.
+- JSON vector fast path evaluation is landed: there is now a vector-heavy transport perf harness plus a targeted `FixedSizeList<Float32>` serializer fast path, but Arrow IPC is still the preferred path for large returned vectors.
 
 ### Phase 2: Shareability
 - [x] Refactor `Database` internals to Arc + RwLock, implement `Clone + Send + Sync`
@@ -18,16 +20,18 @@ Current status:
 - [x] Simplify FFI/TS to drop external Mutex wrappers for reads
 
 ### Phase 3: In-memory open
-- [ ] `Database::open_in_memory(schema_source)` (tempdir-backed)
+- [x] `Database::open_in_memory(schema_source)` (tempdir-backed)
 
 ### Phase 4: Streaming ingest
-- [ ] Reader-based loading in core
-- [ ] `Database::load_file(...)`
-- [ ] TS `loadFile(...)`
-- [ ] Bounded-memory batching, edge spooling, and streaming `@embed` materialization
+- [x] Reader-based loading in core
+- [x] `Database::load_file(...)`
+- [x] TS `loadFile(...)`
+- [x] FFI `nanograph_db_load_file(...)`
+- [x] CLI file-based load path
+- [x] Bounded-memory batching, edge spooling, and streaming `@embed` materialization
 
 ### Phase 5: JSON vector fast path
-- [ ] Evaluate post-streaming-ingest JSON vector serialization optimization
+- [x] Evaluate post-streaming-ingest JSON vector serialization optimization
 
 ### Deferred
 - [ ] `on_change()` callback registration (broadcast channel)

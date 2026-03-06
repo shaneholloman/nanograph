@@ -107,6 +107,21 @@ impl JsDatabase {
         })
     }
 
+    /// Create a tempdir-backed database with automatic cleanup on last drop.
+    ///
+    /// ```js
+    /// const db = await Database.openInMemory(schemaSource);
+    /// ```
+    #[napi(factory, js_name = "openInMemory")]
+    pub async fn open_in_memory(schema_source: String) -> Result<Self> {
+        let db = Database::open_in_memory(&schema_source)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(JsDatabase {
+            inner: Arc::new(RwLock::new(Some(db))),
+        })
+    }
+
     /// Load JSONL data into the database.
     ///
     /// ```js
@@ -117,6 +132,21 @@ impl JsDatabase {
         let load_mode = parse_load_mode(&mode)?;
         let db = self.db().await?;
         db.load_with_mode(&data_source, load_mode)
+            .await
+            .map_err(to_napi_err)
+    }
+
+    /// Load JSONL data from a file path.
+    ///
+    /// ```js
+    /// await db.loadFile("/tmp/data.jsonl", "overwrite");
+    /// ```
+    #[napi(js_name = "loadFile")]
+    pub async fn load_file(&self, data_path: String, mode: String) -> Result<()> {
+        let load_mode = parse_load_mode(&mode)?;
+        let db = self.db().await?;
+        let data_path = PathBuf::from(data_path);
+        db.load_file_with_mode(&data_path, load_mode)
             .await
             .map_err(to_napi_err)
     }
@@ -320,6 +350,13 @@ impl JsDatabase {
             "txRows": report.tx_rows,
             "cdcRows": report.cdc_rows,
         }))
+    }
+
+    /// Return whether this handle uses an internal tempdir-backed database.
+    #[napi(js_name = "isInMemory")]
+    pub async fn is_in_memory(&self) -> Result<bool> {
+        let db = self.db().await?;
+        Ok(db.is_in_memory())
     }
 
     /// Close the database, releasing resources.

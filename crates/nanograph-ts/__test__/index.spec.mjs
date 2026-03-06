@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database, decodeArrow } from "../index.js";
@@ -143,6 +143,12 @@ async function freshDb() {
   return { db, dbPath };
 }
 
+async function writeDataFile(name, contents) {
+  const path = join(tmpDir, `${name}-${++dbCounter}.jsonl`);
+  await writeFile(path, contents);
+  return path;
+}
+
 // ---------- tests ----------
 
 describe("Database", () => {
@@ -159,6 +165,18 @@ describe("Database", () => {
   describe("init + load", () => {
     it("should init and load data", async () => {
       const { db } = await freshDb();
+      assert.equal(await db.isInMemory(), false);
+      const rows = await db.run(QUERIES, "allPeople");
+      assert.equal(rows.length, 3);
+      const names = rows.map((r) => r.name).sort();
+      assert.deepEqual(names, ["Alice", "Bob", "Carol"]);
+      await db.close();
+    });
+
+    it("should open an in-memory database", async () => {
+      const db = await Database.openInMemory(SCHEMA);
+      assert.equal(await db.isInMemory(), true);
+      await db.load(DATA, "overwrite");
       const rows = await db.run(QUERIES, "allPeople");
       assert.equal(rows.length, 3);
       const names = rows.map((r) => r.name).sort();
@@ -170,6 +188,46 @@ describe("Database", () => {
   // ---- load modes ----
 
   describe("load modes", () => {
+    it("loadFile should match string load", async () => {
+      const dbPath = join(tmpDir, `test-${++dbCounter}.nano`);
+      const db = await Database.init(dbPath, SCHEMA);
+      const dataPath = await writeDataFile("load-file", DATA);
+      await db.loadFile(dataPath, "overwrite");
+      const rows = await db.run(QUERIES, "allPeople");
+      assert.equal(rows.length, 3);
+      const names = rows.map((r) => r.name).sort();
+      assert.deepEqual(names, ["Alice", "Bob", "Carol"]);
+      await db.close();
+    });
+
+    it("loadFile should resolve forward-reference edges", async () => {
+      const dbPath = join(tmpDir, `test-${++dbCounter}.nano`);
+      const db = await Database.init(dbPath, SCHEMA);
+      const dataPath = await writeDataFile(
+        "forward-refs",
+        [
+          '{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"since": 2020}}',
+          '{"type": "Person", "data": {"name": "Alice", "age": 30}}',
+          '{"type": "Company", "data": {"name": "Acme"}}',
+        ].join("\n"),
+      );
+      await db.loadFile(dataPath, "overwrite");
+      const rows = await db.run(
+        `
+query coworkers() {
+  match {
+    $p: Person
+    $p worksAt $c
+  }
+  return { $p.name, $c.name as company }
+}
+`,
+        "coworkers",
+      );
+      assert.deepEqual(rows, [{ name: "Alice", company: "Acme" }]);
+      await db.close();
+    });
+
     it("append should add rows without replacing", async () => {
       const { db } = await freshDb();
       const extra = '{"type": "Person", "data": {"name": "Dave", "age": 40}}';

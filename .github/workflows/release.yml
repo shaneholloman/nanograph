@@ -24,6 +24,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
+      - name: Install macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -51,6 +54,29 @@ jobs:
           path: |
             nanograph-*.tar.gz
             nanograph-*.tar.gz.sha256
+
+      - name: Build Swift XCFramework
+        run: bash tools/swift-package/build_xcframework.sh
+
+      - name: Render publishable Swift package
+        run: |
+          bash tools/swift-package/render_package.sh \
+            --output "$RUNNER_TEMP/nanograph-swift" \
+            --version "${GITHUB_REF_NAME#v}" \
+            --artifact-path "$PWD/target/swift-xcframework/NanoGraphFFI.xcframework"
+
+      - name: Smoke test rendered Swift package
+        run: |
+          cd "$RUNNER_TEMP/nanograph-swift"
+          swift test
+
+      - name: Upload Swift XCFramework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-xcframework
+          path: |
+            target/swift-xcframework/NanoGraphFFI.xcframework.zip
+            target/swift-xcframework/NanoGraphFFI.xcframework.sha256
 
   release:
     needs: build

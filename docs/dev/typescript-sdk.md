@@ -22,7 +22,7 @@ npm install nanograph-db
 ## Quick start
 
 ```typescript
-import { Database } from "nanograph-db";
+import { Database, decodeArrow } from "nanograph-db";
 
 const schema = `
 node Person {
@@ -36,7 +36,7 @@ edge Knows: Person -> Person
 const data = [
   '{"type":"Person","data":{"name":"Alice","age":30}}',
   '{"type":"Person","data":{"name":"Bob","age":25}}',
-  '{"type":"Knows","data":{"src":"Alice","dst":"Bob"}}',
+  '{"edge":"Knows","from":"Alice","to":"Bob"}',
 ].join("\n");
 
 const queries = `
@@ -56,7 +56,7 @@ query addPerson($name: String, $age: I32) {
 }
 `;
 
-const db = await Database.init("my.nano", schema);
+const db = await Database.openInMemory(schema);
 await db.load(data, "overwrite");
 
 // Read query
@@ -71,6 +71,11 @@ const alice = await db.run(queries, "byName", { name: "Alice" });
 const result = await db.run(queries, "addPerson", { name: "Carol", age: 28 });
 // { affectedNodes: 1, affectedEdges: 0 }
 
+// Columnar read path for vector-heavy or large result sets
+const arrow = await db.runArrow(queries, "allPeople");
+const table = decodeArrow(arrow);
+const arrowRows = table.toArray();
+
 await db.close();
 ```
 
@@ -84,6 +89,10 @@ Create a new database from a schema string. Returns `Promise<Database>`.
 
 Open an existing database. Returns `Promise<Database>`.
 
+### `Database.openInMemory(schemaSource)`
+
+Create a tempdir-backed database with automatic cleanup when the last handle closes. Returns `Promise<Database>`.
+
 ### `db.load(dataSource, mode)`
 
 Load JSONL data into the database.
@@ -91,6 +100,14 @@ Load JSONL data into the database.
 - `"overwrite"` — replace all data
 - `"append"` — add rows
 - `"merge"` — upsert by `@key`
+
+### `db.loadFile(dataPath, mode)`
+
+Load JSONL data from a file path.
+
+- uses the reader-based streaming ingest path
+- preferred for large datasets and embedding-heavy loads
+- supports the same `"overwrite"`, `"append"`, and `"merge"` modes
 
 ### `db.run(querySource, queryName, params?)`
 
@@ -107,6 +124,18 @@ const rows = await db.run(queries, "byName", { name: "Alice" });
 const result = await db.run(queries, "addPerson", { name: "Dave", age: 40 });
 // { affectedNodes: 1, affectedEdges: 0 }
 ```
+
+### `db.runArrow(querySource, queryName, params?)`
+
+Execute a named read query and return an Arrow IPC stream as a `Buffer`.
+
+```typescript
+const arrow = await db.runArrow(queries, "allPeople");
+const table = decodeArrow(arrow);
+const rows = table.toArray();
+```
+
+Use this path for large result sets and especially for vector-heavy reads. JSON remains the ergonomic default, but Arrow is much faster for large returned embeddings.
 
 ### `db.check(querySource)`
 
@@ -155,6 +184,10 @@ const report = await db.doctor();
 // { healthy: true, issues: [], warnings: [], datasetsChecked: 2, txRows: 1, cdcRows: 3 }
 ```
 
+### `db.isInMemory()`
+
+Return `true` when the handle was created with `Database.openInMemory(...)`.
+
 ### `db.close()`
 
 Close the database and release resources. Safe to call multiple times.
@@ -185,3 +218,7 @@ const db2 = await Database.open("my.nano");
 const rows = await db2.run(queries, "allPeople");
 await db2.close();
 ```
+
+## Large embedding workloads
+
+For large graph loads, prefer `loadFile(...)` over building one giant JSONL string in JS. For large returned vectors, prefer `runArrow(...)` plus `decodeArrow(...)` over `run(...)`.

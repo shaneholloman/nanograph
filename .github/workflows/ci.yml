@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sdk-and-core:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '27.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-macos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-macos-
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: Install TypeScript SDK dependencies
+        run: npm install
+        working-directory: crates/nanograph-ts
+
+      - name: TypeScript SDK tests
+        run: npm test
+        working-directory: crates/nanograph-ts
+
+      - name: TypeScript consumer smoke test
+        run: bash tools/ts-sdk/smoke_test_consumer.sh
+
+      - name: Build Swift FFI library
+        run: cargo build -p nanograph-ffi
+
+      - name: Swift SDK tests
+        run: swift test
+        working-directory: crates/nanograph-ffi/swift
+        env:
+          CLANG_MODULE_CACHE_PATH: ${{ runner.temp }}/clang-module-cache
+          SWIFTPM_MODULECACHE_OVERRIDE: ${{ runner.temp }}/swiftpm-module-cache

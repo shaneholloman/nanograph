@@ -2,6 +2,7 @@
 
 ## Pre-release
 
+- [ ] CI workflow green on `main` / PRs (`cargo check`, TS SDK tests, TS consumer smoke test, Swift SDK tests)
 - [ ] All tests pass: `cargo test`
 - [ ] CLI e2e pass: `bash tests/cli/run-cli-e2e.sh`
 - [ ] Clippy clean: `cargo clippy`
@@ -21,6 +22,7 @@ git push origin main --tags
 
 This automatically:
 - Builds macOS ARM binary on `macos-14` runner
+- Builds Swift XCFramework artifacts for macOS (`NanoGraphFFI.xcframework.zip` + checksum)
 - Creates GitHub Release with `nanograph-vX.Y.Z-aarch64-apple-darwin.tar.gz` + `.sha256`
 - Dispatches formula update to `nanograph/homebrew-tap`
 
@@ -55,6 +57,7 @@ npm publish --otp=<code>
 |-------|----------|
 | GitHub Release | `github.com/aaltshuler/nanograph/releases` |
 | macOS ARM binary | `nanograph-vX.Y.Z-aarch64-apple-darwin.tar.gz` on release |
+| Swift XCFramework | `NanoGraphFFI.xcframework.zip` on release |
 | Homebrew tap | `github.com/nanograph/homebrew-tap` |
 | crates.io (core) | `crates.io/crates/nanograph` |
 | crates.io (CLI) | `crates.io/crates/nanograph-cli` |

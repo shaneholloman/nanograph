@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder,
@@ -15,8 +19,9 @@ use arrow_schema::{DataType, Field, Schema};
 use crate::error::{NanoError, Result};
 
 use super::super::graph::GraphStorage;
-use super::constraints::{key_value_string, node_property_field, node_property_index};
+use super::constraints::{key_value_string, node_property_field};
 
+#[cfg_attr(not(test), allow(dead_code))]
 /// Load JSONL-formatted data into a GraphStorage.
 /// Each line is either a node `{"type": "...", "data": {...}}` or edge `{"edge": "...", "from": "...", "to": "..."}`.
 pub(crate) fn load_jsonl_data(
@@ -27,6 +32,7 @@ pub(crate) fn load_jsonl_data(
     load_jsonl_data_with_name_seed(storage, data, key_props, None)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 /// Load JSONL-formatted data into a GraphStorage with an optional pre-populated
 /// @key-value-to-id mapping for resolving edges that reference existing nodes.
 pub(crate) fn load_jsonl_data_with_name_seed(
@@ -35,290 +41,572 @@ pub(crate) fn load_jsonl_data_with_name_seed(
     key_props: &HashMap<String, String>,
     name_seed: Option<&HashMap<(String, String), u64>>,
 ) -> Result<()> {
-    let mut node_data: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
-    let mut edge_data: Vec<serde_json::Value> = Vec::new();
+    let cursor = Cursor::new(data.as_bytes());
+    load_jsonl_reader_with_name_seed(storage, cursor, key_props, name_seed)
+}
 
-    for line in data.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn load_jsonl_reader<R: BufRead>(
+    storage: &mut GraphStorage,
+    reader: R,
+    key_props: &HashMap<String, String>,
+) -> Result<()> {
+    load_jsonl_reader_with_name_seed(storage, reader, key_props, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn load_jsonl_reader_with_name_seed<R: BufRead>(
+    storage: &mut GraphStorage,
+    reader: R,
+    key_props: &HashMap<String, String>,
+    name_seed: Option<&HashMap<(String, String), u64>>,
+) -> Result<()> {
+    let spool_dir = std::env::temp_dir();
+    load_jsonl_reader_with_name_seed_at_path(storage, &spool_dir, reader, key_props, name_seed)
+}
+
+pub(crate) fn load_jsonl_reader_with_name_seed_at_path<R: BufRead>(
+    storage: &mut GraphStorage,
+    spool_dir: &Path,
+    reader: R,
+    key_props: &HashMap<String, String>,
+    name_seed: Option<&HashMap<(String, String), u64>>,
+) -> Result<()> {
+    let batch_size = parse_env_usize("NANOGRAPH_LOAD_ROW_BATCH_SIZE", 2048);
+    let mut spool_paths = TempSpoolPaths::default();
+    let mut node_paths = HashMap::new();
+    let mut node_writers = HashMap::new();
+    let mut edge_paths = HashMap::new();
+    let mut edge_writers = HashMap::new();
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
             continue;
         }
-        let obj: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| NanoError::Storage(format!("JSON parse error: {}", e)))?;
+
+        let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+            NanoError::Storage(format!("JSON parse error on line {}: {}", line_no + 1, e))
+        })?;
 
         if let Some(type_name) = obj.get("type").and_then(|v| v.as_str()) {
-            node_data
-                .entry(type_name.to_string())
-                .or_default()
-                .push(obj);
-        } else if obj.get("edge").is_some() {
-            edge_data.push(obj);
+            if !storage.catalog.node_types.contains_key(type_name) {
+                return Err(NanoError::Storage(format!(
+                    "unknown node type in data: {}",
+                    type_name
+                )));
+            }
+            let writer = spool_writer_for_type(
+                spool_dir,
+                "load_nodes",
+                type_name,
+                &mut node_writers,
+                &mut node_paths,
+                &mut spool_paths,
+            )?;
+            write_jsonl_line(writer, &obj)?;
+        } else if let Some(edge_type) = obj.get("edge").and_then(|v| v.as_str()) {
+            let edge_name = resolve_edge_name(storage, edge_type)?;
+            let writer = spool_writer_for_type(
+                spool_dir,
+                "load_edges",
+                &edge_name,
+                &mut edge_writers,
+                &mut edge_paths,
+                &mut spool_paths,
+            )?;
+            write_jsonl_line(writer, &obj)?;
         }
     }
 
-    // Insert nodes
+    drop(node_writers);
+    drop(edge_writers);
+
     let mut key_to_id: HashMap<(String, String), u64> = name_seed.cloned().unwrap_or_default();
 
-    for (type_name, nodes) in &node_data {
-        let node_type = storage.catalog.node_types.get(type_name).ok_or_else(|| {
-            NanoError::Storage(format!("unknown node type in data: {}", type_name))
+    let mut node_types: Vec<String> = node_paths.keys().cloned().collect();
+    node_types.sort();
+    for type_name in node_types {
+        let path = node_paths.get(&type_name).ok_or_else(|| {
+            NanoError::Storage(format!("missing node spool path for {}", type_name))
         })?;
-
-        let prop_fields: Vec<Field> = node_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .skip(1) // skip id
-            .map(|f| f.as_ref().clone())
-            .collect();
-
-        let mut builders: Vec<Vec<serde_json::Value>> = vec![Vec::new(); prop_fields.len()];
-
-        for (row_idx, node) in nodes.iter().enumerate() {
-            if let Some(data_obj) = node.get("data").and_then(|d| d.as_object()) {
-                for (i, field) in prop_fields.iter().enumerate() {
-                    let val = data_obj
-                        .get(field.name())
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    if val.is_null() && !field.is_nullable() {
-                        return Err(NanoError::Storage(format!(
-                            "node {}: required field '{}' missing on row {}",
-                            type_name,
-                            field.name(),
-                            row_idx
-                        )));
-                    }
-                    builders[i].push(val);
-                }
-            }
-        }
-
-        let mut columns: Vec<Arc<dyn Array>> = Vec::new();
-        for (i, field) in prop_fields.iter().enumerate() {
-            let col = json_values_to_array(&builders[i], field.data_type(), field.is_nullable())?;
-            columns.push(col);
-        }
-
-        let prop_schema = Arc::new(Schema::new(prop_fields));
-        let batch = RecordBatch::try_new(prop_schema, columns)
-            .map_err(|e| NanoError::Storage(format!("batch error: {}", e)))?;
-
-        storage.insert_nodes(type_name, batch)?;
+        load_spooled_nodes(
+            storage,
+            &type_name,
+            path,
+            key_props,
+            &mut key_to_id,
+            batch_size,
+        )?;
     }
 
-    // Build @key -> id mapping for incoming rows so edges can resolve to nodes created
-    // in this same JSONL payload.
-    for (type_name, key_prop) in key_props {
-        let Some(batch) = storage.get_all_nodes(type_name)? else {
-            continue;
-        };
-
-        let key_idx = node_property_index(batch.schema().as_ref(), key_prop).ok_or_else(|| {
-            NanoError::Storage(format!(
-                "node type {} missing @key property {}",
-                type_name, key_prop
-            ))
+    let mut edge_names: Vec<String> = edge_paths.keys().cloned().collect();
+    edge_names.sort();
+    for edge_name in edge_names {
+        let path = edge_paths.get(&edge_name).ok_or_else(|| {
+            NanoError::Storage(format!("missing edge spool path for {}", edge_name))
         })?;
-        let key_arr = batch.column(key_idx).clone();
-        let id_arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                NanoError::Storage(format!("node type {} has non-UInt64 id column", type_name))
-            })?;
-
-        for row in 0..batch.num_rows() {
-            let key = key_value_string(&key_arr, row, key_prop)?;
-            key_to_id.insert((type_name.clone(), key), id_arr.value(row));
-        }
-    }
-
-    // Resolve edges and group by type
-    struct ResolvedEdge {
-        from_id: u64,
-        to_id: u64,
-        data: Option<serde_json::Map<String, serde_json::Value>>,
-    }
-    // No multigraph support: deduplicate by (src, dst) per edge type.
-    // Last occurrence wins so later lines can override edge properties.
-    let mut edges_by_type: BTreeMap<String, BTreeMap<(u64, u64), ResolvedEdge>> = BTreeMap::new();
-
-    for edge_obj in &edge_data {
-        let edge_type = edge_obj
-            .get("edge")
-            .and_then(|e| e.as_str())
-            .ok_or_else(|| NanoError::Storage("edge missing type".to_string()))?;
-
-        let from_token = edge_obj
-            .get("from")
-            .and_then(|f| f.as_str())
-            .ok_or_else(|| NanoError::Storage("edge missing from".to_string()))?;
-        let to_token = edge_obj
-            .get("to")
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| NanoError::Storage("edge missing to".to_string()))?;
-
-        let et = storage
-            .catalog
-            .edge_types
-            .get(edge_type)
-            .or_else(|| {
-                storage
-                    .catalog
-                    .edge_name_index
-                    .get(edge_type)
-                    .and_then(|key| storage.catalog.edge_types.get(key))
-            })
-            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", edge_type)))?;
-
-        let from_type = et.from_type.clone();
-        let to_type = et.to_type.clone();
-        let edge_name = et.name.clone();
-
-        let (src_key_prop, dst_key_prop) =
-            match (key_props.get(&from_type), key_props.get(&to_type)) {
-                (Some(src), Some(dst)) => (src, dst),
-                _ => {
-                    return Err(NanoError::Storage(format!(
-                        "edge '{}' requires @key on source type '{}' and destination type '{}'",
-                        edge_name, from_type, to_type
-                    )));
-                }
-            };
-
-        let from_key_type = storage
-            .catalog
-            .node_types
-            .get(&from_type)
-            .and_then(|nt| node_property_field(nt.arrow_schema.as_ref(), src_key_prop))
-            .map(|f| f.data_type().clone())
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "missing @key field {} on source type {}",
-                    src_key_prop, from_type
-                ))
-            })?;
-        let to_key_type = storage
-            .catalog
-            .node_types
-            .get(&to_type)
-            .and_then(|nt| node_property_field(nt.arrow_schema.as_ref(), dst_key_prop))
-            .map(|f| f.data_type().clone())
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "missing @key field {} on destination type {}",
-                    dst_key_prop, to_type
-                ))
-            })?;
-
-        let from_key = parse_edge_endpoint_key_token(from_token, &from_key_type).map_err(|e| {
-            NanoError::Storage(format!(
-                "invalid edge endpoint key for {}.{} from='{}': {}",
-                from_type, src_key_prop, from_token, e
-            ))
-        })?;
-        let to_key = parse_edge_endpoint_key_token(to_token, &to_key_type).map_err(|e| {
-            NanoError::Storage(format!(
-                "invalid edge endpoint key for {}.{} to='{}': {}",
-                to_type, dst_key_prop, to_token, e
-            ))
-        })?;
-
-        let from_id = *key_to_id
-            .get(&(from_type.clone(), from_key.clone()))
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "node not found by @key: {}.{}={}",
-                    from_type, src_key_prop, from_key
-                ))
-            })?;
-        let to_id = *key_to_id
-            .get(&(to_type.clone(), to_key.clone()))
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "node not found by @key: {}.{}={}",
-                    to_type, dst_key_prop, to_key
-                ))
-            })?;
-
-        let data = edge_obj.get("data").and_then(|d| d.as_object()).cloned();
-
-        edges_by_type.entry(edge_name).or_default().insert(
-            (from_id, to_id),
-            ResolvedEdge {
-                from_id,
-                to_id,
-                data,
-            },
-        );
-    }
-
-    // Insert edges batched by type
-    for (edge_name, edges_map) in &edges_by_type {
-        let edges: Vec<&ResolvedEdge> = edges_map.values().collect();
-        let src_ids: Vec<u64> = edges.iter().map(|e| e.from_id).collect();
-        let dst_ids: Vec<u64> = edges.iter().map(|e| e.to_id).collect();
-
-        let et = storage
-            .catalog
-            .edge_types
-            .get(edge_name)
-            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", edge_name)))?;
-
-        let prop_batch = if !et.properties.is_empty() {
-            // Build property columns from edge data
-            let edge_seg = storage
-                .edge_segments
-                .get(edge_name)
-                .ok_or_else(|| NanoError::Storage(format!("no edge segment: {}", edge_name)))?;
-            // Edge segment schema: id, src, dst, ...props - skip first 3
-            let prop_fields: Vec<Field> = edge_seg
-                .schema
-                .fields()
-                .iter()
-                .skip(3)
-                .map(|f| f.as_ref().clone())
-                .collect();
-
-            let mut columns: Vec<Arc<dyn Array>> = Vec::new();
-            for field in &prop_fields {
-                let values: Vec<serde_json::Value> = edges
-                    .iter()
-                    .map(|edge| {
-                        let e = *edge;
-                        e.data
-                            .as_ref()
-                            .and_then(|d| d.get(field.name()))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null)
-                    })
-                    .collect();
-                columns.push(json_values_to_array(
-                    &values,
-                    field.data_type(),
-                    field.is_nullable(),
-                )?);
-            }
-
-            if prop_fields.is_empty() {
-                None
-            } else {
-                let schema = Arc::new(Schema::new(prop_fields));
-                Some(
-                    RecordBatch::try_new(schema, columns)
-                        .map_err(|e| NanoError::Storage(format!("edge prop batch error: {}", e)))?,
-                )
-            }
-        } else {
-            None
-        };
-
-        storage.insert_edges(edge_name, &src_ids, &dst_ids, prop_batch)?;
+        load_spooled_edges(storage, &edge_name, path, key_props, &key_to_id, batch_size)?;
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct PendingNodeRow {
+    row_idx: usize,
+    data: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct ResolvedEdge {
+    from_id: u64,
+    to_id: u64,
+    data: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Default)]
+struct TempSpoolPaths {
+    paths: Vec<PathBuf>,
+}
+
+impl TempSpoolPaths {
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for TempSpoolPaths {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn load_spooled_nodes(
+    storage: &mut GraphStorage,
+    type_name: &str,
+    path: &Path,
+    key_props: &HashMap<String, String>,
+    key_to_id: &mut HashMap<(String, String), u64>,
+    batch_size: usize,
+) -> Result<()> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::with_capacity(batch_size);
+    let mut next_row_idx = 0usize;
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+            NanoError::Storage(format!(
+                "JSON parse error in node spool {} line {}: {}",
+                type_name,
+                line_no + 1,
+                e
+            ))
+        })?;
+        let data = obj
+            .get("data")
+            .and_then(|value| value.as_object())
+            .cloned()
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "node {} is missing object field `data` in spooled load",
+                    type_name
+                ))
+            })?;
+        rows.push(PendingNodeRow {
+            row_idx: next_row_idx,
+            data,
+        });
+        next_row_idx += 1;
+        if rows.len() >= batch_size {
+            flush_node_rows(storage, type_name, &mut rows, key_props, key_to_id)?;
+        }
+    }
+
+    if !rows.is_empty() {
+        flush_node_rows(storage, type_name, &mut rows, key_props, key_to_id)?;
+    }
+
+    Ok(())
+}
+
+fn flush_node_rows(
+    storage: &mut GraphStorage,
+    type_name: &str,
+    rows: &mut Vec<PendingNodeRow>,
+    key_props: &HashMap<String, String>,
+    key_to_id: &mut HashMap<(String, String), u64>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let node_type =
+        storage.catalog.node_types.get(type_name).ok_or_else(|| {
+            NanoError::Storage(format!("unknown node type in data: {}", type_name))
+        })?;
+    let prop_fields: Vec<Field> = node_type
+        .arrow_schema
+        .fields()
+        .iter()
+        .skip(1)
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let mut builders: Vec<Vec<serde_json::Value>> =
+        vec![Vec::with_capacity(rows.len()); prop_fields.len()];
+
+    for row in rows.iter() {
+        for (idx, field) in prop_fields.iter().enumerate() {
+            let value = row
+                .data
+                .get(field.name())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if value.is_null() && !field.is_nullable() {
+                return Err(NanoError::Storage(format!(
+                    "node {}: required field '{}' missing on row {}",
+                    type_name,
+                    field.name(),
+                    row.row_idx
+                )));
+            }
+            builders[idx].push(value);
+        }
+    }
+
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(prop_fields.len());
+    for (idx, field) in prop_fields.iter().enumerate() {
+        columns.push(json_values_to_array(
+            &builders[idx],
+            field.data_type(),
+            field.is_nullable(),
+        )?);
+    }
+
+    let prop_schema = Arc::new(Schema::new(prop_fields.clone()));
+    let batch = RecordBatch::try_new(prop_schema, columns)
+        .map_err(|e| NanoError::Storage(format!("batch error: {}", e)))?;
+
+    let key_rows: Option<Vec<String>> = if let Some(key_prop) = key_props.get(type_name) {
+        let key_col_idx = prop_fields
+            .iter()
+            .position(|field| field.name() == key_prop)
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "node type {} missing @key property {}",
+                    type_name, key_prop
+                ))
+            })?;
+        let key_arr = batch.column(key_col_idx).clone();
+        let mut keys = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            keys.push(key_value_string(&key_arr, row, key_prop)?);
+        }
+        Some(keys)
+    } else {
+        None
+    };
+
+    let assigned_ids = storage.insert_nodes(type_name, batch)?;
+    if let Some(keys) = key_rows {
+        for (row, key) in keys.into_iter().enumerate() {
+            key_to_id.insert((type_name.to_string(), key), assigned_ids[row]);
+        }
+    }
+
+    rows.clear();
+    Ok(())
+}
+
+fn load_spooled_edges(
+    storage: &mut GraphStorage,
+    edge_name: &str,
+    path: &Path,
+    key_props: &HashMap<String, String>,
+    key_to_id: &HashMap<(String, String), u64>,
+    batch_size: usize,
+) -> Result<()> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut edges_by_pair: BTreeMap<(u64, u64), ResolvedEdge> = BTreeMap::new();
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+            NanoError::Storage(format!(
+                "JSON parse error in edge spool {} line {}: {}",
+                edge_name,
+                line_no + 1,
+                e
+            ))
+        })?;
+        let resolved = resolve_edge_object(storage, &obj, key_props, key_to_id)?;
+        edges_by_pair.insert((resolved.from_id, resolved.to_id), resolved);
+    }
+
+    if edges_by_pair.is_empty() {
+        return Ok(());
+    }
+
+    let resolved_edges: Vec<&ResolvedEdge> = edges_by_pair.values().collect();
+    for chunk in resolved_edges.chunks(batch_size.max(1)) {
+        insert_resolved_edge_chunk(storage, edge_name, chunk)?;
+    }
+
+    Ok(())
+}
+
+fn insert_resolved_edge_chunk(
+    storage: &mut GraphStorage,
+    edge_name: &str,
+    edges: &[&ResolvedEdge],
+) -> Result<()> {
+    let src_ids: Vec<u64> = edges.iter().map(|edge| edge.from_id).collect();
+    let dst_ids: Vec<u64> = edges.iter().map(|edge| edge.to_id).collect();
+
+    let edge_seg = storage
+        .edge_segments
+        .get(edge_name)
+        .ok_or_else(|| NanoError::Storage(format!("no edge segment: {}", edge_name)))?;
+    let prop_fields: Vec<Field> = edge_seg
+        .schema
+        .fields()
+        .iter()
+        .skip(3)
+        .map(|field| field.as_ref().clone())
+        .collect();
+
+    let prop_batch = if prop_fields.is_empty() {
+        None
+    } else {
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(prop_fields.len());
+        for field in &prop_fields {
+            let values: Vec<serde_json::Value> = edges
+                .iter()
+                .map(|edge| {
+                    edge.data
+                        .as_ref()
+                        .and_then(|data| data.get(field.name()))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+            columns.push(json_values_to_array(
+                &values,
+                field.data_type(),
+                field.is_nullable(),
+            )?);
+        }
+        let schema = Arc::new(Schema::new(prop_fields));
+        Some(
+            RecordBatch::try_new(schema, columns)
+                .map_err(|e| NanoError::Storage(format!("edge prop batch error: {}", e)))?,
+        )
+    };
+
+    storage.insert_edges(edge_name, &src_ids, &dst_ids, prop_batch)?;
+    Ok(())
+}
+
+fn resolve_edge_object(
+    storage: &GraphStorage,
+    edge_obj: &serde_json::Value,
+    key_props: &HashMap<String, String>,
+    key_to_id: &HashMap<(String, String), u64>,
+) -> Result<ResolvedEdge> {
+    let edge_type = edge_obj
+        .get("edge")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| NanoError::Storage("edge missing type".to_string()))?;
+    let et = resolve_edge_type(storage, edge_type)?;
+
+    let from_token = edge_obj
+        .get("from")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| NanoError::Storage("edge missing from".to_string()))?;
+    let to_token = edge_obj
+        .get("to")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| NanoError::Storage("edge missing to".to_string()))?;
+
+    let from_type = et.from_type.clone();
+    let to_type = et.to_type.clone();
+    let edge_name = et.name.clone();
+
+    let (src_key_prop, dst_key_prop) = match (key_props.get(&from_type), key_props.get(&to_type)) {
+        (Some(src), Some(dst)) => (src, dst),
+        _ => {
+            return Err(NanoError::Storage(format!(
+                "edge '{}' requires @key on source type '{}' and destination type '{}'",
+                edge_name, from_type, to_type
+            )));
+        }
+    };
+
+    let from_key_type = storage
+        .catalog
+        .node_types
+        .get(&from_type)
+        .and_then(|node_type| node_property_field(node_type.arrow_schema.as_ref(), src_key_prop))
+        .map(|field| field.data_type().clone())
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "missing @key field {} on source type {}",
+                src_key_prop, from_type
+            ))
+        })?;
+    let to_key_type = storage
+        .catalog
+        .node_types
+        .get(&to_type)
+        .and_then(|node_type| node_property_field(node_type.arrow_schema.as_ref(), dst_key_prop))
+        .map(|field| field.data_type().clone())
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "missing @key field {} on destination type {}",
+                dst_key_prop, to_type
+            ))
+        })?;
+
+    let from_key = parse_edge_endpoint_key_token(from_token, &from_key_type).map_err(|e| {
+        NanoError::Storage(format!(
+            "invalid edge endpoint key for {}.{} from='{}': {}",
+            from_type, src_key_prop, from_token, e
+        ))
+    })?;
+    let to_key = parse_edge_endpoint_key_token(to_token, &to_key_type).map_err(|e| {
+        NanoError::Storage(format!(
+            "invalid edge endpoint key for {}.{} to='{}': {}",
+            to_type, dst_key_prop, to_token, e
+        ))
+    })?;
+
+    let from_id = *key_to_id
+        .get(&(from_type.clone(), from_key.clone()))
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "node not found by @key: {}.{}={}",
+                from_type, src_key_prop, from_key
+            ))
+        })?;
+    let to_id = *key_to_id
+        .get(&(to_type.clone(), to_key.clone()))
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "node not found by @key: {}.{}={}",
+                to_type, dst_key_prop, to_key
+            ))
+        })?;
+
+    Ok(ResolvedEdge {
+        from_id,
+        to_id,
+        data: edge_obj
+            .get("data")
+            .and_then(|value| value.as_object())
+            .cloned(),
+    })
+}
+
+fn resolve_edge_name(storage: &GraphStorage, edge_type: &str) -> Result<String> {
+    Ok(resolve_edge_type(storage, edge_type)?.name.clone())
+}
+
+fn resolve_edge_type<'a>(
+    storage: &'a GraphStorage,
+    edge_type: &str,
+) -> Result<&'a crate::catalog::EdgeType> {
+    storage
+        .catalog
+        .edge_types
+        .get(edge_type)
+        .or_else(|| {
+            storage
+                .catalog
+                .edge_name_index
+                .get(edge_type)
+                .and_then(|name| storage.catalog.edge_types.get(name))
+        })
+        .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", edge_type)))
+}
+
+fn spool_writer_for_type<'a>(
+    spool_dir: &Path,
+    prefix: &str,
+    type_name: &str,
+    writers: &'a mut HashMap<String, BufWriter<File>>,
+    paths: &mut HashMap<String, PathBuf>,
+    spool_paths: &mut TempSpoolPaths,
+) -> Result<&'a mut BufWriter<File>> {
+    if !writers.contains_key(type_name) {
+        let path = create_temp_spool_file(spool_dir, prefix, type_name)?;
+        spool_paths.push(path.clone());
+        let writer = BufWriter::new(
+            OpenOptions::new()
+                .create_new(false)
+                .write(true)
+                .open(&path)?,
+        );
+        writers.insert(type_name.to_string(), writer);
+        paths.insert(type_name.to_string(), path);
+    }
+    writers
+        .get_mut(type_name)
+        .ok_or_else(|| NanoError::Storage(format!("failed to open spool writer for {}", type_name)))
+}
+
+fn create_temp_spool_file(spool_dir: &Path, prefix: &str, type_name: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(spool_dir)?;
+    let pid = std::process::id();
+    let sanitized = type_name.replace(['/', '\\', ' '], "_");
+    for attempt in 0..256u32 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = spool_dir.join(format!(
+            ".nanograph_{}_{}_{}_{}_{}.jsonl",
+            prefix, sanitized, pid, now, attempt
+        ));
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(NanoError::Storage(format!(
+        "failed to create temp spool file for {}",
+        type_name
+    )))
+}
+
+fn write_jsonl_line(writer: &mut BufWriter<File>, value: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(|e| NanoError::Storage(format!("serialize JSONL row failed: {}", e)))?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+fn parse_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Convert JSON values to an Arrow array based on the target DataType.
@@ -766,6 +1054,7 @@ pub(crate) fn parse_date64_literal(s: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Cursor;
 
     use serde_json::json;
 
@@ -915,6 +1204,24 @@ edge Knows: Person -> Person
         assert_eq!(knows.edge_ids.len(), 1);
         assert_eq!(knows.src_ids[0], alice_id);
         assert_eq!(knows.dst_ids[0], bob_id);
+    }
+
+    #[test]
+    fn load_jsonl_reader_handles_forward_reference_edges() {
+        let mut storage = build_storage(test_schema());
+        let data = r#"{"edge":"Knows","from":"Alice","to":"Bob"}
+{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}"#;
+
+        load_jsonl_reader(
+            &mut storage,
+            Cursor::new(data.as_bytes()),
+            &person_key_props(),
+        )
+        .unwrap();
+
+        let knows = &storage.edge_segments["Knows"];
+        assert_eq!(knows.edge_ids.len(), 1);
     }
 
     #[test]

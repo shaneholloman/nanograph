@@ -32,7 +32,8 @@ fn record_batches_to_json_rows_with_mode(
     results: &[RecordBatch],
     integer_mode: JsonIntegerMode,
 ) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
+    let total_rows = results.iter().map(RecordBatch::num_rows).sum();
+    let mut out = Vec::with_capacity(total_rows);
     for batch in results {
         let schema = batch.schema();
         for row in 0..batch.num_rows() {
@@ -164,14 +165,7 @@ fn array_value_to_json_with_mode(
         DataType::FixedSizeList(_, _) => array
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .map(|a| {
-                let values = a.value(row);
-                serde_json::Value::Array(
-                    (0..values.len())
-                        .map(|idx| array_value_to_json_with_mode(&values, idx, integer_mode))
-                        .collect(),
-                )
-            })
+            .map(|a| fixed_size_list_value_to_json(a, row, integer_mode))
             .unwrap_or(serde_json::Value::Null),
         _ => {
             let display =
@@ -181,11 +175,50 @@ fn array_value_to_json_with_mode(
     }
 }
 
+fn fixed_size_list_value_to_json(
+    array: &FixedSizeListArray,
+    row: usize,
+    integer_mode: JsonIntegerMode,
+) -> serde_json::Value {
+    let value_len = array.value_length() as usize;
+    let values = array.values();
+    if let Some(float_values) = values.as_any().downcast_ref::<Float32Array>() {
+        let start = row.saturating_mul(value_len);
+        return float32_json_array(float_values, start, value_len);
+    }
+
+    let values = array.value(row);
+    serde_json::Value::Array(
+        (0..values.len())
+            .map(|idx| array_value_to_json_with_mode(&values, idx, integer_mode))
+            .collect(),
+    )
+}
+
+fn float32_json_array(values: &Float32Array, start: usize, len: usize) -> serde_json::Value {
+    let mut out = Vec::with_capacity(len);
+    let end = start.saturating_add(len).min(values.len());
+    for idx in start..end {
+        if values.is_null(idx) {
+            out.push(serde_json::Value::Null);
+            continue;
+        }
+        let value = values.value(idx) as f64;
+        out.push(
+            serde_json::Number::from_f64(value)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::Value::Array(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{array_value_to_json, record_batches_to_rust_json_rows};
     use std::sync::Arc;
 
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
@@ -237,6 +270,36 @@ mod tests {
                 "signed": i64::MIN,
                 "unsigned": u64::MAX,
             })]
+        );
+    }
+
+    #[test]
+    fn fixed_size_float32_vectors_serialize_without_recursive_dispatch() {
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        builder.values().append_value(0.25);
+        builder.values().append_value(0.5);
+        builder.values().append_value(0.75);
+        builder.append(true);
+
+        for _ in 0..3 {
+            builder.values().append_null();
+        }
+        builder.append(false);
+
+        builder.values().append_value(1.0);
+        builder.values().append_value(2.0);
+        builder.values().append_value(3.0);
+        builder.append(true);
+
+        let values: ArrayRef = Arc::new(builder.finish());
+        assert_eq!(
+            array_value_to_json(&values, 0),
+            serde_json::json!([0.25, 0.5, 0.75])
+        );
+        assert_eq!(array_value_to_json(&values, 1), serde_json::Value::Null);
+        assert_eq!(
+            array_value_to_json(&values, 2),
+            serde_json::json!([1.0, 2.0, 3.0])
         );
     }
 }
