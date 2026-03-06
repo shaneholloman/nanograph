@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
+use nanograph::RunInputError;
 use nanograph::error::NanoError;
-use nanograph::json_output::record_batches_to_json_rows;
+use nanograph::find_named_query;
 use nanograph::query::parser::parse_query;
-use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
+use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::store::database::Database;
-use nanograph::{ParamMap, execute_mutation, execute_query, lower_mutation_query, lower_query};
 
 use convert::{
     js_object_to_param_map, parse_cleanup_options, parse_compact_options, parse_load_mode,
@@ -24,14 +24,26 @@ fn to_napi_err(e: NanoError) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
 
+fn to_napi_input_err(e: RunInputError) -> napi::Error {
+    napi::Error::from_reason(e.to_string())
+}
+
 #[napi(js_name = "Database")]
 pub struct JsDatabase {
-    inner: Arc<Mutex<Option<Database>>>,
+    inner: Arc<RwLock<Option<Database>>>,
 }
 
 impl JsDatabase {
     fn db_path(path: &str) -> PathBuf {
         PathBuf::from(path)
+    }
+
+    async fn db(&self) -> Result<Database> {
+        let guard = self.inner.read().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| napi::Error::from_reason("database is closed"))
     }
 }
 
@@ -77,7 +89,7 @@ impl JsDatabase {
             .await
             .map_err(to_napi_err)?;
         Ok(JsDatabase {
-            inner: Arc::new(Mutex::new(Some(db))),
+            inner: Arc::new(RwLock::new(Some(db))),
         })
     }
 
@@ -91,7 +103,7 @@ impl JsDatabase {
         let path = Self::db_path(&db_path);
         let db = Database::open(&path).await.map_err(to_napi_err)?;
         Ok(JsDatabase {
-            inner: Arc::new(Mutex::new(Some(db))),
+            inner: Arc::new(RwLock::new(Some(db))),
         })
     }
 
@@ -103,10 +115,7 @@ impl JsDatabase {
     #[napi]
     pub async fn load(&self, data_source: String, mode: String) -> Result<()> {
         let load_mode = parse_load_mode(&mode)?;
-        let mut guard = self.inner.lock().await;
-        let db = guard
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
+        let db = self.db().await?;
         db.load_with_mode(&data_source, load_mode)
             .await
             .map_err(to_napi_err)
@@ -127,56 +136,44 @@ impl JsDatabase {
         query_name: String,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let queries = parse_query(&query_source).map_err(to_napi_err)?;
-        let query = queries
-            .queries
-            .iter()
-            .find(|q| q.name == query_name)
-            .ok_or_else(|| napi::Error::from_reason(format!("query '{}' not found", query_name)))?
-            .clone();
-
-        let param_map: ParamMap = js_object_to_param_map(params.as_ref(), &query.params)?;
+        let query = find_named_query(&query_source, &query_name).map_err(to_napi_input_err)?;
+        let param_map = js_object_to_param_map(params.as_ref(), &query.params)?;
+        let db = self.db().await?;
 
         if query.mutation.is_some() {
-            // Mutation path — holds lock for the entire operation
-            let mut guard = self.inner.lock().await;
-            let db = guard
-                .as_mut()
-                .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
-
-            let checked = typecheck_query_decl(db.catalog(), &query).map_err(to_napi_err)?;
-            if !matches!(checked, CheckedQuery::Mutation(_)) {
-                return Err(napi::Error::from_reason("expected mutation query"));
-            }
-
-            let mutation_ir = lower_mutation_query(&query).map_err(to_napi_err)?;
-            let result = execute_mutation(&mutation_ir, db, &param_map)
+            let result = db
+                .run_query(&query, &param_map)
                 .await
                 .map_err(to_napi_err)?;
-
-            Ok(serde_json::json!({
-                "affectedNodes": result.affected_nodes,
-                "affectedEdges": result.affected_edges,
-            }))
-        } else {
-            // Read path — clone catalog + snapshot, then release lock
-            let (catalog, storage) = {
-                let guard = self.inner.lock().await;
-                let db = guard
-                    .as_ref()
-                    .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
-                (db.catalog().clone(), db.snapshot())
-            };
-
-            let type_ctx = typecheck_query(&catalog, &query).map_err(to_napi_err)?;
-            let ir = lower_query(&catalog, &query, &type_ctx).map_err(to_napi_err)?;
-            let results = execute_query(&ir, storage, &param_map)
-                .await
-                .map_err(to_napi_err)?;
-
-            let rows = record_batches_to_json_rows(&results);
-            Ok(serde_json::Value::Array(rows))
+            return Ok(result.to_sdk_json());
         }
+
+        let prepared = db.prepare_read_query(&query).map_err(to_napi_err)?;
+        let result = prepared.execute(&param_map).await.map_err(to_napi_err)?;
+        Ok(result.to_sdk_json())
+    }
+
+    /// Execute a named read query and return an Arrow IPC stream as a Node Buffer.
+    #[napi(js_name = "runArrow")]
+    pub async fn run_arrow(
+        &self,
+        query_source: String,
+        query_name: String,
+        params: Option<serde_json::Value>,
+    ) -> Result<Buffer> {
+        let query = find_named_query(&query_source, &query_name).map_err(to_napi_input_err)?;
+        if query.mutation.is_some() {
+            return Err(napi::Error::from_reason(
+                "runArrow only supports read queries; use run() for mutations",
+            ));
+        }
+
+        let param_map = js_object_to_param_map(params.as_ref(), &query.params)?;
+        let db = self.db().await?;
+        let prepared = db.prepare_read_query(&query).map_err(to_napi_err)?;
+        let result = prepared.execute(&param_map).await.map_err(to_napi_err)?;
+        let encoded = result.to_arrow_ipc().map_err(to_napi_err)?;
+        Ok(Buffer::from(encoded))
     }
 
     /// Typecheck all queries in the source text against the database schema.
@@ -189,13 +186,8 @@ impl JsDatabase {
     #[napi]
     pub async fn check(&self, query_source: String) -> Result<serde_json::Value> {
         let queries = parse_query(&query_source).map_err(to_napi_err)?;
-
-        let guard = self.inner.lock().await;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
+        let db = self.db().await?;
         let catalog = db.catalog().clone();
-        drop(guard);
 
         let mut checks = Vec::with_capacity(queries.queries.len());
         for q in &queries.queries {
@@ -235,13 +227,8 @@ impl JsDatabase {
     /// ```
     #[napi]
     pub async fn describe(&self) -> Result<serde_json::Value> {
-        let ir = {
-            let guard = self.inner.lock().await;
-            let db = guard
-                .as_ref()
-                .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
-            db.schema_ir.clone()
-        };
+        let db = self.db().await?;
+        let ir = db.schema_ir.clone();
 
         let mut node_types = Vec::new();
         for nt in ir.node_types() {
@@ -281,10 +268,7 @@ impl JsDatabase {
     #[napi]
     pub async fn compact(&self, options: Option<serde_json::Value>) -> Result<serde_json::Value> {
         let opts = parse_compact_options(options.as_ref())?;
-        let mut guard = self.inner.lock().await;
-        let db = guard
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
+        let db = self.db().await?;
         let result = db.compact(opts).await.map_err(to_napi_err)?;
         Ok(serde_json::json!({
             "datasetsConsidered": result.datasets_considered,
@@ -305,10 +289,7 @@ impl JsDatabase {
     #[napi]
     pub async fn cleanup(&self, options: Option<serde_json::Value>) -> Result<serde_json::Value> {
         let opts = parse_cleanup_options(options.as_ref())?;
-        let mut guard = self.inner.lock().await;
-        let db = guard
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
+        let db = self.db().await?;
         let result = db.cleanup(opts).await.map_err(to_napi_err)?;
         Ok(serde_json::json!({
             "txRowsRemoved": result.tx_rows_removed,
@@ -328,10 +309,7 @@ impl JsDatabase {
     /// ```
     #[napi]
     pub async fn doctor(&self) -> Result<serde_json::Value> {
-        let guard = self.inner.lock().await;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
+        let db = self.db().await?;
         let report = db.doctor().await.map_err(to_napi_err)?;
         Ok(serde_json::json!({
             "healthy": report.healthy,
@@ -351,7 +329,7 @@ impl JsDatabase {
     /// ```
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         *guard = None;
         Ok(())
     }

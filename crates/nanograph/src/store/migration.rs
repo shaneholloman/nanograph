@@ -1002,7 +1002,8 @@ fn classify_endpoint_rebind(
     old_edge: &EdgeTypeDef,
     new_edge: &EdgeTypeDef,
 ) -> (MigrationSafety, String) {
-    let Some(seg) = db.storage.edge_segments.get(&old_edge.name) else {
+    let storage = db.snapshot();
+    let Some(seg) = storage.edge_segments.get(&old_edge.name) else {
         return (
             MigrationSafety::Blocked,
             format!("edge segment for `{}` not found", old_edge.name),
@@ -1015,7 +1016,7 @@ fn classify_endpoint_rebind(
         );
     }
 
-    let node_sets = build_node_id_sets_by_type_id(old_ir, &db.storage);
+    let node_sets = build_node_id_sets_by_type_id(old_ir, storage.as_ref());
     let new_src = node_sets.get(&new_edge.src_type_id);
     let new_dst = node_sets.get(&new_edge.dst_type_id);
     if new_src.is_none() || new_dst.is_none() {
@@ -1078,14 +1079,16 @@ fn build_node_id_sets_by_type_id(
 }
 
 fn get_node_column(db: &Database, type_name: &str, prop_name: &str) -> Result<Option<ArrayRef>> {
-    let Some(batch) = db.storage.get_all_nodes(type_name)? else {
+    let storage = db.snapshot();
+    let Some(batch) = storage.get_all_nodes(type_name)? else {
         return Ok(None);
     };
     Ok(batch.column_by_name(prop_name).cloned())
 }
 
 fn get_edge_column(db: &Database, type_name: &str, prop_name: &str) -> Result<Option<ArrayRef>> {
-    let Some(batch) = db.storage.edge_batch_for_save(type_name)? else {
+    let storage = db.snapshot();
+    let Some(batch) = storage.edge_batch_for_save(type_name)? else {
         return Ok(None);
     };
     Ok(batch.column_by_name(prop_name).cloned())
@@ -1251,6 +1254,7 @@ fn transform_storage_for_new_schema(
     new_catalog: &Catalog,
 ) -> Result<GraphStorage> {
     let mut out = GraphStorage::new(new_catalog.clone());
+    let old_storage = old_db.snapshot();
 
     let old_nodes_by_id = old_db
         .schema_ir
@@ -1278,7 +1282,7 @@ fn transform_storage_for_new_schema(
         let Some(old_node) = old_nodes_by_id.get(&new_node.type_id) else {
             continue;
         };
-        let Some(old_batch) = old_db.storage.get_all_nodes(&old_node.name)? else {
+        let Some(old_batch) = old_storage.get_all_nodes(&old_node.name)? else {
             continue;
         };
         let old_props_by_id = old_node
@@ -1342,7 +1346,7 @@ fn transform_storage_for_new_schema(
         let Some(old_edge) = old_edges_by_id.get(&new_edge.type_id) else {
             continue;
         };
-        let Some(old_batch) = old_db.storage.edge_batch_for_save(&old_edge.name)? else {
+        let Some(old_batch) = old_storage.edge_batch_for_save(&old_edge.name)? else {
             continue;
         };
         let old_props_by_id = old_edge

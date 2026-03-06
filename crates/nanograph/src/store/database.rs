@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::BooleanBuilder;
@@ -16,11 +17,23 @@ use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{CompactionOptions as LanceCompactionOptions, compact_files};
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{debug, info, instrument};
 
 use crate::catalog::Catalog;
 use crate::catalog::schema_ir::{SchemaIR, build_catalog_from_ir, build_schema_ir};
 use crate::error::{NanoError, Result};
+use crate::ir::{ParamMap, QueryIR};
+use crate::plan::physical::execute_mutation;
+use crate::query::ast::QueryDecl;
+use crate::query::parser::parse_query;
+use crate::query::typecheck::{
+    CheckedQuery, infer_query_result_schema, typecheck_query, typecheck_query_decl,
+};
+use crate::query_input::{
+    JsonParamMode, RunInputResult, find_named_query, json_params_to_param_map,
+};
+use crate::result::{MutationResult, QueryResult, RunResult};
 use crate::schema::parser::parse_schema;
 use crate::store::graph::GraphStorage;
 use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
@@ -31,11 +44,29 @@ use crate::store::txlog::{
     CdcLogEntry, commit_manifest_and_logs, prune_logs_for_replay_window, read_cdc_log_entries,
     read_tx_catalog_entries, read_visible_cdc_entries, reconcile_logs_to_manifest,
 };
+use crate::{execute_query, lower_mutation_query, lower_query};
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
 const SCHEMA_IR_FILENAME: &str = "schema.ir.json";
 const CDC_ANALYTICS_DATASET_DIR: &str = "__cdc_analytics";
 const CDC_ANALYTICS_STATE_FILE: &str = "__cdc_analytics.state.json";
+pub(crate) const LANCE_INTERNAL_ID_FIELD: &str = "__ng_id";
+pub(crate) const LANCE_INTERNAL_SRC_FIELD: &str = "__ng_src";
+pub(crate) const LANCE_INTERNAL_DST_FIELD: &str = "__ng_dst";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanceDatasetKind {
+    Node,
+    Edge,
+    Plain,
+}
+
+pub(crate) fn logical_node_field_to_lance(field_name: &str) -> &str {
+    match field_name {
+        "id" => LANCE_INTERNAL_ID_FIELD,
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOp {
@@ -222,11 +253,63 @@ impl MutationPlan {
     }
 }
 
-pub struct Database {
+pub struct DatabaseShared {
     path: PathBuf,
     pub schema_ir: SchemaIR,
     pub catalog: Catalog,
-    pub storage: GraphStorage,
+    storage: RwLock<Arc<GraphStorage>>,
+    writer: Mutex<()>,
+}
+
+#[derive(Clone)]
+pub struct Database {
+    inner: Arc<DatabaseShared>,
+}
+
+pub(crate) struct DatabaseWriteGuard<'a> {
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedReadQuery {
+    ir: QueryIR,
+    output_schema: arrow_schema::SchemaRef,
+    storage: Arc<GraphStorage>,
+}
+
+impl PreparedReadQuery {
+    fn new(
+        ir: QueryIR,
+        output_schema: arrow_schema::SchemaRef,
+        storage: Arc<GraphStorage>,
+    ) -> Self {
+        Self {
+            ir,
+            output_schema,
+            storage,
+        }
+    }
+
+    pub async fn execute(&self, params: &ParamMap) -> Result<QueryResult> {
+        let batches = execute_query(&self.ir, self.storage.clone(), params).await?;
+        Ok(QueryResult::new(self.output_schema.clone(), batches))
+    }
+
+    pub fn ir(&self) -> &QueryIR {
+        &self.ir
+    }
+
+    pub fn output_schema(&self) -> &arrow_schema::SchemaRef {
+        &self.output_schema
+    }
+}
+
+impl Deref for Database {
+    type Target = DatabaseShared;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl Database {
@@ -265,10 +348,13 @@ impl Database {
         info!("database initialized");
 
         Ok(Database {
-            path: db_path.to_path_buf(),
-            schema_ir,
-            catalog,
-            storage,
+            inner: Arc::new(DatabaseShared {
+                path: db_path.to_path_buf(),
+                schema_ir,
+                catalog,
+                storage: RwLock::new(Arc::new(storage)),
+                writer: Mutex::new(()),
+            }),
         })
     }
 
@@ -355,10 +441,13 @@ impl Database {
         );
 
         Ok(Database {
-            path: db_path.to_path_buf(),
-            schema_ir,
-            catalog,
-            storage,
+            inner: Arc::new(DatabaseShared {
+                path: db_path.to_path_buf(),
+                schema_ir,
+                catalog,
+                storage: RwLock::new(Arc::new(storage)),
+                writer: Mutex::new(()),
+            }),
         })
     }
 
@@ -366,7 +455,7 @@ impl Database {
     /// - any `@key` in schema => `LoadMode::Merge`
     /// - no `@key` in schema => `LoadMode::Overwrite`
     #[instrument(skip(self, data_source))]
-    pub async fn load(&mut self, data_source: &str) -> Result<()> {
+    pub async fn load(&self, data_source: &str) -> Result<()> {
         let mode = if self
             .schema_ir
             .node_types()
@@ -381,14 +470,26 @@ impl Database {
 
     /// Load JSONL data using explicit semantics.
     #[instrument(skip(self, data_source), fields(mode = ?mode))]
-    pub async fn load_with_mode(&mut self, data_source: &str, mode: LoadMode) -> Result<()> {
+    pub async fn load_with_mode(&self, data_source: &str, mode: LoadMode) -> Result<()> {
+        let mut writer = self.lock_writer().await;
+        self.load_with_mode_locked(data_source, mode, &mut writer)
+            .await
+    }
+
+    async fn load_with_mode_locked(
+        &self,
+        data_source: &str,
+        mode: LoadMode,
+        writer: &mut DatabaseWriteGuard<'_>,
+    ) -> Result<()> {
         info!("starting database load");
-        self.apply_mutation_plan(MutationPlan::for_load(data_source, mode))
+        self.apply_mutation_plan_locked(MutationPlan::for_load(data_source, mode), writer)
             .await?;
+        let storage = self.snapshot();
         info!(
             mode = ?mode,
-            node_types = self.storage.node_segments.len(),
-            edge_types = self.storage.edge_segments.len(),
+            node_types = storage.node_segments.len(),
+            edge_types = storage.edge_segments.len(),
             "database load complete"
         );
 
@@ -396,33 +497,65 @@ impl Database {
     }
 
     /// Apply one append-only mutation payload through the unified mutation path.
-    pub async fn apply_append_mutation(
-        &mut self,
-        data_source: &str,
-        op_summary: &str,
-    ) -> Result<()> {
-        self.apply_mutation_plan(MutationPlan::append_mutation(data_source, op_summary))
+    pub async fn apply_append_mutation(&self, data_source: &str, op_summary: &str) -> Result<()> {
+        let mut writer = self.lock_writer().await;
+        self.apply_append_mutation_locked(data_source, op_summary, &mut writer)
             .await
     }
 
     /// Apply one keyed-merge mutation payload through the unified mutation path.
-    pub async fn apply_merge_mutation(
-        &mut self,
-        data_source: &str,
-        op_summary: &str,
-    ) -> Result<()> {
-        self.apply_mutation_plan(MutationPlan::merge_mutation(data_source, op_summary))
+    pub async fn apply_merge_mutation(&self, data_source: &str, op_summary: &str) -> Result<()> {
+        let mut writer = self.lock_writer().await;
+        self.apply_merge_mutation_locked(data_source, op_summary, &mut writer)
             .await
     }
 
     /// Delete nodes of a given type matching a predicate, cascading incident edges.
     #[instrument(skip(self), fields(type_name = type_name, property = %predicate.property))]
     pub async fn delete_nodes(
-        &mut self,
+        &self,
         type_name: &str,
         predicate: &DeletePredicate,
     ) -> Result<DeleteResult> {
-        let target_batch = match self.storage.get_all_nodes(type_name)? {
+        let mut writer = self.lock_writer().await;
+        self.delete_nodes_locked(type_name, predicate, &mut writer)
+            .await
+    }
+
+    pub(crate) async fn apply_append_mutation_locked(
+        &self,
+        data_source: &str,
+        op_summary: &str,
+        writer: &mut DatabaseWriteGuard<'_>,
+    ) -> Result<()> {
+        self.apply_mutation_plan_locked(
+            MutationPlan::append_mutation(data_source, op_summary),
+            writer,
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_merge_mutation_locked(
+        &self,
+        data_source: &str,
+        op_summary: &str,
+        writer: &mut DatabaseWriteGuard<'_>,
+    ) -> Result<()> {
+        self.apply_mutation_plan_locked(
+            MutationPlan::merge_mutation(data_source, op_summary),
+            writer,
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_nodes_locked(
+        &self,
+        type_name: &str,
+        predicate: &DeletePredicate,
+        writer: &mut DatabaseWriteGuard<'_>,
+    ) -> Result<DeleteResult> {
+        let current = self.snapshot();
+        let target_batch = match current.get_all_nodes(type_name)? {
             Some(batch) => batch,
             None => return Ok(DeleteResult::default()),
         };
@@ -443,8 +576,8 @@ impl Database {
         let filtered_target = arrow_select::filter::filter_record_batch(&target_batch, &keep_mask)
             .map_err(|e| NanoError::Storage(format!("node delete filter error: {}", e)))?;
 
-        let old_next_node_id = self.storage.next_node_id();
-        let old_next_edge_id = self.storage.next_edge_id();
+        let old_next_node_id = current.next_node_id();
+        let old_next_edge_id = current.next_edge_id();
         let mut new_storage = GraphStorage::new(self.catalog.clone());
 
         for node_def in self.schema_ir.node_types() {
@@ -455,14 +588,14 @@ impl Database {
                 continue;
             }
 
-            if let Some(batch) = self.storage.get_all_nodes(&node_def.name)? {
+            if let Some(batch) = current.get_all_nodes(&node_def.name)? {
                 new_storage.load_node_batch(&node_def.name, batch)?;
             }
         }
 
         let mut deleted_edges = 0usize;
         for edge_def in self.schema_ir.edge_types() {
-            if let Some(edge_batch) = self.storage.edge_batch_for_save(&edge_def.name)? {
+            if let Some(edge_batch) = current.edge_batch_for_save(&edge_def.name)? {
                 let filtered = filter_edge_batch_by_deleted_nodes(&edge_batch, &deleted_node_set)?;
                 deleted_edges += edge_batch.num_rows().saturating_sub(filtered.num_rows());
                 if filtered.num_rows() > 0 {
@@ -478,10 +611,10 @@ impl Database {
             new_storage.set_next_edge_id(old_next_edge_id);
         }
         new_storage.build_indices()?;
-        self.apply_mutation_plan(MutationPlan::prepared_storage(
-            new_storage,
-            "mutation:delete_nodes",
-        ))
+        self.apply_mutation_plan_locked(
+            MutationPlan::prepared_storage(new_storage, "mutation:delete_nodes"),
+            writer,
+        )
         .await?;
 
         Ok(DeleteResult {
@@ -493,9 +626,20 @@ impl Database {
     /// Delete edges of a given type matching a predicate.
     #[instrument(skip(self), fields(type_name = type_name, property = %predicate.property))]
     pub async fn delete_edges(
-        &mut self,
+        &self,
         type_name: &str,
         predicate: &DeletePredicate,
+    ) -> Result<DeleteResult> {
+        let mut writer = self.lock_writer().await;
+        self.delete_edges_locked(type_name, predicate, &mut writer)
+            .await
+    }
+
+    pub(crate) async fn delete_edges_locked(
+        &self,
+        type_name: &str,
+        predicate: &DeletePredicate,
+        writer: &mut DatabaseWriteGuard<'_>,
     ) -> Result<DeleteResult> {
         if !self.catalog.edge_types.contains_key(type_name) {
             return Err(NanoError::Storage(format!(
@@ -504,7 +648,8 @@ impl Database {
             )));
         }
 
-        let target_batch = match self.storage.edge_batch_for_save(type_name)? {
+        let current = self.snapshot();
+        let target_batch = match current.edge_batch_for_save(type_name)? {
             Some(batch) => batch,
             None => return Ok(DeleteResult::default()),
         };
@@ -525,12 +670,12 @@ impl Database {
             return Ok(DeleteResult::default());
         }
 
-        let old_next_node_id = self.storage.next_node_id();
-        let old_next_edge_id = self.storage.next_edge_id();
+        let old_next_node_id = current.next_node_id();
+        let old_next_edge_id = current.next_edge_id();
         let mut new_storage = GraphStorage::new(self.catalog.clone());
 
         for node_def in self.schema_ir.node_types() {
-            if let Some(batch) = self.storage.get_all_nodes(&node_def.name)? {
+            if let Some(batch) = current.get_all_nodes(&node_def.name)? {
                 new_storage.load_node_batch(&node_def.name, batch)?;
             }
         }
@@ -543,7 +688,7 @@ impl Database {
                 continue;
             }
 
-            if let Some(batch) = self.storage.edge_batch_for_save(&edge_def.name)? {
+            if let Some(batch) = current.edge_batch_for_save(&edge_def.name)? {
                 new_storage.load_edge_batch(&edge_def.name, batch)?;
             }
         }
@@ -555,10 +700,10 @@ impl Database {
             new_storage.set_next_edge_id(old_next_edge_id);
         }
         new_storage.build_indices()?;
-        self.apply_mutation_plan(MutationPlan::prepared_storage(
-            new_storage,
-            "mutation:delete_edges",
-        ))
+        self.apply_mutation_plan_locked(
+            MutationPlan::prepared_storage(new_storage, "mutation:delete_edges"),
+            writer,
+        )
         .await?;
 
         Ok(DeleteResult {
@@ -568,7 +713,8 @@ impl Database {
     }
 
     /// Compact all manifest-tracked Lance datasets and commit updated dataset versions.
-    pub async fn compact(&mut self, options: CompactOptions) -> Result<CompactResult> {
+    pub async fn compact(&self, options: CompactOptions) -> Result<CompactResult> {
+        let _writer = self.lock_writer().await;
         let previous_manifest = GraphManifest::read(&self.path)?;
         reconcile_logs_to_manifest(&self.path, previous_manifest.db_version)?;
         let mut next_manifest = previous_manifest.clone();
@@ -626,7 +772,8 @@ impl Database {
     }
 
     /// Prune tx/CDC logs and old Lance dataset versions while preserving manifest-visible state.
-    pub async fn cleanup(&mut self, options: CleanupOptions) -> Result<CleanupResult> {
+    pub async fn cleanup(&self, options: CleanupOptions) -> Result<CleanupResult> {
+        let _writer = self.lock_writer().await;
         if options.retain_tx_versions == 0 {
             return Err(NanoError::Storage(
                 "retain_tx_versions must be >= 1".to_string(),
@@ -776,6 +923,7 @@ impl Database {
         reconcile_logs_to_manifest(&self.path, manifest.db_version)?;
         let mut issues = Vec::new();
         let mut warnings = Vec::new();
+        let storage = self.snapshot();
 
         let tx_rows = read_tx_catalog_entries(&self.path)?;
         for (idx, window) in tx_rows.windows(2).enumerate() {
@@ -830,11 +978,9 @@ impl Database {
         }
 
         for edge_def in self.schema_ir.edge_types() {
-            let src_nodes =
-                collect_existing_ids(self.storage.get_all_nodes(&edge_def.src_type_name)?)?;
-            let dst_nodes =
-                collect_existing_ids(self.storage.get_all_nodes(&edge_def.dst_type_name)?)?;
-            if let Some(edge_batch) = self.storage.edge_batch_for_save(&edge_def.name)? {
+            let src_nodes = collect_existing_ids(storage.get_all_nodes(&edge_def.src_type_name)?)?;
+            let dst_nodes = collect_existing_ids(storage.get_all_nodes(&edge_def.dst_type_name)?)?;
+            if let Some(edge_batch) = storage.edge_batch_for_save(&edge_def.name)? {
                 let src_arr = edge_batch
                     .column_by_name("src")
                     .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
@@ -881,18 +1027,22 @@ impl Database {
         })
     }
 
-    async fn apply_mutation_plan(&mut self, plan: MutationPlan) -> Result<()> {
+    async fn apply_mutation_plan_locked(
+        &self,
+        plan: MutationPlan,
+        _writer: &mut DatabaseWriteGuard<'_>,
+    ) -> Result<()> {
         let MutationPlan {
             source,
             op_summary,
             cdc_events,
         } = plan;
-        let previous_storage = self.storage.clone();
-        let next_storage = match source {
+        let previous_storage = self.snapshot();
+        let mut next_storage = match source {
             MutationSource::Load { mode, data_source } => {
                 build_next_storage_for_load(
                     &self.path,
-                    &self.storage,
+                    previous_storage.as_ref(),
                     &self.schema_ir,
                     &data_source,
                     mode,
@@ -903,25 +1053,27 @@ impl Database {
         };
         let effective_cdc_events = if cdc_events.is_empty() {
             build_cdc_events_for_storage_transition(
-                &previous_storage,
+                previous_storage.as_ref(),
                 &next_storage,
                 &self.schema_ir,
             )?
         } else {
             cdc_events
         };
-        self.storage = next_storage;
-        self.persist_storage_with_cdc(&op_summary, &effective_cdc_events)
-            .await
+        self.persist_storage_with_cdc(&mut next_storage, &op_summary, &effective_cdc_events)
+            .await?;
+        self.replace_storage(next_storage);
+        Ok(())
     }
 
     async fn persist_storage_with_cdc(
-        &mut self,
+        &self,
+        storage: &mut GraphStorage,
         op_summary: &str,
         cdc_events: &[CdcLogEntry],
     ) -> Result<()> {
         let previous_manifest = GraphManifest::read(&self.path)?;
-        self.storage.clear_node_dataset_paths();
+        storage.clear_node_dataset_paths();
         let mut dataset_entries = Vec::new();
         let mut previous_entries_by_key: HashMap<String, DatasetEntry> = HashMap::new();
         for entry in &previous_manifest.datasets {
@@ -970,13 +1122,13 @@ impl Database {
 
         // Write each node type to Lance
         for node_def in self.schema_ir.node_types() {
-            if let Some(batch) = self.storage.get_all_nodes(&node_def.name)? {
+            if let Some(batch) = storage.get_all_nodes(&node_def.name)? {
                 let entity_key = dataset_entity_key("node", &node_def.name);
                 let previous_entry = previous_entries_by_key.get(&entity_key).cloned();
 
                 if !changed_entities.contains(&entity_key) {
                     if let Some(prev) = previous_entry {
-                        self.storage.set_node_dataset_path(
+                        storage.set_node_dataset_path(
                             &node_def.name,
                             self.path.join(&prev.dataset_path),
                         );
@@ -991,17 +1143,21 @@ impl Database {
                     .map(|entry| entry.dataset_path.clone())
                     .unwrap_or_else(|| format!("nodes/{}", SchemaIR::dir_name(node_def.type_id)));
                 let dataset_path = self.path.join(&dataset_rel_path);
+                let duplicate_field_names =
+                    schema_has_duplicate_field_names(batch.schema().as_ref());
                 let key_prop = node_def
                     .properties
                     .iter()
                     .find(|prop| prop.key)
                     .map(|prop| prop.name.as_str());
                 let can_merge_upsert = merge_commit
+                    && !duplicate_field_names
                     && previous_entry.is_some()
                     && key_prop.is_some()
                     && changed_entities.contains(&entity_key)
                     && !non_upsert_entities.contains(&entity_key);
                 let can_append = append_only_commit
+                    && !duplicate_field_names
                     && previous_entry.is_some()
                     && changed_entities.contains(&entity_key)
                     && !non_insert_entities.contains(&entity_key);
@@ -1099,8 +1255,7 @@ impl Database {
                 };
                 rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
                 rebuild_node_vector_indexes(&dataset_path, node_def).await?;
-                self.storage
-                    .set_node_dataset_path(&node_def.name, dataset_path.clone());
+                storage.set_node_dataset_path(&node_def.name, dataset_path.clone());
                 dataset_entries.push(DatasetEntry {
                     type_id: node_def.type_id,
                     type_name: node_def.name.clone(),
@@ -1114,7 +1269,7 @@ impl Database {
 
         // Write each edge type to Lance
         for edge_def in self.schema_ir.edge_types() {
-            if let Some(batch) = self.storage.edge_batch_for_save(&edge_def.name)? {
+            if let Some(batch) = storage.edge_batch_for_save(&edge_def.name)? {
                 let entity_key = dataset_entity_key("edge", &edge_def.name);
                 let previous_entry = previous_entries_by_key.get(&entity_key).cloned();
 
@@ -1131,7 +1286,10 @@ impl Database {
                     .map(|entry| entry.dataset_path.clone())
                     .unwrap_or_else(|| format!("edges/{}", SchemaIR::dir_name(edge_def.type_id)));
                 let dataset_path = self.path.join(&dataset_rel_path);
+                let duplicate_field_names =
+                    schema_has_duplicate_field_names(batch.schema().as_ref());
                 let can_append = append_only_commit
+                    && !duplicate_field_names
                     && previous_entry.is_some()
                     && changed_entities.contains(&entity_key)
                     && !non_insert_entities.contains(&entity_key);
@@ -1211,8 +1369,8 @@ impl Database {
         manifest.db_version = previous_manifest.db_version.saturating_add(1);
         manifest.last_tx_id = format!("manifest-{}", manifest.db_version);
         manifest.committed_at = now_unix_seconds_string();
-        manifest.next_node_id = self.storage.next_node_id();
-        manifest.next_edge_id = self.storage.next_edge_id();
+        manifest.next_node_id = storage.next_node_id();
+        manifest.next_edge_id = storage.next_edge_id();
         let (next_type_id, next_prop_id) = next_schema_identity_counters(&self.schema_ir);
         manifest.next_type_id = next_type_id;
         manifest.next_prop_id = next_prop_id;
@@ -1232,9 +1390,100 @@ impl Database {
         &self.catalog
     }
 
-    /// Clone storage into Arc for query execution.
+    pub fn schema_ir(&self) -> &SchemaIR {
+        &self.schema_ir
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) async fn lock_writer(&self) -> DatabaseWriteGuard<'_> {
+        DatabaseWriteGuard {
+            _guard: self.writer.lock().await,
+        }
+    }
+
+    fn snapshot_storage(&self) -> Arc<GraphStorage> {
+        self.storage
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace_storage(&self, storage: GraphStorage) {
+        *self
+            .storage
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(storage);
+    }
+
+    /// Clone the current storage snapshot for query execution.
     pub fn snapshot(&self) -> Arc<GraphStorage> {
-        Arc::new(self.storage.clone())
+        self.snapshot_storage()
+    }
+
+    fn prepare_read_query_with_storage(
+        &self,
+        query: &QueryDecl,
+        storage: Arc<GraphStorage>,
+    ) -> Result<PreparedReadQuery> {
+        let catalog = self.catalog().clone();
+        let type_ctx = typecheck_query(&catalog, query)?;
+        let output_schema = infer_query_result_schema(&catalog, query, &type_ctx)?;
+        let ir = lower_query(&catalog, query, &type_ctx)?;
+        Ok(PreparedReadQuery::new(ir, output_schema, storage))
+    }
+
+    pub fn prepare_read_query(&self, query: &QueryDecl) -> Result<PreparedReadQuery> {
+        let mut prepared_storage = self.snapshot().as_ref().clone();
+        prepared_storage.clear_node_dataset_paths();
+        self.prepare_read_query_with_storage(query, Arc::new(prepared_storage))
+    }
+
+    pub async fn run_query(&self, query: &QueryDecl, params: &ParamMap) -> Result<RunResult> {
+        if query.mutation.is_some() {
+            let checked = typecheck_query_decl(self.catalog(), query)?;
+            if !matches!(checked, CheckedQuery::Mutation(_)) {
+                return Err(NanoError::Type("expected mutation query".to_string()));
+            }
+
+            let mutation_ir = lower_mutation_query(query)?;
+            let mut writer = self.lock_writer().await;
+            let result = execute_mutation(&mutation_ir, self, params, &mut writer).await?;
+            return Ok(RunResult::Mutation(MutationResult::from(result)));
+        }
+
+        let prepared = self.prepare_read_query_with_storage(query, self.snapshot())?;
+        let result = prepared.execute(params).await?;
+        Ok(RunResult::Query(result))
+    }
+
+    pub async fn run(
+        &self,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<RunResult> {
+        let queries = parse_query(query_source)?;
+        let query = queries
+            .queries
+            .into_iter()
+            .find(|query| query.name == query_name)
+            .ok_or_else(|| NanoError::Execution(format!("query '{}' not found", query_name)))?;
+        self.run_query(&query, params).await
+    }
+
+    pub async fn run_json(
+        &self,
+        query_source: &str,
+        query_name: &str,
+        params: Option<&serde_json::Value>,
+        mode: JsonParamMode,
+    ) -> RunInputResult<RunResult> {
+        let query = find_named_query(query_source, query_name)?;
+        let params = json_params_to_param_map(params, &query.params, mode)?;
+        self.run_query(&query, &params).await.map_err(Into::into)
     }
 }
 
@@ -2011,6 +2260,90 @@ fn cdc_rows_to_analytics_batch(rows: &[CdcLogEntry]) -> Result<RecordBatch> {
     .map_err(|e| NanoError::Storage(format!("build CDC analytics batch: {}", e)))
 }
 
+fn schema_has_duplicate_field_names(schema: &arrow_schema::Schema) -> bool {
+    let mut seen = HashSet::with_capacity(schema.fields().len());
+    schema
+        .fields()
+        .iter()
+        .any(|field| !seen.insert(field.name().clone()))
+}
+
+fn lance_dataset_kind(path: &Path) -> LanceDatasetKind {
+    match path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+    {
+        Some("nodes") => LanceDatasetKind::Node,
+        Some("edges") => LanceDatasetKind::Edge,
+        _ => LanceDatasetKind::Plain,
+    }
+}
+
+fn rename_batch_fields(batch: &RecordBatch, renames: &[(usize, &str)]) -> Result<RecordBatch> {
+    let mut fields: Vec<arrow_schema::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    for (index, new_name) in renames {
+        if *index >= fields.len() {
+            return Err(NanoError::Storage(format!(
+                "cannot rename field {} in schema with {} field(s)",
+                index,
+                fields.len()
+            )));
+        }
+        fields[*index] = fields[*index].clone().with_name(*new_name);
+    }
+
+    RecordBatch::try_new(
+        Arc::new(arrow_schema::Schema::new(fields)),
+        batch.columns().to_vec(),
+    )
+    .map_err(|e| NanoError::Storage(format!("rename batch schema error: {}", e)))
+}
+
+fn logical_batch_to_lance(batch: &RecordBatch, kind: LanceDatasetKind) -> Result<RecordBatch> {
+    match kind {
+        LanceDatasetKind::Node => rename_batch_fields(batch, &[(0, LANCE_INTERNAL_ID_FIELD)]),
+        LanceDatasetKind::Edge => rename_batch_fields(
+            batch,
+            &[
+                (0, LANCE_INTERNAL_ID_FIELD),
+                (1, LANCE_INTERNAL_SRC_FIELD),
+                (2, LANCE_INTERNAL_DST_FIELD),
+            ],
+        ),
+        LanceDatasetKind::Plain => Ok(batch.clone()),
+    }
+}
+
+fn lance_batch_to_logical(batch: &RecordBatch, kind: LanceDatasetKind) -> Result<RecordBatch> {
+    match kind {
+        LanceDatasetKind::Node => {
+            if batch.schema().field(0).name() == LANCE_INTERNAL_ID_FIELD {
+                rename_batch_fields(batch, &[(0, "id")])
+            } else {
+                Ok(batch.clone())
+            }
+        }
+        LanceDatasetKind::Edge => {
+            if batch.schema().fields().len() >= 3
+                && batch.schema().field(0).name() == LANCE_INTERNAL_ID_FIELD
+                && batch.schema().field(1).name() == LANCE_INTERNAL_SRC_FIELD
+                && batch.schema().field(2).name() == LANCE_INTERNAL_DST_FIELD
+            {
+                rename_batch_fields(batch, &[(0, "id"), (1, "src"), (2, "dst")])
+            } else {
+                Ok(batch.clone())
+            }
+        }
+        LanceDatasetKind::Plain => Ok(batch.clone()),
+    }
+}
+
 // ── Lance helpers ───────────────────────────────────────────────────────────
 
 async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<u64> {
@@ -2028,6 +2361,8 @@ async fn write_lance_batch_with_mode(
         mode = ?mode,
         "writing Lance dataset"
     );
+    let kind = lance_dataset_kind(path);
+    let batch = logical_batch_to_lance(&batch, kind)?;
     let schema = batch.schema();
     let uri = path.to_string_lossy().to_string();
 
@@ -2051,6 +2386,7 @@ async fn run_lance_merge_insert_with_key(
     source_batch: RecordBatch,
     key_prop: &str,
 ) -> Result<u64> {
+    let kind = lance_dataset_kind(dataset_path);
     let uri = dataset_path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri)
         .await
@@ -2072,6 +2408,7 @@ async fn run_lance_merge_insert_with_key(
         .when_not_matched(WhenNotMatched::InsertAll)
         .conflict_retries(0);
 
+    let source_batch = logical_batch_to_lance(&source_batch, kind)?;
     let source_schema = source_batch.schema();
     let source = Box::new(RecordBatchIterator::new(
         vec![Ok(source_batch)].into_iter(),
@@ -2113,7 +2450,7 @@ async fn run_lance_delete_by_ids(
 
     let predicate = ids
         .iter()
-        .map(|id| format!("id = {}", id))
+        .map(|id| format!("{} = {}", LANCE_INTERNAL_ID_FIELD, id))
         .collect::<Vec<_>>()
         .join(" OR ");
     dataset
@@ -2139,6 +2476,7 @@ async fn read_lance_batches(path: &Path, version: u64) -> Result<Vec<RecordBatch
         .await
         .map_err(|e| NanoError::Lance(format!("checkout version {} error: {}", version, e)))?;
 
+    let kind = lance_dataset_kind(path);
     let scanner = dataset.scan();
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
@@ -2148,6 +2486,9 @@ async fn read_lance_batches(path: &Path, version: u64) -> Result<Vec<RecordBatch
         .collect::<Vec<_>>()
         .await
         .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|batch| lance_batch_to_logical(&batch, kind))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(batches)
@@ -2291,6 +2632,36 @@ edge Knows: Person -> Person
 "#
     }
 
+    fn id_named_key_schema_src() -> &'static str {
+        r#"node Person {
+    id: String @key
+    name: String
+    age: I32?
+}
+edge Knows: Person -> Person
+"#
+    }
+
+    fn id_named_key_initial_data_src() -> &'static str {
+        r#"{"type": "Person", "data": {"id": "usr_alice", "name": "Alice", "age": 30}}
+{"type": "Person", "data": {"id": "usr_bob", "name": "Bob", "age": 25}}
+{"edge": "Knows", "from": "usr_alice", "to": "usr_bob"}
+"#
+    }
+
+    fn id_named_key_append_data_src() -> &'static str {
+        r#"{"type": "Person", "data": {"id": "usr_charlie", "name": "Charlie", "age": 40}}
+{"edge": "Knows", "from": "usr_charlie", "to": "usr_alice"}
+"#
+    }
+
+    fn id_named_key_merge_data_src() -> &'static str {
+        r#"{"type": "Person", "data": {"id": "usr_alice", "name": "Alice", "age": 31}}
+{"type": "Person", "data": {"id": "usr_charlie", "name": "Charlie", "age": 40}}
+{"edge": "Knows", "from": "usr_alice", "to": "usr_charlie"}
+"#
+    }
+
     fn append_data_new_person_with_edge_to_existing() -> &'static str {
         r#"{"type": "Person", "data": {"name": "Diana", "age": 28}}
 {"edge": "Knows", "from": "Diana", "to": "Alice"}
@@ -2319,6 +2690,20 @@ edge Knows: Person -> Person
     fn unique_data_incoming_incoming_conflict() -> &'static str {
         r#"{"type": "Person", "data": {"name": "Charlie", "email": "charlie@example.com"}}
 {"type": "Person", "data": {"name": "Diana", "email": "charlie@example.com"}}
+"#
+    }
+
+    fn id_named_unique_schema_src() -> &'static str {
+        r#"node Person {
+    id: String @unique
+    name: String
+}
+"#
+    }
+
+    fn id_named_unique_duplicate_data() -> &'static str {
+        r#"{"type": "Person", "data": {"id": "user-1", "name": "Alice"}}
+{"type": "Person", "data": {"id": "user-1", "name": "Bob"}}
 "#
     }
 
@@ -2466,6 +2851,47 @@ edge Knows: Person -> Person
             .unwrap()
     }
 
+    fn person_internal_id_by_user_id(batch: &RecordBatch, user_id: &str) -> u64 {
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let user_id_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        (0..batch.num_rows())
+            .find(|&i| user_id_col.value(i) == user_id)
+            .map(|i| id_col.value(i))
+            .unwrap()
+    }
+
+    fn person_age_by_user_id(batch: &RecordBatch, user_id: &str) -> Option<i32> {
+        let user_id_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let age_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        (0..batch.num_rows()).find_map(|i| {
+            if user_id_col.value(i) == user_id {
+                Some(if age_col.is_null(i) {
+                    None
+                } else {
+                    Some(age_col.value(i))
+                })
+            } else {
+                None
+            }
+        })?
+    }
+
     fn doc_title_by_slug(batch: &RecordBatch, slug: &str) -> Option<String> {
         let slug_col = batch
             .column_by_name("slug")
@@ -2552,19 +2978,21 @@ edge Knows: Person -> Person
         db.load(test_data_src()).await.unwrap();
 
         // Verify in-memory
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 3);
 
         // Reopen
         let db2 = Database::open(path).await.unwrap();
-        let persons2 = db2.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage2 = db2.snapshot();
+        let persons2 = storage2.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons2.num_rows(), 3);
 
-        let companies = db2.storage.get_all_nodes("Company").unwrap().unwrap();
+        let companies = storage2.get_all_nodes("Company").unwrap().unwrap();
         assert_eq!(companies.num_rows(), 1);
 
         // Verify edges survived
-        let knows_seg = &db2.storage.edge_segments["Knows"];
+        let knows_seg = &storage2.edge_segments["Knows"];
         assert_eq!(knows_seg.edge_ids.len(), 2);
         assert!(knows_seg.csr.is_some());
     }
@@ -2694,7 +3122,8 @@ edge Knows: Person -> Person
         file.sync_all().unwrap();
 
         let reopened = Database::open(path).await.unwrap();
-        let persons = reopened.storage.get_all_nodes("Person").unwrap().unwrap();
+        let reopened_storage = reopened.snapshot();
+        let persons = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 3);
 
         let rows = read_tx_catalog_entries(path).unwrap();
@@ -2723,7 +3152,8 @@ edge Knows: Person -> Person
         assert_eq!(rows_before.len(), 2);
 
         let reopened = Database::open(path).await.unwrap();
-        let persons = reopened.storage.get_all_nodes("Person").unwrap().unwrap();
+        let reopened_storage = reopened.snapshot();
+        let persons = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 3);
 
         let rows_after = read_tx_catalog_entries(path).unwrap();
@@ -2739,7 +3169,8 @@ edge Knows: Person -> Person
         let mut db = Database::init(path, test_schema_src()).await.unwrap();
         db.load(duplicate_edge_data_src()).await.unwrap();
 
-        let knows_seg = &db.storage.edge_segments["Knows"];
+        let storage = db.snapshot();
+        let knows_seg = &storage.edge_segments["Knows"];
         assert_eq!(knows_seg.edge_ids.len(), 1);
     }
 
@@ -2759,7 +3190,8 @@ edge Knows: Person -> Person
         .await
         .unwrap();
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 1);
         let names = persons
             .column_by_name("name")
@@ -2768,6 +3200,49 @@ edge Knows: Person -> Person
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(names.value(0), "OnlyOne");
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_overwrite_supports_user_property_named_id_key() {
+        let dir = test_dir("mode_overwrite_user_id_key");
+        let path = dir.path();
+
+        let mut db = Database::init(path, id_named_key_schema_src())
+            .await
+            .unwrap();
+        db.load_with_mode(id_named_key_initial_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(persons.num_rows(), 2);
+        let user_ids = persons
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(user_ids.value(0), "usr_alice");
+        assert_eq!(user_ids.value(1), "usr_bob");
+
+        let alice_id = person_internal_id_by_user_id(&persons, "usr_alice");
+        let bob_id = person_internal_id_by_user_id(&persons, "usr_bob");
+        let knows = storage.edge_batch_for_save("Knows").unwrap().unwrap();
+        let src = knows
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let dst = knows
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(knows.num_rows(), 1);
+        assert_eq!(src.value(0), alice_id);
+        assert_eq!(dst.value(0), bob_id);
     }
 
     #[tokio::test]
@@ -2786,11 +3261,12 @@ edge Knows: Person -> Person
         .await
         .unwrap();
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 4);
         let alice_id = person_id_by_name(&persons, "Alice");
         let diana_id = person_id_by_name(&persons, "Diana");
-        let knows = db.storage.edge_batch_for_save("Knows").unwrap().unwrap();
+        let knows = storage.edge_batch_for_save("Knows").unwrap().unwrap();
         let src = knows
             .column_by_name("src")
             .unwrap()
@@ -2806,6 +3282,45 @@ edge Knows: Person -> Person
         assert!(
             (0..knows.num_rows())
                 .any(|row| src.value(row) == diana_id && dst.value(row) == alice_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_append_supports_user_property_named_id_key() {
+        let dir = test_dir("mode_append_user_id_key");
+        let path = dir.path();
+
+        let mut db = Database::init(path, id_named_key_schema_src())
+            .await
+            .unwrap();
+        db.load_with_mode(id_named_key_initial_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.load_with_mode(id_named_key_append_data_src(), LoadMode::Append)
+            .await
+            .unwrap();
+
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(persons.num_rows(), 3);
+        let alice_id = person_internal_id_by_user_id(&persons, "usr_alice");
+        let charlie_id = person_internal_id_by_user_id(&persons, "usr_charlie");
+        let knows = storage.edge_batch_for_save("Knows").unwrap().unwrap();
+        let src = knows
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let dst = knows
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert!(
+            (0..knows.num_rows())
+                .any(|row| src.value(row) == charlie_id && dst.value(row) == alice_id)
         );
     }
 
@@ -2872,9 +3387,60 @@ edge Knows: Person -> Person
             .await
             .unwrap();
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 3);
         assert_eq!(person_age_by_name(&persons, "Alice"), Some(31));
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_merge_supports_user_property_named_id_key() {
+        let dir = test_dir("mode_merge_user_id_key");
+        let path = dir.path();
+
+        let mut db = Database::init(path, id_named_key_schema_src())
+            .await
+            .unwrap();
+        db.load_with_mode(id_named_key_initial_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+
+        let before_storage = db.snapshot();
+        let persons_before = before_storage.get_all_nodes("Person").unwrap().unwrap();
+        let alice_id_before = person_internal_id_by_user_id(&persons_before, "usr_alice");
+
+        db.load_with_mode(id_named_key_merge_data_src(), LoadMode::Merge)
+            .await
+            .unwrap();
+
+        let after_storage = db.snapshot();
+        let persons_after = after_storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(persons_after.num_rows(), 3);
+        assert_eq!(
+            person_internal_id_by_user_id(&persons_after, "usr_alice"),
+            alice_id_before
+        );
+        assert_eq!(person_age_by_user_id(&persons_after, "usr_alice"), Some(31));
+
+        let alice_id_after = person_internal_id_by_user_id(&persons_after, "usr_alice");
+        let charlie_id = person_internal_id_by_user_id(&persons_after, "usr_charlie");
+        let knows = after_storage.edge_batch_for_save("Knows").unwrap().unwrap();
+        let src = knows
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let dst = knows
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert!(
+            (0..knows.num_rows())
+                .any(|row| src.value(row) == alice_id_after && dst.value(row) == charlie_id)
+        );
     }
 
     #[tokio::test]
@@ -2899,7 +3465,8 @@ edge Knows: Person -> Person
             .await
             .unwrap();
 
-        let docs = reopened.storage.get_all_nodes("Doc").unwrap().unwrap();
+        let reopened_storage = reopened.snapshot();
+        let docs = reopened_storage.get_all_nodes("Doc").unwrap().unwrap();
         assert_eq!(docs.num_rows(), 2);
         assert_eq!(doc_title_by_slug(&docs, "a").as_deref(), Some("A"));
         assert_eq!(doc_title_by_slug(&docs, "b").as_deref(), Some("B"));
@@ -2927,7 +3494,8 @@ edge Knows: Person -> Person
             .await
             .unwrap();
 
-        let docs = reopened.storage.get_all_nodes("Doc").unwrap().unwrap();
+        let reopened_storage = reopened.snapshot();
+        let docs = reopened_storage.get_all_nodes("Doc").unwrap().unwrap();
         assert_eq!(docs.num_rows(), 2);
         assert_eq!(doc_title_by_slug(&docs, "a").as_deref(), Some("A2"));
         assert_eq!(doc_title_by_slug(&docs, "b").as_deref(), Some("B"));
@@ -3025,7 +3593,8 @@ edge Knows: Person -> Person
             }
 
             result.unwrap();
-            let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+            let storage = db.snapshot();
+            let persons = storage.get_all_nodes("Person").unwrap().unwrap();
             assert_eq!(
                 persons.num_rows(),
                 case.expected_person_rows.unwrap(),
@@ -3218,7 +3787,8 @@ edge Knows: Person -> Person
         assert_eq!(result.deleted_nodes, 1);
         assert_eq!(result.deleted_edges, 3);
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 2);
         let name_col = persons
             .column(1)
@@ -3231,8 +3801,8 @@ edge Knows: Person -> Person
         names.sort();
         assert_eq!(names, vec!["Bob".to_string(), "Charlie".to_string()]);
 
-        assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 0);
-        assert_eq!(db.storage.edge_segments["WorksAt"].edge_ids.len(), 0);
+        assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 0);
+        assert_eq!(storage.edge_segments["WorksAt"].edge_ids.len(), 0);
 
         let tx_rows = read_tx_catalog_entries(path).unwrap();
         assert_eq!(tx_rows.len(), 2);
@@ -3253,10 +3823,11 @@ edge Knows: Person -> Person
 
         drop(db);
         let reopened = Database::open(path).await.unwrap();
-        let persons2 = reopened.storage.get_all_nodes("Person").unwrap().unwrap();
+        let reopened_storage = reopened.snapshot();
+        let persons2 = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons2.num_rows(), 2);
-        assert_eq!(reopened.storage.edge_segments["Knows"].edge_ids.len(), 0);
-        assert_eq!(reopened.storage.edge_segments["WorksAt"].edge_ids.len(), 0);
+        assert_eq!(reopened_storage.edge_segments["Knows"].edge_ids.len(), 0);
+        assert_eq!(reopened_storage.edge_segments["WorksAt"].edge_ids.len(), 0);
     }
 
     #[tokio::test]
@@ -3267,7 +3838,8 @@ edge Knows: Person -> Person
         let mut db = Database::init(path, test_schema_src()).await.unwrap();
         db.load(test_data_src()).await.unwrap();
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         let alice_id = person_id_by_name(&persons, "Alice");
         let result = db
             .delete_edges(
@@ -3283,8 +3855,9 @@ edge Knows: Person -> Person
 
         assert_eq!(result.deleted_nodes, 0);
         assert_eq!(result.deleted_edges, 2);
-        assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 0);
-        assert_eq!(db.storage.edge_segments["WorksAt"].edge_ids.len(), 1);
+        let storage = db.snapshot();
+        assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 0);
+        assert_eq!(storage.edge_segments["WorksAt"].edge_ids.len(), 1);
 
         let tx_rows = read_tx_catalog_entries(path).unwrap();
         assert_eq!(tx_rows.len(), 2);
@@ -3300,8 +3873,9 @@ edge Knows: Person -> Person
 
         drop(db);
         let reopened = Database::open(path).await.unwrap();
-        assert_eq!(reopened.storage.edge_segments["Knows"].edge_ids.len(), 0);
-        assert_eq!(reopened.storage.edge_segments["WorksAt"].edge_ids.len(), 1);
+        let reopened_storage = reopened.snapshot();
+        assert_eq!(reopened_storage.edge_segments["Knows"].edge_ids.len(), 0);
+        assert_eq!(reopened_storage.edge_segments["WorksAt"].edge_ids.len(), 1);
     }
 
     #[tokio::test]
@@ -3315,7 +3889,8 @@ edge Knows: Person -> Person
         let knows_path_before = dataset_rel_path_for(&manifest_before, "edge", "Knows");
         let works_at_version_before = dataset_version_for(&manifest_before, "edge", "WorksAt");
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         let bob_id = person_id_by_name(&persons, "Bob");
         let result = db
             .delete_edges(
@@ -3383,6 +3958,160 @@ edge Knows: Person -> Person
     }
 
     #[tokio::test]
+    async fn test_cloned_handles_observe_committed_storage_swaps() {
+        let dir = test_dir("shared_handle_commit");
+        let path = dir.path();
+
+        let db = Database::init(path, test_schema_src()).await.unwrap();
+        let db2 = db.clone();
+
+        db.load_with_mode(test_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+
+        let storage = db2.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+        let companies = storage.get_all_nodes("Company").unwrap().unwrap();
+        assert_eq!(persons.num_rows(), 3);
+        assert_eq!(companies.num_rows(), 1);
+        assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_mutations_on_cloned_handles_do_not_lose_updates() {
+        let dir = test_dir("shared_handle_mutations");
+        let path = dir.path();
+
+        let db = Database::init(path, test_schema_src()).await.unwrap();
+        let db1 = db.clone();
+        let db2 = db.clone();
+
+        let alice = r#"{"type":"Person","data":{"name":"Alice","age":30}}"#;
+        let bob = r#"{"type":"Person","data":{"name":"Bob","age":25}}"#;
+
+        let (left, right) = tokio::join!(
+            db1.apply_append_mutation(alice, "mutation:insert_node"),
+            db2.apply_append_mutation(bob, "mutation:insert_node")
+        );
+        left.unwrap();
+        right.unwrap();
+
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+        let names = persons
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut actual: Vec<String> = (0..persons.num_rows())
+            .map(|row| names.value(row).to_string())
+            .collect();
+        actual.sort();
+        assert_eq!(actual, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_prepared_reads_keep_old_snapshot_across_mutation() {
+        let dir = test_dir("prepared_snapshot_stability");
+        let path = dir.path();
+
+        let db = Database::init(path, keyed_schema_src()).await.unwrap();
+        db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+
+        let query = parse_query(
+            r#"
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+"#,
+        )
+        .unwrap()
+        .queries
+        .into_iter()
+        .next()
+        .unwrap();
+        let prepared_before = db.prepare_read_query(&query).unwrap();
+
+        let db2 = db.clone();
+        db2.load_with_mode(keyed_data_upsert(), LoadMode::Merge)
+            .await
+            .unwrap();
+
+        let before_rows = prepared_before.execute(&ParamMap::new()).await.unwrap();
+        let fresh_rows = db.prepare_read_query(&query).unwrap();
+        let after_rows = fresh_rows.execute(&ParamMap::new()).await.unwrap();
+
+        let before_json = before_rows.to_rust_json();
+        let after_json = after_rows.to_rust_json();
+
+        assert_eq!(
+            before_json,
+            serde_json::json!([
+                { "name": "Alice", "age": 30 },
+                { "name": "Bob", "age": 25 }
+            ])
+        );
+        assert_eq!(
+            after_json,
+            serde_json::json!([
+                { "name": "Alice", "age": 31 },
+                { "name": "Bob", "age": 25 },
+                { "name": "Charlie", "age": 40 }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_query_works_against_reopened_persisted_storage() {
+        let dir = test_dir("query_reopened_persisted");
+        let path = dir.path();
+
+        let db = Database::init(path, keyed_schema_src()).await.unwrap();
+        db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        let reopened = Database::open(path).await.unwrap();
+
+        let query = parse_query(
+            r#"
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+"#,
+        )
+        .unwrap()
+        .queries
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let rows = match reopened.run_query(&query, &ParamMap::new()).await.unwrap() {
+            RunResult::Query(rows) => rows.to_rust_json(),
+            RunResult::Mutation(_) => panic!("expected query result"),
+        };
+
+        let mut people = rows.as_array().unwrap().clone();
+        people.sort_by(|left, right| {
+            left.get("name")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("name").and_then(serde_json::Value::as_str))
+        });
+
+        assert_eq!(
+            people,
+            vec![
+                serde_json::json!({ "name": "Alice", "age": 30 }),
+                serde_json::json!({ "name": "Bob", "age": 25 }),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_keyed_load_upsert_preserves_ids_and_remaps_edges() {
         let dir = test_dir("keyed_upsert");
         let path = dir.path();
@@ -3390,13 +4119,15 @@ edge Knows: Person -> Person
         let mut db = Database::init(path, keyed_schema_src()).await.unwrap();
         db.load(keyed_data_initial()).await.unwrap();
 
-        let persons_before = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let before_storage = db.snapshot();
+        let persons_before = before_storage.get_all_nodes("Person").unwrap().unwrap();
         let alice_id_before = person_id_by_name(&persons_before, "Alice");
         let bob_id_before = person_id_by_name(&persons_before, "Bob");
 
         db.load(keyed_data_upsert()).await.unwrap();
 
-        let persons_after = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let after_storage = db.snapshot();
+        let persons_after = after_storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons_after.num_rows(), 3);
         let alice_id_after = person_id_by_name(&persons_after, "Alice");
         let bob_id_after = person_id_by_name(&persons_after, "Bob");
@@ -3406,7 +4137,7 @@ edge Knows: Person -> Person
         assert_eq!(bob_id_after, bob_id_before);
         assert_eq!(person_age_by_name(&persons_after, "Alice"), Some(31));
 
-        let knows_seg = &db.storage.edge_segments["Knows"];
+        let knows_seg = &after_storage.edge_segments["Knows"];
         assert_eq!(knows_seg.edge_ids.len(), 2);
         assert!(
             knows_seg
@@ -3423,7 +4154,7 @@ edge Knows: Person -> Person
                 .any(|(&src, &dst)| src == alice_id_after && dst == charlie_id_after)
         );
 
-        let companies_after = db.storage.get_all_nodes("Company").unwrap().unwrap();
+        let companies_after = after_storage.get_all_nodes("Company").unwrap().unwrap();
         assert_eq!(companies_after.num_rows(), 1);
         let company_name_col = companies_after
             .column(1)
@@ -3455,7 +4186,9 @@ edge Knows: Person -> Person
             ],
         )
         .unwrap();
-        db.storage.insert_nodes("Person", batch).unwrap();
+        let mut storage = db.snapshot().as_ref().clone();
+        storage.insert_nodes("Person", batch).unwrap();
+        db.replace_storage(storage);
 
         let err = db.load("").await.unwrap_err();
         match err {
@@ -3502,7 +4235,8 @@ edge Knows: Person -> Person
             other => panic!("expected UniqueConstraint, got {}", other),
         }
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 2);
         assert_eq!(person_email_by_name(&persons, "Bob"), "bob@example.com");
     }
@@ -3531,7 +4265,35 @@ edge Knows: Person -> Person
             other => panic!("expected UniqueConstraint, got {}", other),
         }
 
-        assert!(db.storage.get_all_nodes("Person").unwrap().is_none());
+        let storage = db.snapshot();
+        assert!(storage.get_all_nodes("Person").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unique_rejects_duplicate_user_property_named_id() {
+        let dir = test_dir("unique_user_id");
+        let path = dir.path();
+
+        let mut db = Database::init(path, id_named_unique_schema_src())
+            .await
+            .unwrap();
+        let err = db
+            .load_with_mode(id_named_unique_duplicate_data(), LoadMode::Overwrite)
+            .await
+            .unwrap_err();
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                ..
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "id");
+                assert_eq!(value, "user-1");
+            }
+            other => panic!("expected UniqueConstraint, got {}", other),
+        }
     }
 
     #[tokio::test]
@@ -3544,7 +4306,8 @@ edge Knows: Person -> Person
             .unwrap();
         db.load(nullable_unique_ok_data()).await.unwrap();
 
-        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let persons = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 2);
         let nick_col = persons
             .column(2)
@@ -3569,7 +4332,8 @@ edge Knows: Person -> Person
             other => panic!("expected UniqueConstraint, got {}", other),
         }
 
-        let persons_after_err = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let after_err_storage = db.snapshot();
+        let persons_after_err = after_err_storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons_after_err.num_rows(), 2);
     }
 

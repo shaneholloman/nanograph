@@ -11,10 +11,11 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{debug, info, instrument, warn};
 use tracing_subscriber::EnvFilter;
 
+use nanograph::ParamMap;
 use nanograph::error::{NanoError, ParseDiagnostic};
 use nanograph::query::ast::Literal;
 use nanograph::query::parser::parse_query_diagnostic;
-use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
+use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema_diagnostic;
 use nanograph::store::database::{
     CdcAnalyticsMaterializeOptions, CleanupOptions, CompactOptions, Database, DeleteOp,
@@ -25,10 +26,6 @@ use nanograph::store::migration::{
     MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep, execute_schema_migration,
 };
 use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
-use nanograph::{
-    MutationExecResult, ParamMap, execute_mutation, execute_query, lower_mutation_query,
-    lower_query,
-};
 
 #[derive(Parser)]
 #[command(
@@ -531,6 +528,7 @@ fn build_describe_payload(
     db: &Database,
     manifest: &GraphManifest,
 ) -> Result<serde_json::Value> {
+    let storage = db.snapshot();
     let dataset_map = manifest
         .datasets
         .iter()
@@ -539,8 +537,7 @@ fn build_describe_payload(
 
     let mut nodes = Vec::new();
     for node in db.schema_ir.node_types() {
-        let rows = db
-            .storage
+        let rows = storage
             .get_all_nodes(&node.name)?
             .map(|b| b.num_rows() as u64)
             .unwrap_or(0);
@@ -572,8 +569,7 @@ fn build_describe_payload(
 
     let mut edges = Vec::new();
     for edge in db.schema_ir.edge_types() {
-        let rows = db
-            .storage
+        let rows = storage
             .edge_batch_for_save(&edge.name)?
             .map(|b| b.num_rows() as u64)
             .unwrap_or(0);
@@ -751,11 +747,12 @@ async fn cmd_export(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
 fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
     use arrow_array::{Array, StringArray, UInt64Array};
 
+    let storage = db.snapshot();
     let mut rows = Vec::new();
     let mut node_labels: HashMap<String, HashMap<u64, String>> = HashMap::new();
 
     for node in db.schema_ir.node_types() {
-        let Some(batch) = db.storage.get_all_nodes(&node.name)? else {
+        let Some(batch) = storage.get_all_nodes(&node.name)? else {
             continue;
         };
         let id_arr = batch
@@ -786,7 +783,7 @@ fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
     }
 
     for edge in db.schema_ir.edge_types() {
-        let Some(batch) = db.storage.edge_batch_for_save(&edge.name)? else {
+        let Some(batch) = storage.edge_batch_for_save(&edge.name)? else {
             continue;
         };
         let id_arr = batch
@@ -1146,7 +1143,7 @@ async fn cmd_load(
     let data_src = std::fs::read_to_string(data_path)
         .wrap_err_with(|| format!("failed to read data: {}", data_path.display()))?;
 
-    let mut db = Database::open(db_path).await?;
+    let db = Database::open(db_path).await?;
 
     if let Err(err) = db.load_with_mode(&data_src, mode.into()).await {
         render_load_error(db_path, &err, json);
@@ -1210,7 +1207,7 @@ fn render_load_error(db_path: &Path, err: &NanoError, json: bool) {
 #[instrument(skip(type_name, predicate), fields(db_path = %db_path.display(), type_name = type_name))]
 async fn cmd_delete(db_path: &PathBuf, type_name: &str, predicate: &str, json: bool) -> Result<()> {
     let pred = parse_delete_predicate(predicate)?;
-    let mut db = Database::open(db_path).await?;
+    let db = Database::open(db_path).await?;
     let result = db.delete_nodes(type_name, &pred).await?;
 
     info!(
@@ -1344,7 +1341,7 @@ async fn cmd_compact(
     materialize_deletions_threshold: f32,
     json: bool,
 ) -> Result<()> {
-    let mut db = Database::open(db_path).await?;
+    let db = Database::open(db_path).await?;
     let result = db
         .compact(CompactOptions {
             target_rows_per_fragment,
@@ -1396,7 +1393,7 @@ async fn cmd_cleanup(
     retain_dataset_versions: usize,
     json: bool,
 ) -> Result<()> {
-    let mut db = Database::open(db_path).await?;
+    let db = Database::open(db_path).await?;
     let result = db
         .cleanup(CleanupOptions {
             retain_tx_versions,
@@ -1644,28 +1641,9 @@ async fn cmd_run(
     let param_map = build_param_map(&query.params, &raw_params)?;
 
     let effective_format = if json { "json" } else { format };
-
-    if query.mutation.is_some() {
-        let mut db = Database::open(&db_path).await?;
-        let checked = typecheck_query_decl(db.catalog(), query)?;
-        if !matches!(checked, CheckedQuery::Mutation(_)) {
-            return Err(eyre!("expected mutation query"));
-        }
-
-        let mutation_ir = lower_mutation_query(query)?;
-        let result = execute_mutation(&mutation_ir, &mut db, &param_map).await?;
-        let result_batch = mutation_result_batch(result)?;
-        return render_results(effective_format, &[result_batch]);
-    }
-
     let db = Database::open(&db_path).await?;
-    let catalog = db.catalog().clone();
-    let storage = db.snapshot();
-
-    let type_ctx = typecheck_query(&catalog, query)?;
-    let ir = lower_query(&catalog, query, &type_ctx)?;
-    debug!(pipeline_len = ir.pipeline.len(), "query lowered");
-    let results = execute_query(&ir, storage, &param_map).await?;
+    let run_result = db.run_query(query, &param_map).await?;
+    let results = run_result.into_record_batches()?;
     render_results(effective_format, &results)
 }
 
@@ -1696,23 +1674,6 @@ fn render_results(format: &str, results: &[RecordBatch]) -> Result<()> {
         _ => return Err(eyre!("unknown format: {}", format)),
     }
     Ok(())
-}
-
-fn mutation_result_batch(result: MutationExecResult) -> Result<RecordBatch> {
-    use arrow_array::UInt64Array;
-    use arrow_schema::{DataType, Field, Schema};
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("affected_nodes", DataType::UInt64, false),
-        Field::new("affected_edges", DataType::UInt64, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(UInt64Array::from(vec![result.affected_nodes as u64])),
-            Arc::new(UInt64Array::from(vec![result.affected_edges as u64])),
-        ],
-    )
-    .map_err(|e| eyre!("failed to build mutation result batch: {}", e))
 }
 
 fn print_csv(batch: &RecordBatch) {
@@ -2253,7 +2214,8 @@ mod tests {
             .unwrap();
 
         let db = Database::open(&db_path).await.unwrap();
-        let batch = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let batch = storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
         let names = batch
             .column_by_name("name")
@@ -2457,7 +2419,8 @@ query add_person($name: String, $age: I32) {
         .unwrap();
 
         let db = Database::open(&db_path).await.unwrap();
-        let people = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let storage = db.snapshot();
+        let people = storage.get_all_nodes("Person").unwrap().unwrap();
         let names = people
             .column_by_name("name")
             .unwrap()

@@ -124,5 +124,11 @@ if (!nativeBinding) {
 }
 
 const { Database } = nativeBinding
+const { tableFromIPC } = require('apache-arrow')
+
+function decodeArrow(buffer) {
+  return tableFromIPC(buffer)
+}
 
 module.exports.Database = Database
+module.exports.decodeArrow = decodeArrow

@@ -6,7 +6,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
@@ -70,12 +70,13 @@ pub(crate) fn enforce_node_unique_constraints(
         };
 
         for property in properties {
-            let prop_idx = batch.schema().index_of(property).map_err(|e| {
-                NanoError::Storage(format!(
-                    "node type {} missing @unique property {}: {}",
-                    type_name, property, e
-                ))
-            })?;
+            let prop_idx =
+                node_property_index(batch.schema().as_ref(), property).ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node type {} missing @unique property {}",
+                        type_name, property
+                    ))
+                })?;
             let arr = batch.column(prop_idx);
             let mut seen: HashMap<String, usize> = HashMap::new();
             for row in 0..batch.num_rows() {
@@ -126,10 +127,10 @@ pub(crate) fn build_name_seed_for_keyed_load(
             continue;
         };
 
-        let key_idx = batch.schema().index_of(key_prop).map_err(|e| {
+        let key_idx = node_property_index(batch.schema().as_ref(), key_prop).ok_or_else(|| {
             NanoError::Storage(format!(
-                "node type {} missing @key property {}: {}",
-                type_name, key_prop, e
+                "node type {} missing @key property {}",
+                type_name, key_prop
             ))
         })?;
         let key_arr = batch.column(key_idx).clone();
@@ -155,6 +156,19 @@ pub(crate) fn build_name_seed_for_append(
     key_props: &HashMap<String, String>,
 ) -> Result<HashMap<(String, String), u64>> {
     build_name_seed_for_keyed_load(storage, key_props)
+}
+
+pub(crate) fn node_property_index(schema: &Schema, prop_name: &str) -> Option<usize> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(idx, field)| (field.name() == prop_name).then_some(idx))
+}
+
+pub(crate) fn node_property_field<'a>(schema: &'a Schema, prop_name: &str) -> Option<&'a Field> {
+    node_property_index(schema, prop_name).map(|idx| schema.field(idx).as_ref())
 }
 
 pub(crate) fn key_value_string(array: &ArrayRef, row: usize, prop_name: &str) -> Result<String> {
@@ -354,6 +368,39 @@ mod tests {
     }
 
     #[test]
+    fn enforce_node_unique_constraints_uses_user_property_named_id() {
+        let schema = r#"node Person {
+    id: String @unique
+    name: String
+}"#;
+        let (_, mut storage) = build_schema_ir_and_storage(schema);
+        let key_props = HashMap::new();
+        load_jsonl_data(
+            &mut storage,
+            r#"{"type":"Person","data":{"id":"user-1","name":"Alice"}}
+{"type":"Person","data":{"id":"user-1","name":"Bob"}}"#,
+            &key_props,
+        )
+        .unwrap();
+
+        let unique_props = HashMap::from([("Person".to_string(), vec!["id".to_string()])]);
+        let err = enforce_node_unique_constraints(&storage, &unique_props).unwrap_err();
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                ..
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "id");
+                assert_eq!(value, "user-1");
+            }
+            other => panic!("expected UniqueConstraint, got {other}"),
+        }
+    }
+
+    #[test]
     fn build_name_seed_for_keyed_load_uses_declared_key_property() {
         let schema = r#"node Person {
     uid: String @key
@@ -376,6 +423,25 @@ node Company {
 
         assert!(seed.contains_key(&("Person".to_string(), "u1".to_string())));
         assert!(!seed.contains_key(&("Company".to_string(), "Acme".to_string())));
+    }
+
+    #[test]
+    fn build_name_seed_for_keyed_load_uses_user_property_named_id() {
+        let schema = r#"node Person {
+    id: String @key
+    name: String
+}"#;
+        let (_, mut storage) = build_schema_ir_and_storage(schema);
+        let key_props = HashMap::from([("Person".to_string(), "id".to_string())]);
+        load_jsonl_data(
+            &mut storage,
+            r#"{"type":"Person","data":{"id":"user-1","name":"Alice"}}"#,
+            &key_props,
+        )
+        .unwrap();
+
+        let seed = build_name_seed_for_keyed_load(&storage, &key_props).unwrap();
+        assert!(seed.contains_key(&("Person".to_string(), "user-1".to_string())));
     }
 
     #[test]

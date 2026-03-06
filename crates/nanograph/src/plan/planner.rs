@@ -20,6 +20,7 @@ use crate::embedding::EmbeddingClient;
 use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal};
+use crate::store::database::logical_node_field_to_lance;
 use crate::store::graph::GraphStorage;
 use crate::types::ScalarType;
 use tracing::{debug, info, instrument};
@@ -842,7 +843,7 @@ async fn try_execute_single_node_nearest_ann_fast_path(
     );
     let projected_columns: Vec<String> = struct_fields
         .iter()
-        .map(|field| field.name().clone())
+        .map(|field| logical_node_field_to_lance(field.name()).to_string())
         .collect();
 
     let filter_sql = match build_lance_sql_filter_for_pushdown_preds(
@@ -979,7 +980,12 @@ fn build_lance_sql_filter_for_pushdown_preds(
             CompOp::Ge => ">=",
             CompOp::Le => "<=",
         };
-        clauses.push(format!("{} {} {}", predicate.property, op, lit));
+        clauses.push(format!(
+            "{} {} {}",
+            logical_node_field_to_lance(&predicate.property),
+            op,
+            lit
+        ));
     }
 
     Ok(Some(clauses.join(" AND ")))
@@ -999,6 +1005,7 @@ fn wrap_projected_node_batch(
     for expected in struct_fields {
         let col = batch
             .column_by_name(expected.name())
+            .or_else(|| batch.column_by_name(logical_node_field_to_lance(expected.name())))
             .cloned()
             .ok_or_else(|| {
                 NanoError::Execution(format!(

@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::catalog::Catalog;
 use crate::error::{NanoError, Result};
@@ -70,6 +73,28 @@ pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeConte
         ));
     }
     typecheck_read_query(catalog, query)
+}
+
+pub fn infer_query_result_schema(
+    catalog: &Catalog,
+    query: &QueryDecl,
+    ctx: &TypeContext,
+) -> Result<SchemaRef> {
+    let params = parse_declared_param_types(&query.params)?;
+    let mut fields = Vec::with_capacity(query.return_clause.len());
+
+    for projection in &query.return_clause {
+        let field = infer_projection_field(
+            catalog,
+            &projection.expr,
+            projection.alias.as_deref(),
+            ctx,
+            &params,
+        )?;
+        fields.push(field);
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropType>> {
@@ -1139,6 +1164,77 @@ fn resolve_expr_type(
                 Ok(ResolvedType::Aggregate)
             }
         }
+    }
+}
+
+fn infer_projection_field(
+    catalog: &Catalog,
+    expr: &Expr,
+    alias: Option<&str>,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<Field> {
+    let name = projection_name(expr, alias);
+    match expr {
+        Expr::Aggregate { func, arg } => {
+            let (data_type, nullable) = match func {
+                AggFunc::Count => (DataType::Int64, true),
+                AggFunc::Avg => (DataType::Float64, true),
+                _ => {
+                    let resolved = resolve_expr_type(catalog, arg, ctx, params)?;
+                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved)?;
+                    (data_type, true)
+                }
+            };
+            Ok(Field::new(name, data_type, nullable))
+        }
+        _ => {
+            let resolved = resolve_expr_type(catalog, expr, ctx, params)?;
+            let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
+            Ok(Field::new(name, data_type, nullable))
+        }
+    }
+}
+
+fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
+    if let Some(alias) = alias {
+        return alias.to_string();
+    }
+
+    match expr {
+        Expr::PropAccess { property, .. } => property.clone(),
+        Expr::Variable(variable) => variable.clone(),
+        Expr::Literal(_) => "literal".to_string(),
+        Expr::Nearest { .. } => "nearest".to_string(),
+        Expr::Search { .. } => "search".to_string(),
+        Expr::Fuzzy { .. } => "fuzzy".to_string(),
+        Expr::MatchText { .. } => "match_text".to_string(),
+        Expr::Bm25 { .. } => "bm25".to_string(),
+        Expr::Rrf { .. } => "rrf".to_string(),
+        Expr::Aggregate { func, .. } => func.to_string(),
+        Expr::AliasRef(name) => name.clone(),
+    }
+}
+
+fn resolved_type_to_field_shape(
+    catalog: &Catalog,
+    resolved: &ResolvedType,
+) -> Result<(DataType, bool)> {
+    match resolved {
+        ResolvedType::Scalar(prop_type) => Ok((prop_type.to_arrow(), prop_type.nullable)),
+        ResolvedType::Node(type_name) => {
+            let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+                NanoError::Type(format!("type `{}` not found in catalog", type_name))
+            })?;
+            let fields: Vec<Field> = node_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            Ok((DataType::Struct(fields.into()), false))
+        }
+        ResolvedType::Aggregate => Ok((DataType::Int64, true)),
     }
 }
 

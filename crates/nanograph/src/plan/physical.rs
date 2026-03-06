@@ -21,7 +21,7 @@ use crate::error::{NanoError, Result};
 use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
 use crate::query::ast::{CompOp, Literal};
 use crate::store::csr::CsrIndex;
-use crate::store::database::{Database, DeleteOp, DeletePredicate};
+use crate::store::database::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate};
 use crate::store::graph::GraphStorage;
 use crate::types::Direction;
 
@@ -579,38 +579,40 @@ pub struct MutationExecResult {
     pub affected_edges: usize,
 }
 
-pub async fn execute_mutation(
+pub(crate) async fn execute_mutation(
     ir: &MutationIR,
-    db: &mut Database,
+    db: &Database,
     params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
 ) -> Result<MutationExecResult> {
     match &ir.op {
         MutationOpIR::Insert {
             type_name,
             assignments,
-        } => execute_insert_mutation(db, type_name, assignments, params).await,
+        } => execute_insert_mutation(db, type_name, assignments, params, writer).await,
         MutationOpIR::Update {
             type_name,
             assignments,
             predicate,
-        } => execute_update_mutation(db, type_name, assignments, predicate, params).await,
+        } => execute_update_mutation(db, type_name, assignments, predicate, params, writer).await,
         MutationOpIR::Delete {
             type_name,
             predicate,
-        } => execute_delete_mutation(db, type_name, predicate, params).await,
+        } => execute_delete_mutation(db, type_name, predicate, params, writer).await,
     }
 }
 
 async fn execute_insert_mutation(
-    db: &mut Database,
+    db: &Database,
     type_name: &str,
     assignments: &[IRAssignment],
     params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
 ) -> Result<MutationExecResult> {
     let is_node_type = db.catalog.node_types.contains_key(type_name);
     let is_edge_type = db.catalog.edge_types.contains_key(type_name);
     if is_edge_type {
-        return execute_insert_edge_mutation(db, type_name, assignments, params).await;
+        return execute_insert_edge_mutation(db, type_name, assignments, params, writer).await;
     }
     if !is_node_type {
         return Err(NanoError::Execution(format!(
@@ -629,7 +631,7 @@ async fn execute_insert_mutation(
         "data": data
     })
     .to_string();
-    db.apply_append_mutation(&line, "mutation:insert_node")
+    db.apply_append_mutation_locked(&line, "mutation:insert_node", writer)
         .await?;
     Ok(MutationExecResult {
         affected_nodes: 1,
@@ -638,10 +640,11 @@ async fn execute_insert_mutation(
 }
 
 async fn execute_insert_edge_mutation(
-    db: &mut Database,
+    db: &Database,
     type_name: &str,
     assignments: &[IRAssignment],
     params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
 ) -> Result<MutationExecResult> {
     let mut from_name: Option<String> = None;
     let mut to_name: Option<String> = None;
@@ -683,7 +686,7 @@ async fn execute_insert_edge_mutation(
     })
     .to_string();
 
-    db.apply_append_mutation(&line, "mutation:insert_edge")
+    db.apply_append_mutation_locked(&line, "mutation:insert_edge", writer)
         .await?;
     Ok(MutationExecResult {
         affected_nodes: 0,
@@ -692,11 +695,12 @@ async fn execute_insert_edge_mutation(
 }
 
 async fn execute_update_mutation(
-    db: &mut Database,
+    db: &Database,
     type_name: &str,
     assignments: &[IRAssignment],
     predicate: &IRMutationPredicate,
     params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
 ) -> Result<MutationExecResult> {
     let key_prop = find_key_property(db, type_name).ok_or_else(|| {
         NanoError::Storage(format!(
@@ -711,7 +715,8 @@ async fn execute_update_mutation(
         )));
     }
 
-    let target_batch = match db.storage.get_all_nodes(type_name)? {
+    let storage = db.snapshot();
+    let target_batch = match storage.get_all_nodes(type_name)? {
         Some(batch) => batch,
         None => return Ok(MutationExecResult::default()),
     };
@@ -767,7 +772,7 @@ async fn execute_update_mutation(
     }
 
     let payload = payload_lines.join("\n");
-    db.apply_merge_mutation(&payload, "mutation:update_node")
+    db.apply_merge_mutation_locked(&payload, "mutation:update_node", writer)
         .await?;
     Ok(MutationExecResult {
         affected_nodes: matched_rows.len(),
@@ -776,14 +781,17 @@ async fn execute_update_mutation(
 }
 
 async fn execute_delete_mutation(
-    db: &mut Database,
+    db: &Database,
     type_name: &str,
     predicate: &IRMutationPredicate,
     params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
 ) -> Result<MutationExecResult> {
     if db.catalog.node_types.contains_key(type_name) {
         let delete_pred = build_delete_predicate(predicate, params)?;
-        let result = db.delete_nodes(type_name, &delete_pred).await?;
+        let result = db
+            .delete_nodes_locked(type_name, &delete_pred, writer)
+            .await?;
         return Ok(MutationExecResult {
             affected_nodes: result.deleted_nodes,
             affected_edges: result.deleted_edges,
@@ -791,7 +799,7 @@ async fn execute_delete_mutation(
     }
 
     if db.catalog.edge_types.contains_key(type_name) {
-        return execute_delete_edge_mutation(db, type_name, predicate, params).await;
+        return execute_delete_edge_mutation(db, type_name, predicate, params, writer).await;
     }
 
     Err(NanoError::Execution(format!(
@@ -801,10 +809,11 @@ async fn execute_delete_mutation(
 }
 
 async fn execute_delete_edge_mutation(
-    db: &mut Database,
+    db: &Database,
     type_name: &str,
     predicate: &IRMutationPredicate,
     params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
 ) -> Result<MutationExecResult> {
     let edge_type = db
         .catalog
@@ -839,7 +848,9 @@ async fn execute_delete_edge_mutation(
         _ => delete_pred,
     };
 
-    let result = db.delete_edges(type_name, &mapped_pred).await?;
+    let result = db
+        .delete_edges_locked(type_name, &mapped_pred, writer)
+        .await?;
     Ok(MutationExecResult {
         affected_nodes: 0,
         affected_edges: result.deleted_edges,
@@ -939,7 +950,8 @@ fn find_key_property(db: &Database, type_name: &str) -> Option<String> {
 }
 
 fn resolve_node_id_by_name(db: &Database, node_type: &str, node_name: &str) -> Result<u64> {
-    let batch = db.storage.get_all_nodes(node_type)?.ok_or_else(|| {
+    let storage = db.snapshot();
+    let batch = storage.get_all_nodes(node_type)?.ok_or_else(|| {
         NanoError::Execution(format!(
             "edge endpoint lookup failed: node type `{}` has no rows",
             node_type

@@ -13,7 +13,7 @@ use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 
 use super::super::graph::GraphStorage;
-use super::constraints::key_value_string;
+use super::constraints::{key_value_string, node_property_index};
 use super::jsonl::json_values_to_array;
 
 pub(crate) async fn merge_storage_with_node_keys(
@@ -231,14 +231,10 @@ fn rewrite_incoming_keyed_ids(
     key_prop: &str,
     next_node_id: &mut u64,
 ) -> Result<(RecordBatch, HashMap<u64, u64>)> {
-    let existing_key_idx = existing
-        .schema()
-        .index_of(key_prop)
-        .map_err(|e| NanoError::Storage(format!("missing key property {}: {}", key_prop, e)))?;
-    let incoming_key_idx = incoming
-        .schema()
-        .index_of(key_prop)
-        .map_err(|e| NanoError::Storage(format!("missing key property {}: {}", key_prop, e)))?;
+    let existing_key_idx = node_property_index(existing.schema().as_ref(), key_prop)
+        .ok_or_else(|| NanoError::Storage(format!("missing key property {}", key_prop)))?;
+    let incoming_key_idx = node_property_index(incoming.schema().as_ref(), key_prop)
+        .ok_or_else(|| NanoError::Storage(format!("missing key property {}", key_prop)))?;
 
     let existing_id_arr = existing
         .column(0)
@@ -316,9 +312,8 @@ fn run_keyed_merge_insert_in_memory(
         )));
     }
 
-    let key_idx = schema
-        .index_of(key_prop)
-        .map_err(|e| NanoError::Storage(format!("missing key property {}: {}", key_prop, e)))?;
+    let key_idx = node_property_index(schema.as_ref(), key_prop)
+        .ok_or_else(|| NanoError::Storage(format!("missing key property {}", key_prop)))?;
 
     let mut key_to_row: HashMap<String, usize> = HashMap::new();
     let mut out_rows: Vec<Vec<serde_json::Value>> =
@@ -745,6 +740,26 @@ mod tests {
         .unwrap()
     }
 
+    fn node_batch_with_user_id(
+        internal_ids: Vec<u64>,
+        user_ids: Vec<&str>,
+        names: Vec<&str>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(internal_ids)) as ArrayRef,
+                Arc::new(StringArray::from(user_ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn reassign_node_ids_rewrites_ids_and_returns_remap() {
         let batch = node_batch(vec![7, 8], vec!["Alice", "Bob"]);
@@ -794,6 +809,35 @@ mod tests {
         let err =
             rewrite_incoming_keyed_ids(&existing, &incoming, "name", &mut next_id).unwrap_err();
         assert!(err.to_string().contains("duplicate @key"));
+    }
+
+    #[test]
+    fn rewrite_incoming_keyed_ids_uses_user_property_named_id() {
+        let existing = node_batch_with_user_id(vec![10], vec!["user-1"], vec!["Alice"]);
+        let incoming =
+            node_batch_with_user_id(vec![1, 2], vec!["user-1", "user-2"], vec!["Alice", "Bob"]);
+        let mut next_id = 50;
+
+        let (rewritten, remap) =
+            rewrite_incoming_keyed_ids(&existing, &incoming, "id", &mut next_id).unwrap();
+        let ids = rewritten
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let user_ids = rewritten
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(ids.value(0), 10);
+        assert_eq!(ids.value(1), 50);
+        assert_eq!(user_ids.value(0), "user-1");
+        assert_eq!(user_ids.value(1), "user-2");
+        assert_eq!(remap.get(&1), Some(&10));
+        assert_eq!(remap.get(&2), Some(&50));
+        assert_eq!(next_id, 51);
     }
 
     #[test]

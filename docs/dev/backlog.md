@@ -1,6 +1,48 @@
 # Backlog
 
-## CLI
+## Embeddable API
+
+See [docs/dev/embeddable-api.md](embeddable-api.md) for full design.
+
+Current status:
+- Core execution facade, adapter migration, Arrow IPC, and the Rust embeddable ergonomics (`num_rows`, `concat_batches`, `to_rust_json`, `deserialize`, `params!`, `ToParam`) are landed.
+- Duplicate logical field names are correct for load / persist / reopen / append / merge, but they currently opt out of the CDC-derived append / merge fast path and fall back to full dataset rewrites.
+- The shareable `Database` refactor is landed: `Database` is `Clone + Send + Sync`, mutations serialize through one internal writer path, and TS / FFI no longer hold external read mutexes.
+- Prepared reads freeze an in-memory snapshot for isolation across later mutations; one-shot reads still use the live snapshot and Lance pushdown.
+- The next embeddable API milestone is `open_in_memory()` and then streaming ingest.
+
+### Phase 2: Shareability
+- [x] Refactor `Database` internals to Arc + RwLock, implement `Clone + Send + Sync`
+- [x] Move read APIs toward `&self` with cheap prepared-read snapshots
+- [x] Serialize mutations through one internal writer path
+- [x] Simplify FFI/TS to drop external Mutex wrappers for reads
+
+### Phase 3: In-memory open
+- [ ] `Database::open_in_memory(schema_source)` (tempdir-backed)
+
+### Phase 4: Streaming ingest
+- [ ] Reader-based loading in core
+- [ ] `Database::load_file(...)`
+- [ ] TS `loadFile(...)`
+- [ ] Bounded-memory batching, edge spooling, and streaming `@embed` materialization
+
+### Phase 5: JSON vector fast path
+- [ ] Evaluate post-streaming-ingest JSON vector serialization optimization
+
+### Deferred
+- [ ] `on_change()` callback registration (broadcast channel)
+- [ ] Custom UDF registration via DataFusion (separate design doc)
+
+## CLI Ergonomics
+
+- [ ] Structured JSON errors — when `--json` is set, emit `{"error": "...", "kind": "..."}` instead of stderr text. Critical for agent consumption.
+- [ ] `--dry-run` on `load` and mutation `run` — show type-checked plan, affected types, estimated row counts without writing. (`migrate --dry-run` already exists.)
+- [ ] Consistent `--json` vs `--format` — pick one mechanism. Currently `--json` is global and `--format` is per-command; some commands check both. Unify so `--json` globally switches all output (including errors) to structured JSON.
+- [ ] Schema introspection — `nanograph describe --type Person` to dump a single type's properties, annotations, and Arrow schema. Current `describe` shows manifest-level info only.
+- [ ] Inline query — `--query-inline 'insert Person { name: $name }'` or `--query -` for stdin, so one-liners don't need a `.gq` file.
+- [ ] Stdin for load — `--data -` reads JSONL from stdin for pipeline composition (`cat data.jsonl | nanograph load my.nano --data - --mode append`).
+
+## CLI (existing)
 
 - [x] `nanograph describe` — print schema definition for a type or all types
 - [x] `--format json` output (array of objects, in addition to existing `table|csv|jsonl`)

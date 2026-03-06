@@ -95,9 +95,22 @@ Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/emb
 | `types.rs` | Core type definitions, `PropType`, Arrow type mappings |
 | `error.rs` | `NanoError` error type |
 
+### Public API (`lib.rs` re-exports)
+
+```rust
+pub use catalog::{build_catalog, schema_ir};   // SchemaIR — compiled schema used at runtime
+pub use ir::ParamMap;                           // query parameter map
+pub use ir::lower::{lower_query, lower_mutation_query};
+pub use plan::planner::execute_query;
+pub use plan::physical::{execute_mutation, MutationExecResult};
+pub use types::{Direction, EdgeId, NodeId, PropType, ScalarType};
+```
+
+All SDK crates (FFI, TS) call `build_catalog → lower_query → execute_query → json_output`. This is the stable interface.
+
 ### Error Handling
 
-All library errors go through `NanoError` (in `error.rs`). Source-span diagnostics use the `ariadne` crate for pretty error rendering with source locations (used in schema/query parse errors and type errors).
+All library errors go through `NanoError` (in `error.rs`). Variants: `Parse`, `Catalog`, `Type`, `Storage`, `UniqueConstraint` (structured fields), `Plan`, `Execution`, `Arrow`, `DataFusion`, `Io`, `Lance`, `Manifest`. Source-span diagnostics use the `ariadne` crate for pretty error rendering with source locations (used in schema/query parse errors and type errors).
 
 ### Key Design Details
 
@@ -160,6 +173,7 @@ delete Person where name = $name
 The CLI loads `.env` from CWD at startup (custom parser, no external dependency). Variables are only set if not already present in the environment.
 
 - `OPENAI_API_KEY` — required only for real embedding API calls.
+- `OPENAI_BASE_URL` — custom OpenAI-compatible endpoint (default: OpenAI API).
 - `NANOGRAPH_EMBED_MODEL` — OpenAI model name (default: `text-embedding-3-small`).
 - `NANOGRAPH_EMBED_BATCH_SIZE` — batch size for API calls (default: 64).
 - `NANOGRAPH_EMBED_CHUNK_CHARS` — chunk size for large text; 0 disables (default: 1500).
@@ -193,6 +207,7 @@ Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compati
 - `docs/dev/search.md` — search feature design (vector, text, hybrid)
 - `docs/dev/typescript-sdk.md` — TypeScript SDK implementation details (lock semantics, type conversion, build)
 - `docs/dev/swift-sdk.md` — Swift SDK implementation details (C ABI, Swift Package wrapper)
+- `docs/dev/release-checklist.md` — release process steps
 
 Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
@@ -203,6 +218,10 @@ Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test
 CLI scenario scripts live in `tests/cli/scenarios/` and use shared helpers from `tests/cli/lib/common.sh` (build helpers, assertion macros, query runners). Scenarios: `lifecycle`, `migration`, `query_mutations`, `maintenance`, `revops_typed_cdc`, `text_search`, `context_graph_search`, `starwars_search`. Run all via `bash tests/cli/run-cli-e2e.sh` or one via `bash tests/cli/run-cli-e2e.sh <scenario>`.
 
 CLI integration tests (Rust) in `crates/nanograph-cli/tests/` — `semantic_search.rs` (embed + nearest with mock) and `search_features.rs` (search predicates and ordering).
+
+## Not Yet Implemented
+
+These are on the backlog but **do not exist yet** — do not assume they work or generate code that depends on them: `@locked` annotation, encryption at rest, multimedia content storage, Python SDK, Go SDK, criterion benchmark suite, graph analytics (community detection, centrality, flow tracing, blast radius), ASCII graph visualization, progress bars on `nanograph load`.
 
 ## Known Pitfalls
 

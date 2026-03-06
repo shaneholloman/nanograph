@@ -19,6 +19,6 @@
 | [architecture.md](dev/architecture.md) | System overview, module map, data flow |
 | [db-features.md](dev/db-features.md) | Feature status and remaining work |
 | [test-framework.md](dev/test-framework.md) | Test tiers, commands, fixture policy, CI guidance |
-| [backlog.md](dev/backlog.md) | Implementation backlog with phase status |
+| [backlog.md](backlog/backlog.md) | Implementation backlog with phase status |
 
 Also see `grammar.ebnf` in the repo root for the formal grammar of both DSLs.

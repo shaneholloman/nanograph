@@ -8,12 +8,30 @@ use arrow_schema::DataType;
 pub const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
 pub const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonIntegerMode {
+    JavaScript,
+    Native,
+}
+
 pub fn is_js_safe_integer_i64(value: i64) -> bool {
     (-JS_MAX_SAFE_INTEGER_I64..=JS_MAX_SAFE_INTEGER_I64).contains(&value)
 }
 
 /// Convert Arrow RecordBatches into a Vec of JSON objects (one per row).
 pub fn record_batches_to_json_rows(results: &[RecordBatch]) -> Vec<serde_json::Value> {
+    record_batches_to_json_rows_with_mode(results, JsonIntegerMode::JavaScript)
+}
+
+/// Convert Arrow RecordBatches into JSON rows without JS-safe integer coercion.
+pub fn record_batches_to_rust_json_rows(results: &[RecordBatch]) -> Vec<serde_json::Value> {
+    record_batches_to_json_rows_with_mode(results, JsonIntegerMode::Native)
+}
+
+fn record_batches_to_json_rows_with_mode(
+    results: &[RecordBatch],
+    integer_mode: JsonIntegerMode,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for batch in results {
         let schema = batch.schema();
@@ -21,7 +39,10 @@ pub fn record_batches_to_json_rows(results: &[RecordBatch]) -> Vec<serde_json::V
             let mut map = serde_json::Map::new();
             for (col_idx, field) in schema.fields().iter().enumerate() {
                 let col_arr = batch.column(col_idx);
-                map.insert(field.name().clone(), array_value_to_json(col_arr, row));
+                map.insert(
+                    field.name().clone(),
+                    array_value_to_json_with_mode(col_arr, row, integer_mode),
+                );
             }
             out.push(serde_json::Value::Object(map));
         }
@@ -31,6 +52,14 @@ pub fn record_batches_to_json_rows(results: &[RecordBatch]) -> Vec<serde_json::V
 
 /// Convert a single cell from an Arrow array to a serde_json::Value.
 pub fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
+    array_value_to_json_with_mode(array, row, JsonIntegerMode::JavaScript)
+}
+
+fn array_value_to_json_with_mode(
+    array: &ArrayRef,
+    row: usize,
+    integer_mode: JsonIntegerMode,
+) -> serde_json::Value {
     if array.is_null(row) {
         return serde_json::Value::Null;
     }
@@ -56,10 +85,13 @@ pub fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Int64Array>()
             .map(|a| {
                 let value = a.value(row);
-                if is_js_safe_integer_i64(value) {
-                    serde_json::Value::Number(value.into())
-                } else {
-                    serde_json::Value::String(value.to_string())
+                match integer_mode {
+                    JsonIntegerMode::JavaScript if !is_js_safe_integer_i64(value) => {
+                        serde_json::Value::String(value.to_string())
+                    }
+                    JsonIntegerMode::JavaScript | JsonIntegerMode::Native => {
+                        serde_json::Value::Number(value.into())
+                    }
                 }
             })
             .unwrap_or(serde_json::Value::Null),
@@ -73,10 +105,13 @@ pub fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<UInt64Array>()
             .map(|a| {
                 let value = a.value(row);
-                if value <= JS_MAX_SAFE_INTEGER_U64 {
-                    serde_json::Value::Number(value.into())
-                } else {
-                    serde_json::Value::String(value.to_string())
+                match integer_mode {
+                    JsonIntegerMode::JavaScript if value > JS_MAX_SAFE_INTEGER_U64 => {
+                        serde_json::Value::String(value.to_string())
+                    }
+                    JsonIntegerMode::JavaScript | JsonIntegerMode::Native => {
+                        serde_json::Value::Number(value.into())
+                    }
                 }
             })
             .unwrap_or(serde_json::Value::Null),
@@ -121,7 +156,7 @@ pub fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
                 let values = a.value(row);
                 serde_json::Value::Array(
                     (0..values.len())
-                        .map(|idx| array_value_to_json(&values, idx))
+                        .map(|idx| array_value_to_json_with_mode(&values, idx, integer_mode))
                         .collect(),
                 )
             })
@@ -133,7 +168,7 @@ pub fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
                 let values = a.value(row);
                 serde_json::Value::Array(
                     (0..values.len())
-                        .map(|idx| array_value_to_json(&values, idx))
+                        .map(|idx| array_value_to_json_with_mode(&values, idx, integer_mode))
                         .collect(),
                 )
             })
@@ -148,10 +183,11 @@ pub fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::array_value_to_json;
+    use super::{array_value_to_json, record_batches_to_rust_json_rows};
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int64Array, UInt64Array};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
 
     #[test]
     fn int64_outside_js_safe_range_is_stringified() {
@@ -177,6 +213,30 @@ mod tests {
         assert_eq!(
             array_value_to_json(&values, 0),
             serde_json::json!(9_007_199_254_740_991u64)
+        );
+    }
+
+    #[test]
+    fn rust_json_rows_preserve_full_width_integers() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("signed", DataType::Int64, false),
+            Field::new("unsigned", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![i64::MIN])),
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+            ],
+        )
+        .expect("batch");
+
+        assert_eq!(
+            record_batches_to_rust_json_rows(&[batch]),
+            vec![serde_json::json!({
+                "signed": i64::MIN,
+                "unsigned": u64::MAX,
+            })]
         );
     }
 }

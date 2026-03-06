@@ -14,6 +14,7 @@ default-members = [
 [workspace.dependencies]
 # Arrow sub-crates (replaces monolithic `arrow`)
 arrow-array = "57"
+arrow-ipc = "57"
 arrow-schema = "57"
 arrow-select = "57"
 arrow-cast = { version = "57", features = ["prettyprint"] }

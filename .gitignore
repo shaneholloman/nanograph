@@ -4,6 +4,7 @@
 *.lance
 .DS_Store
 docs/internal/
+docs/backlog/
 .claude/
 .env
 search-test/

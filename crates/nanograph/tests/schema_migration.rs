@@ -286,9 +286,9 @@ async fn migration_apply_rename_preserves_data() {
     assert!(db.schema_ir.node_type_id("User").is_none());
     assert!(db.schema_ir.edge_type_id("ConnectedTo").is_some());
     assert!(db.schema_ir.edge_type_id("Knows").is_none());
+    let storage = db.snapshot();
 
-    let batch = db
-        .storage
+    let batch = storage
         .get_all_nodes("Account")
         .expect("read nodes")
         .expect("account rows");
@@ -303,8 +303,7 @@ async fn migration_apply_rename_preserves_data() {
         .collect::<Vec<_>>();
     assert_eq!(values, vec!["Alice".to_string(), "Bob".to_string()]);
 
-    let edge_batch = db
-        .storage
+    let edge_batch = storage
         .edge_batch_for_save("ConnectedTo")
         .expect("read edges")
         .expect("connected edge rows");
@@ -370,8 +369,8 @@ async fn migration_requires_confirmation_for_drop_property() {
     assert_eq!(applied.status, MigrationStatus::Applied);
 
     let db = Database::open(&db_path).await.expect("re-open migrated db");
-    let batch = db
-        .storage
+    let storage = db.snapshot();
+    let batch = storage
         .get_all_nodes("User")
         .expect("read user rows")
         .expect("user rows");

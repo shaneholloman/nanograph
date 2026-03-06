@@ -18,6 +18,7 @@ use tracing::debug;
 
 use crate::plan::literal_utils;
 use crate::query::ast::{CompOp, Literal};
+use crate::store::database::logical_node_field_to_lance;
 use crate::store::graph::GraphStorage;
 
 #[derive(Debug, Clone)]
@@ -190,12 +191,15 @@ impl NodeScanExec {
         let struct_fields = Self::output_struct_fields(output_schema)?;
         let mut struct_columns = Vec::with_capacity(struct_fields.len());
         for field in &struct_fields {
-            let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "column {} not found while materializing node scan output",
-                    field.name()
-                ))
-            })?;
+            let col = batch
+                .column_by_name(field.name())
+                .or_else(|| batch.column_by_name(logical_node_field_to_lance(field.name())))
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "column {} not found while materializing node scan output",
+                        field.name()
+                    ))
+                })?;
             struct_columns.push(Self::align_column_to_field(col, field)?);
         }
 
@@ -214,7 +218,7 @@ impl NodeScanExec {
     fn projected_column_names(&self) -> Result<Vec<String>> {
         Ok(Self::output_struct_fields(&self.output_schema)?
             .into_iter()
-            .map(|f| f.name().clone())
+            .map(|f| logical_node_field_to_lance(f.name()).to_string())
             .collect())
     }
 
@@ -243,7 +247,12 @@ impl NodeScanExec {
                     pred.property
                 )
             })?;
-            clauses.push(format!("{} {} {}", pred.property, op, lit));
+            clauses.push(format!(
+                "{} {} {}",
+                logical_node_field_to_lance(&pred.property),
+                op,
+                lit
+            ));
         }
 
         Ok(Some(clauses.join(" AND ")))

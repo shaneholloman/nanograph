@@ -17,10 +17,7 @@ use nanograph::store::database::Database;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::txlog::read_visible_cdc_entries;
 use nanograph::store::{GraphStorage, scalar_index_name, vector_index_name};
-use nanograph::{
-    MutationExecResult, ParamMap, build_catalog, execute_mutation, execute_query,
-    lower_mutation_query, lower_query,
-};
+use nanograph::{MutationExecResult, ParamMap, build_catalog, execute_query, lower_query};
 
 fn test_schema() -> &'static str {
     r#"
@@ -215,15 +212,20 @@ async fn run_db_query_test_with_params(
 
 async fn run_db_mutation_test_with_params(
     query_str: &str,
-    db: &mut Database,
+    db: &Database,
     params: &ParamMap,
 ) -> MutationExecResult {
     let qf = parse_query(query_str).unwrap();
     let query = &qf.queries[0];
     let checked = typecheck_query_decl(db.catalog(), query).unwrap();
     assert!(matches!(checked, CheckedQuery::Mutation(_)));
-    let ir = lower_mutation_query(query).unwrap();
-    execute_mutation(&ir, db, params).await.unwrap()
+    match db.run_query(query, params).await.unwrap() {
+        nanograph::RunResult::Mutation(result) => MutationExecResult {
+            affected_nodes: result.affected_nodes,
+            affected_edges: result.affected_edges,
+        },
+        nanograph::RunResult::Query(_) => panic!("expected mutation result"),
+    }
 }
 
 fn extract_string_column(batches: &[RecordBatch], col_name: &str) -> Vec<String> {
@@ -1113,7 +1115,8 @@ query add_knows($from: String, $to: String) {
     .await;
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 1);
-    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 4);
+    let storage = db.snapshot();
+    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 4);
 }
 
 #[tokio::test]
@@ -1126,7 +1129,8 @@ async fn test_update_mutation_query_preserves_id_and_edges() {
     db.load(keyed_mutation_data()).await.unwrap();
     let manifest_before = GraphManifest::read(&db_path).unwrap();
 
-    let before = db.storage.get_all_nodes("Person").unwrap().unwrap();
+    let before_storage = db.snapshot();
+    let before = before_storage.get_all_nodes("Person").unwrap().unwrap();
     let before_ids = before
         .column_by_name("id")
         .unwrap()
@@ -1165,7 +1169,8 @@ query update_person($name: String, $age: I32) {
     .await;
     assert_eq!(result.affected_nodes, 1);
 
-    let after = db.storage.get_all_nodes("Person").unwrap().unwrap();
+    let after_storage = db.snapshot();
+    let after = after_storage.get_all_nodes("Person").unwrap().unwrap();
     let after_ids = after
         .column_by_name("id")
         .unwrap()
@@ -1189,7 +1194,7 @@ query update_person($name: String, $age: I32) {
         .unwrap();
     assert_eq!(after_ids.value(alice_after), alice_id_before);
     assert_eq!(after_ages.value(alice_after), 31);
-    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
+    assert_eq!(after_storage.edge_segments["Knows"].edge_ids.len(), 1);
     let manifest_after = GraphManifest::read(&db_path).unwrap();
     assert!(
         manifest_dataset_version(&manifest_after, "node", "Person")
@@ -1236,7 +1241,8 @@ query delete_knows($from: String) {
     .await;
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 2);
-    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
+    let storage = db.snapshot();
+    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 1);
 }
 
 #[tokio::test]
@@ -1264,10 +1270,11 @@ query delete_person($name: String) {
     assert_eq!(result.affected_nodes, 1);
     assert_eq!(result.affected_edges, 3);
 
-    let people = db.storage.get_all_nodes("Person").unwrap().unwrap();
+    let storage = db.snapshot();
+    let people = storage.get_all_nodes("Person").unwrap().unwrap();
     assert_eq!(people.num_rows(), 3);
-    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
-    assert_eq!(db.storage.edge_segments["WorksAt"].edge_ids.len(), 1);
+    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 1);
+    assert_eq!(storage.edge_segments["WorksAt"].edge_ids.len(), 1);
 }
 
 #[tokio::test]

@@ -2,17 +2,15 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use tokio::runtime::Runtime;
 
 use nanograph::error::NanoError;
-use nanograph::json_output::record_batches_to_json_rows;
-use nanograph::query::ast::{Literal, Param};
 use nanograph::query::parser::parse_query;
-use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
+use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::store::database::{CleanupOptions, CompactOptions, Database, LoadMode};
-use nanograph::{ParamMap, execute_mutation, execute_query, lower_mutation_query, lower_query};
+use nanograph::{JsonParamMode, RunInputError, find_named_query, json_params_to_param_map};
 
 type FfiResult<T> = std::result::Result<T, String>;
 
@@ -109,6 +107,10 @@ fn to_ffi_err(err: NanoError) -> String {
     err.to_string()
 }
 
+fn to_ffi_input_err(err: RunInputError) -> String {
+    err.to_string()
+}
+
 fn parse_load_mode(mode: &str) -> FfiResult<LoadMode> {
     match mode {
         "overwrite" => Ok(LoadMode::Overwrite),
@@ -196,186 +198,6 @@ fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> FfiResult<CleanupO
     Ok(result)
 }
 
-fn parse_i64_param(key: &str, value: &serde_json::Value) -> FfiResult<i64> {
-    match value {
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .ok_or_else(|| format!("param '{}': expected integer number", key)),
-        serde_json::Value::String(s) => s
-            .parse::<i64>()
-            .map_err(|_| format!("param '{}': expected integer string, got '{}'", key, s)),
-        _ => Err(format!("param '{}': expected integer", key)),
-    }
-}
-
-fn parse_u64_param(key: &str, value: &serde_json::Value) -> FfiResult<u64> {
-    match value {
-        serde_json::Value::Number(n) => n
-            .as_u64()
-            .ok_or_else(|| format!("param '{}': expected unsigned integer number", key)),
-        serde_json::Value::String(s) => s.parse::<u64>().map_err(|_| {
-            format!(
-                "param '{}': expected unsigned integer string, got '{}'",
-                key, s
-            )
-        }),
-        _ => Err(format!("param '{}': expected unsigned integer", key)),
-    }
-}
-
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-fn json_value_to_literal_inferred(key: &str, value: &serde_json::Value) -> FfiResult<Literal> {
-    match value {
-        serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-        serde_json::Value::Bool(v) => Ok(Literal::Bool(*v)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Literal::Integer(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(Literal::Float(f))
-            } else {
-                Err(format!("param '{}': unsupported numeric value", key))
-            }
-        }
-        serde_json::Value::Array(values) => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                out.push(json_value_to_literal_inferred(key, value)?);
-            }
-            Ok(Literal::List(out))
-        }
-        serde_json::Value::Null => Err(format!("param '{}': null is not supported", key)),
-        serde_json::Value::Object(_) => Err(format!("param '{}': object is not supported", key)),
-    }
-}
-
-fn parse_vector_dim(type_name: &str) -> Option<usize> {
-    let dim = type_name
-        .strip_prefix("Vector(")?
-        .strip_suffix(')')?
-        .parse::<usize>()
-        .ok()?;
-    if dim == 0 { None } else { Some(dim) }
-}
-
-fn json_value_to_literal_typed(
-    key: &str,
-    value: &serde_json::Value,
-    type_name: &str,
-) -> FfiResult<Literal> {
-    match type_name {
-        "String" => match value {
-            serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-            other => Err(format!(
-                "param '{}': expected string, got {}",
-                key,
-                json_type_name(other)
-            )),
-        },
-        "I32" | "I64" => Ok(Literal::Integer(parse_i64_param(key, value)?)),
-        "U32" => {
-            let v = parse_u64_param(key, value)?;
-            let v = u32::try_from(v)
-                .map_err(|_| format!("param '{}': value {} exceeds U32", key, v))?;
-            Ok(Literal::Integer(i64::from(v)))
-        }
-        "U64" => {
-            let v = parse_u64_param(key, value)?;
-            let v = i64::try_from(v).map_err(|_| {
-                format!(
-                    "param '{}': value {} exceeds current engine range for U64 (max {})",
-                    key,
-                    v,
-                    i64::MAX
-                )
-            })?;
-            Ok(Literal::Integer(v))
-        }
-        "F32" | "F64" => value
-            .as_f64()
-            .map(Literal::Float)
-            .ok_or_else(|| format!("param '{}': expected float", key)),
-        "Bool" => value
-            .as_bool()
-            .map(Literal::Bool)
-            .ok_or_else(|| format!("param '{}': expected boolean", key)),
-        "Date" => match value {
-            serde_json::Value::String(s) => Ok(Literal::Date(s.clone())),
-            _ => Err(format!("param '{}': expected date string", key)),
-        },
-        "DateTime" => match value {
-            serde_json::Value::String(s) => Ok(Literal::DateTime(s.clone())),
-            _ => Err(format!("param '{}': expected datetime string", key)),
-        },
-        t if t.starts_with("Vector(") => {
-            let expected_dim = parse_vector_dim(t)
-                .ok_or_else(|| format!("param '{}': invalid vector type '{}'", key, t))?;
-            let values = value
-                .as_array()
-                .ok_or_else(|| format!("param '{}': expected array for {}", key, t))?;
-            if values.len() != expected_dim {
-                return Err(format!(
-                    "param '{}': expected {} values for {}, got {}",
-                    key,
-                    expected_dim,
-                    t,
-                    values.len()
-                ));
-            }
-            let mut out = Vec::with_capacity(values.len());
-            for item in values {
-                let num = item
-                    .as_f64()
-                    .ok_or_else(|| format!("param '{}': vector element is not numeric", key))?;
-                out.push(Literal::Float(num));
-            }
-            Ok(Literal::List(out))
-        }
-        _ => match value {
-            serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-            other => Err(format!(
-                "param '{}': expected string for type '{}', got {}",
-                key,
-                type_name,
-                json_type_name(other)
-            )),
-        },
-    }
-}
-
-fn json_params_to_param_map(
-    params: Option<&serde_json::Value>,
-    query_params: &[Param],
-) -> FfiResult<ParamMap> {
-    let mut map = ParamMap::new();
-    let object = match params {
-        Some(serde_json::Value::Object(obj)) => obj,
-        Some(serde_json::Value::Null) | None => return Ok(map),
-        Some(_) => return Err("params must be a JSON object".to_string()),
-    };
-
-    for (key, value) in object {
-        let decl = query_params.iter().find(|p| p.name == *key);
-        let literal = if let Some(decl) = decl {
-            json_value_to_literal_typed(key, value, &decl.type_name)?
-        } else {
-            json_value_to_literal_inferred(key, value)?
-        };
-        map.insert(key.clone(), literal);
-    }
-    Ok(map)
-}
-
 fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "name": prop.name,
@@ -405,15 +227,26 @@ fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
 
 pub struct NanoGraphHandle {
     runtime: Runtime,
-    db: Mutex<Option<Database>>,
+    db: RwLock<Option<Database>>,
 }
 
 impl NanoGraphHandle {
     fn with_runtime(runtime: Runtime, db: Database) -> Self {
         Self {
             runtime,
-            db: Mutex::new(Some(db)),
+            db: RwLock::new(Some(db)),
         }
+    }
+
+    fn db(&self) -> FfiResult<Database> {
+        let guard = self
+            .db
+            .read()
+            .map_err(|_| "database rwlock is poisoned".to_string())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "database is closed".to_string())
     }
 }
 
@@ -435,56 +268,25 @@ fn run_query_json(
     query_name: &str,
     params: Option<serde_json::Value>,
 ) -> FfiResult<serde_json::Value> {
-    let queries = parse_query(query_source).map_err(to_ffi_err)?;
-    let query = queries
-        .queries
-        .iter()
-        .find(|q| q.name == query_name)
-        .ok_or_else(|| format!("query '{}' not found", query_name))?
-        .clone();
-    let param_map = json_params_to_param_map(params.as_ref(), &query.params)?;
+    let query = find_named_query(query_source, query_name).map_err(to_ffi_input_err)?;
+    let param_map =
+        json_params_to_param_map(params.as_ref(), &query.params, JsonParamMode::Standard)
+            .map_err(to_ffi_input_err)?;
+    let db = handle.db()?;
 
     if query.mutation.is_some() {
-        let mut guard = handle
-            .db
-            .lock()
-            .map_err(|_| "database mutex is poisoned".to_string())?;
-        let db = guard
-            .as_mut()
-            .ok_or_else(|| "database is closed".to_string())?;
-        let checked = typecheck_query_decl(db.catalog(), &query).map_err(to_ffi_err)?;
-        if !matches!(checked, CheckedQuery::Mutation(_)) {
-            return Err("expected mutation query".to_string());
-        }
-        let mutation_ir = lower_mutation_query(&query).map_err(to_ffi_err)?;
         let result = handle
             .runtime
-            .block_on(execute_mutation(&mutation_ir, db, &param_map))
+            .block_on(db.run_query(&query, &param_map))
             .map_err(to_ffi_err)?;
-        Ok(serde_json::json!({
-            "affectedNodes": result.affected_nodes,
-            "affectedEdges": result.affected_edges,
-        }))
+        Ok(result.to_sdk_json())
     } else {
-        let (catalog, storage) = {
-            let guard = handle
-                .db
-                .lock()
-                .map_err(|_| "database mutex is poisoned".to_string())?;
-            let db = guard
-                .as_ref()
-                .ok_or_else(|| "database is closed".to_string())?;
-            (db.catalog().clone(), db.snapshot())
-        };
-        let type_ctx = typecheck_query(&catalog, &query).map_err(to_ffi_err)?;
-        let ir = lower_query(&catalog, &query, &type_ctx).map_err(to_ffi_err)?;
+        let prepared = db.prepare_read_query(&query).map_err(to_ffi_err)?;
         let results = handle
             .runtime
-            .block_on(execute_query(&ir, storage, &param_map))
+            .block_on(prepared.execute(&param_map))
             .map_err(to_ffi_err)?;
-        Ok(serde_json::Value::Array(record_batches_to_json_rows(
-            &results,
-        )))
+        Ok(results.to_sdk_json())
     }
 }
 
@@ -576,8 +378,8 @@ pub extern "C" fn nanograph_db_close(handle: *mut NanoGraphHandle) -> c_int {
     to_status(with_handle(handle, |handle| {
         let mut guard = handle
             .db
-            .lock()
-            .map_err(|_| "database mutex is poisoned".to_string())?;
+            .write()
+            .map_err(|_| "database rwlock is poisoned".to_string())?;
         *guard = None;
         Ok(())
     }))
@@ -617,13 +419,7 @@ pub extern "C" fn nanograph_db_load(
 
     to_status(with_handle(handle, |handle| {
         let load_mode = parse_load_mode(&mode)?;
-        let mut guard = handle
-            .db
-            .lock()
-            .map_err(|_| "database mutex is poisoned".to_string())?;
-        let db = guard
-            .as_mut()
-            .ok_or_else(|| "database is closed".to_string())?;
+        let db = handle.db()?;
         handle
             .runtime
             .block_on(db.load_with_mode(&data_source, load_mode))
@@ -659,16 +455,8 @@ pub extern "C" fn nanograph_db_check(
         let query_source = parse_required_str("query_source", query_source)?;
         with_handle(handle, |handle| {
             let queries = parse_query(&query_source).map_err(to_ffi_err)?;
-            let catalog = {
-                let guard = handle
-                    .db
-                    .lock()
-                    .map_err(|_| "database mutex is poisoned".to_string())?;
-                let db = guard
-                    .as_ref()
-                    .ok_or_else(|| "database is closed".to_string())?;
-                db.catalog().clone()
-            };
+            let db = handle.db()?;
+            let catalog = db.catalog().clone();
 
             let mut checks = Vec::with_capacity(queries.queries.len());
             for q in &queries.queries {
@@ -700,13 +488,7 @@ pub extern "C" fn nanograph_db_check(
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_db_describe(handle: *mut NanoGraphHandle) -> *mut c_char {
     let result = with_handle(handle, |handle| {
-        let guard = handle
-            .db
-            .lock()
-            .map_err(|_| "database mutex is poisoned".to_string())?;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| "database is closed".to_string())?;
+        let db = handle.db()?;
         let ir = &db.schema_ir;
 
         let node_types: Vec<serde_json::Value> = ir
@@ -750,13 +532,7 @@ pub extern "C" fn nanograph_db_compact(
         let options = parse_optional_json(options_json)?;
         with_handle(handle, |handle| {
             let opts = parse_compact_options(options.as_ref())?;
-            let mut guard = handle
-                .db
-                .lock()
-                .map_err(|_| "database mutex is poisoned".to_string())?;
-            let db = guard
-                .as_mut()
-                .ok_or_else(|| "database is closed".to_string())?;
+            let db = handle.db()?;
             let result = handle
                 .runtime
                 .block_on(db.compact(opts))
@@ -784,13 +560,7 @@ pub extern "C" fn nanograph_db_cleanup(
         let options = parse_optional_json(options_json)?;
         with_handle(handle, |handle| {
             let opts = parse_cleanup_options(options.as_ref())?;
-            let mut guard = handle
-                .db
-                .lock()
-                .map_err(|_| "database mutex is poisoned".to_string())?;
-            let db = guard
-                .as_mut()
-                .ok_or_else(|| "database is closed".to_string())?;
+            let db = handle.db()?;
             let result = handle
                 .runtime
                 .block_on(db.cleanup(opts))
@@ -812,13 +582,7 @@ pub extern "C" fn nanograph_db_cleanup(
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_char {
     let result = with_handle(handle, |handle| {
-        let guard = handle
-            .db
-            .lock()
-            .map_err(|_| "database mutex is poisoned".to_string())?;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| "database is closed".to_string())?;
+        let db = handle.db()?;
         let report = handle.runtime.block_on(db.doctor()).map_err(to_ffi_err)?;
         Ok(serde_json::json!({
             "healthy": report.healthy,

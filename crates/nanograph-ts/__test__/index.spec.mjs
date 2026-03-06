@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "../index.js";
+import { Database, decodeArrow } from "../index.js";
 
 // ---------- fixtures ----------
 
@@ -207,6 +207,10 @@ describe("Database", () => {
   // ---- read queries ----
 
   describe("run — read queries", () => {
+    it("should export decodeArrow helper", async () => {
+      assert.equal(typeof decodeArrow, "function");
+    });
+
     it("should execute a parameterized query", async () => {
       const { db } = await freshDb();
       const rows = await db.run(QUERIES, "personByName", { name: "Alice" });
@@ -265,6 +269,40 @@ describe("Database", () => {
       const rows = await db.run(QUERIES, "avgAge");
       assert.equal(rows.length, 1);
       assert.equal(rows[0].avg_age, 30); // (30+25+35)/3 = 30
+      await db.close();
+    });
+
+    it("should return Arrow IPC for read queries", async () => {
+      const { db } = await freshDb();
+      const arrow = await db.runArrow(QUERIES, "personByName", { name: "Alice" });
+      const table = decodeArrow(arrow);
+      const rows = table.toArray();
+      assert.equal(Buffer.isBuffer(arrow), true);
+      assert.ok(arrow.byteLength > 0);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].name, "Alice");
+      await db.close();
+    });
+
+    it("should return Arrow IPC for empty read results", async () => {
+      const { db } = await freshDb();
+      const arrow = await db.runArrow(QUERIES, "personByName", { name: "Nobody" });
+      const table = decodeArrow(arrow);
+      assert.equal(Buffer.isBuffer(arrow), true);
+      assert.ok(arrow.byteLength > 0);
+      assert.equal(table.toArray().length, 0);
+      await db.close();
+    });
+
+    it("should reject runArrow for mutations", async () => {
+      const { db } = await freshDb();
+      await assert.rejects(
+        () => db.runArrow(QUERIES, "insertPerson", { name: "Frank", age: 41 }),
+        (err) => {
+          assert.ok(err.message.includes("runArrow only supports read queries"));
+          return true;
+        },
+      );
       await db.close();
     });
   });

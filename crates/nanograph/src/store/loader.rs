@@ -44,6 +44,9 @@ pub(crate) async fn build_next_storage_for_load(
     };
 
     let mut incoming_storage = GraphStorage::new(existing.catalog.clone());
+    if matches!(mode, LoadMode::Merge | LoadMode::Append) {
+        incoming_storage.set_next_node_id(existing.next_node_id());
+    }
     match mode {
         LoadMode::Overwrite => {
             load_jsonl_data(&mut incoming_storage, &materialized_data, &key_props)?;

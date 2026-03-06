@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema};
 use crate::error::{NanoError, Result};
 
 use super::super::graph::GraphStorage;
-use super::constraints::key_value_string;
+use super::constraints::{key_value_string, node_property_field, node_property_index};
 
 /// Load JSONL-formatted data into a GraphStorage.
 /// Each line is either a node `{"type": "...", "data": {...}}` or edge `{"edge": "...", "from": "...", "to": "..."}`.
@@ -64,28 +64,29 @@ pub(crate) fn load_jsonl_data_with_name_seed(
             NanoError::Storage(format!("unknown node type in data: {}", type_name))
         })?;
 
-        let props: Vec<String> = node_type
+        let prop_fields: Vec<Field> = node_type
             .arrow_schema
             .fields()
             .iter()
             .skip(1) // skip id
-            .map(|f| f.name().clone())
+            .map(|f| f.as_ref().clone())
             .collect();
 
-        let mut builders: Vec<Vec<serde_json::Value>> = vec![Vec::new(); props.len()];
+        let mut builders: Vec<Vec<serde_json::Value>> = vec![Vec::new(); prop_fields.len()];
 
         for (row_idx, node) in nodes.iter().enumerate() {
             if let Some(data_obj) = node.get("data").and_then(|d| d.as_object()) {
-                for (i, prop) in props.iter().enumerate() {
-                    let field = &node_type.arrow_schema.fields()[i + 1]; // skip id
+                for (i, field) in prop_fields.iter().enumerate() {
                     let val = data_obj
-                        .get(prop)
+                        .get(field.name())
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     if val.is_null() && !field.is_nullable() {
                         return Err(NanoError::Storage(format!(
                             "node {}: required field '{}' missing on row {}",
-                            type_name, prop, row_idx
+                            type_name,
+                            field.name(),
+                            row_idx
                         )));
                     }
                     builders[i].push(val);
@@ -94,19 +95,11 @@ pub(crate) fn load_jsonl_data_with_name_seed(
         }
 
         let mut columns: Vec<Arc<dyn Array>> = Vec::new();
-        for (i, prop) in props.iter().enumerate() {
-            let field = node_type.arrow_schema.field_with_name(prop).unwrap();
+        for (i, field) in prop_fields.iter().enumerate() {
             let col = json_values_to_array(&builders[i], field.data_type(), field.is_nullable())?;
             columns.push(col);
         }
 
-        let prop_fields: Vec<Field> = node_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .skip(1)
-            .map(|f| f.as_ref().clone())
-            .collect();
         let prop_schema = Arc::new(Schema::new(prop_fields));
         let batch = RecordBatch::try_new(prop_schema, columns)
             .map_err(|e| NanoError::Storage(format!("batch error: {}", e)))?;
@@ -121,10 +114,10 @@ pub(crate) fn load_jsonl_data_with_name_seed(
             continue;
         };
 
-        let key_idx = batch.schema().index_of(key_prop).map_err(|e| {
+        let key_idx = node_property_index(batch.schema().as_ref(), key_prop).ok_or_else(|| {
             NanoError::Storage(format!(
-                "node type {} missing @key property {}: {}",
-                type_name, key_prop, e
+                "node type {} missing @key property {}",
+                type_name, key_prop
             ))
         })?;
         let key_arr = batch.column(key_idx).clone();
@@ -199,7 +192,7 @@ pub(crate) fn load_jsonl_data_with_name_seed(
             .catalog
             .node_types
             .get(&from_type)
-            .and_then(|nt| nt.arrow_schema.field_with_name(src_key_prop).ok())
+            .and_then(|nt| node_property_field(nt.arrow_schema.as_ref(), src_key_prop))
             .map(|f| f.data_type().clone())
             .ok_or_else(|| {
                 NanoError::Storage(format!(
@@ -211,7 +204,7 @@ pub(crate) fn load_jsonl_data_with_name_seed(
             .catalog
             .node_types
             .get(&to_type)
-            .and_then(|nt| nt.arrow_schema.field_with_name(dst_key_prop).ok())
+            .and_then(|nt| node_property_field(nt.arrow_schema.as_ref(), dst_key_prop))
             .map(|f| f.data_type().clone())
             .ok_or_else(|| {
                 NanoError::Storage(format!(
@@ -973,6 +966,35 @@ edge Follows: User -> User
 {"edge":"Follows","from":"usr_01","to":"usr_02"}"#;
 
         load_jsonl_data(&mut storage, data, &key_props).unwrap();
+        let follows = &storage.edge_segments["Follows"];
+        assert_eq!(follows.edge_ids.len(), 1);
+    }
+
+    #[test]
+    fn load_jsonl_edges_resolve_by_user_property_named_id() {
+        let schema = r#"node User {
+    id: String @key
+    display_name: String
+}
+edge Follows: User -> User
+"#;
+        let mut storage = build_storage(schema);
+        let key_props = HashMap::from([("User".to_string(), "id".to_string())]);
+        let data = r#"{"type":"User","data":{"id":"usr_01","display_name":"Alice"}}
+{"type":"User","data":{"id":"usr_02","display_name":"Bob"}}
+{"edge":"Follows","from":"usr_01","to":"usr_02"}"#;
+
+        load_jsonl_data(&mut storage, data, &key_props).unwrap();
+
+        let users = storage.get_all_nodes("User").unwrap().unwrap();
+        let user_ids = users
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(user_ids.value(0), "usr_01");
+        assert_eq!(user_ids.value(1), "usr_02");
+
         let follows = &storage.edge_segments["Follows"];
         assert_eq!(follows.edge_ids.len(), 1);
     }
