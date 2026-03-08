@@ -2,15 +2,15 @@
 
 Personal CRM and decision trace system. Demonstrates the complete physics of execution: from intelligence capture through enrichment, screening, decision-making, and execution.
 
-**Design docs:** [Context Graph Example](../../docs/user/revops.md)
+**Design docs:** [Context Graph Example](../../docs/user/context-graph-example.md)
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `revops.pg` | Schema — 10 node types, 21 edge types |
-| `revops.gq` | Queries — 24 total: lookups, traces, aggregation, filtering, mutations |
-| `revops.jsonl` | Seed data — Stripe Migration example (16 nodes, 22 edges) |
+| `revops.pg` | Schema with trace-friendly node and edge types plus agent-facing metadata |
+| `revops.gq` | Query suite for traces, search, aggregation, filtering, and mutations |
+| `revops.jsonl` | Seed data for the Stripe Migration scenario |
 
 ## Quick Start
 
@@ -33,6 +33,12 @@ The checked-in `nanograph.toml` provides:
 - deterministic mock embeddings for `Signal.summaryEmbedding`
 
 Output formats remain `table` (default), `csv`, `jsonl`, and `json`.
+
+See also:
+
+- [Context Graph Example](../../docs/user/context-graph-example.md)
+- [Search Guide](../../docs/user/search.md)
+- [Project Config](../../docs/user/config.md)
 
 ## Schema Overview
 
@@ -126,26 +132,11 @@ Output formats remain `table` (default), `csv`, `jsonl`, and `json`.
 
 ## Seed Data: Stripe Migration Trace
 
-The seed data implements the complete three-phase trace from the [context graph example](../../docs/user/revops.md):
+The seed data implements the complete three-phase trace from the [context graph example](../../docs/user/context-graph-example.md):
 
 1. **Intelligence** — Jamie's coffee chat produces a Signal ("Priya hates her vendor"). The Signal surfaces the Stripe Migration opportunity.
 2. **Enrichment & Screening** — Andrew decides to make a proposal. The agent builds an Enrichment Profile from the Screening Policy criteria. The decision passes screening.
 3. **Execution** — The agent drafts and sends the proposal. The deal advances to Won. A Data Pipeline project is spawned.
-
-### Entities
-
-| Type | Count | Examples |
-|------|-------|---------|
-| Actor | 2 | Andrew (human), OmniBot (agent) |
-| Client | 2 | Jamie Lee (connector), Priya Shah (Stripe) |
-| Record | 3 | Coffee Chat, Enrichment Profile, Proposal |
-| Opportunity | 1 | Stripe Migration ($25K, won) |
-| Project | 1 | Data Pipeline (active) |
-| ActionItem | 1 | Draft Proposal (completed) |
-| Signal | 1 | "Hates vendor" (high urgency) |
-| Decision | 1 | Make Proposal (approved, sales) |
-| Policy | 2 | Screening Policy v1, v2 (supersedes) |
-| Action | 2 | Build Profile, Sent Proposal |
 
 ## Adding Data
 

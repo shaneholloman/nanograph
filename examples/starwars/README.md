@@ -6,8 +6,8 @@ Typed property graph of the Star Wars universe with a rich relationship model an
 
 | File | Description |
 |------|-------------|
-| `starwars.pg` | Merged schema (9 node types, 26 edge types, slug `@key` identity) |
-| `starwars.jsonl` | Merged data (~66 nodes, ~146 edges) |
+| `starwars.pg` | Schema with slug `@key` identity, search fields, and agent-facing metadata |
+| `starwars.jsonl` | Seed data for the example graph |
 | `starwars.gq` | Read + mutation query suite (legacy reads + film/date + mutations) |
 
 ## Notable Modeling Choices
@@ -34,6 +34,12 @@ nanograph run debut anakin-skywalker
 ```
 
 The config also enables deterministic mock embeddings and exposes aliases like `search`, `hybrid`, `family`, and `debut`.
+
+See also:
+
+- [Star Wars Example](../../docs/user/starwars-example.md)
+- [Search Guide](../../docs/user/search.md)
+- [Project Config](../../docs/user/config.md)
 
 ## Mutation + CDC Walkthrough
 

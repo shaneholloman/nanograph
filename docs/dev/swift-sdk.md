@@ -215,12 +215,24 @@ let schema = try db.describe() as! [String: Any]
 
 // Typed
 struct DescribeResult: Decodable {
-    struct TypeDef: Decodable { let name: String }
-    let nodeTypes: [TypeDef]
-    let edgeTypes: [TypeDef]
+    struct NodeType: Decodable {
+        let name: String
+        let description: String?
+        let instruction: String?
+        let keyProperty: String?
+    }
+    struct EdgeType: Decodable {
+        let name: String
+        let description: String?
+        let instruction: String?
+    }
+    let nodeTypes: [NodeType]
+    let edgeTypes: [EdgeType]
 }
 let schema = try db.describe(DescribeResult.self)
 ```
+
+The describe payload includes schema `@description(...)` / `@instruction(...)` metadata, derived key-property summaries, endpoint-key metadata, and relationship hints. Use this as the canonical machine-readable schema surface from Swift.
 
 ### `db.compact(options:)`
 

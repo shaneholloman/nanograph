@@ -5,6 +5,7 @@
 .DS_Store
 docs/internal/
 docs/backlog/
+docs/archive/
 .claude/
 .env
 .env.nano

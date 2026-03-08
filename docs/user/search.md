@@ -29,6 +29,8 @@ If you want real embeddings instead of the example's default mock provider, put 
 OPENAI_API_KEY=...
 ```
 
+See [Project Config](config.md) for config and env precedence.
+
 ## Lexical search
 
 Token search:
@@ -137,6 +139,7 @@ Machine-oriented formats like `json`, `jsonl`, and `csv` keep their existing pay
 
 ## Next steps
 
+- [Project Config](config.md)
 - [Star Wars Example](starwars-example.md)
 - [Context Graph Example](context-graph-example.md)
 - [Schema Language Reference](schema.md)

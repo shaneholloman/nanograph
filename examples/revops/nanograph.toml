@@ -48,3 +48,8 @@ query = "revops.gq"
 name = "semantic_signals_for_client"
 args = ["client", "q"]
 format = "table"
+
+[query_aliases.capture]
+query = "revops.gq"
+name = "add_signal"
+format = "jsonl"

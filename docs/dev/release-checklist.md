@@ -86,7 +86,7 @@ This is not automated yet. If the external Swift package repo exists, update it 
 
 | Asset | Location |
 |-------|----------|
-| GitHub Release | `github.com/aaltshuler/nanograph/releases` |
+| GitHub Release | `github.com/nanograph/nanograph/releases` |
 | macOS ARM binary | `nanograph-vX.Y.Z-aarch64-apple-darwin.tar.gz` on release |
 | Swift XCFramework | `NanoGraphFFI.xcframework.zip` on release |
 | Homebrew tap | `github.com/nanograph/homebrew-tap` |
@@ -107,4 +107,4 @@ This is not automated yet. If the external Swift package repo exists, update it 
 | Swift package renderer | `tools/swift-package/render_package.sh` |
 | Homebrew tap | `nanograph/homebrew-tap` (GitHub org) |
 | Tap update workflow | `homebrew-tap/.github/workflows/update-formula.yml` |
-| `HOMEBREW_TAP_TOKEN` | Secret on `aaltshuler/nanograph` — fine-grained PAT with Contents write to `nanograph/homebrew-tap` |
+| `HOMEBREW_TAP_TOKEN` | Secret on `nanograph/nanograph` — fine-grained PAT with Contents write to `nanograph/homebrew-tap` |

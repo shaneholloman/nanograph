@@ -48,6 +48,8 @@ That means:
 - `nanograph run search "father and son conflict"` works out of the box
 - explicit flags still override config when you need them
 
+See [Project Config](config.md) for the full config, env, and alias rules.
+
 ## Schema metadata
 
 The example schema also demonstrates agent-oriented metadata:
@@ -127,6 +129,7 @@ nanograph run --query starwars.gq --name same_debut --format json --param film=a
 
 ## See also
 
+- [Project Config](config.md)
 - [Search Guide](search.md)
 - [Context Graph Example](context-graph-example.md)
 - [Schema Language Reference](schema.md)

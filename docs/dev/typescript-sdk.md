@@ -152,8 +152,28 @@ Return schema introspection.
 
 ```typescript
 const schema = await db.describe();
-// { nodeTypes: [{ name: "Person", typeId: ..., properties: [...] }], edgeTypes: [...] }
+// {
+//   nodeTypes: [{
+//     name: "Person",
+//     description: "...",
+//     instruction: "...",
+//     keyProperty: "name",
+//     uniqueProperties: [],
+//     outgoingEdges: [...],
+//     incomingEdges: [...],
+//     properties: [...]
+//   }],
+//   edgeTypes: [{
+//     name: "Knows",
+//     description: "...",
+//     instruction: "...",
+//     endpointKeys: { src: "name", dst: "name" },
+//     properties: [...]
+//   }]
+// }
 ```
+
+The describe payload now includes schema `@description(...)` / `@instruction(...)` metadata, derived key-property summaries, and relationship hints. This is the preferred machine-readable introspection surface for agents and SDK consumers.
 
 ### `db.compact(options?)`
 

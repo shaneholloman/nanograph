@@ -19,7 +19,7 @@ cargo install nanograph-cli
 
 ## The Star Wars graph
 
-The `examples/starwars/` directory has a ready-to-run knowledge graph — 9 node types, 25 edge types, 66 nodes, 146 edges.
+The `examples/starwars/` directory has a ready-to-run knowledge graph with typed schema, search fields, aliases, and checked-in project config.
 
 Here's a slice of the graph:
 
@@ -71,11 +71,16 @@ nanograph load --data starwars.jsonl --mode overwrite
 
 The checked-in [examples/starwars/nanograph.toml](/Users/andrew/code/nanograph/examples/starwars/nanograph.toml) supplies the default DB path, query root, mock embedding mode, and search aliases. `init` creates the database directory from the schema, and `load` ingests JSONL data with schema validation.
 
+For new projects outside the examples, `init` also scaffolds `nanograph.toml` and `.env.nano`. See [Project Config](config.md) for the exact layout.
+
 ## Query
 
 ```bash
 # semantic search
 nanograph run search "father and son conflict"
+
+# inspect agent-facing schema metadata
+nanograph describe --type Character --format json
 
 # who did Yoda train?
 nanograph run --query starwars.gq --name students_of --param name="Yoda"
@@ -93,6 +98,7 @@ nanograph check --query starwars.gq
 ## Next steps
 
 - [Schema Language Reference](schema.md) — types, annotations, constraints
+- [Project Config](config.md) — `nanograph.toml`, `.env.nano`, aliases, defaults
 - [Query Language Reference](queries.md) — match, return, traversal, mutations
 - [Search Guide](search.md) — text search, vector search, hybrid ranking
 - [CLI Reference](cli-reference.md) — all commands and options

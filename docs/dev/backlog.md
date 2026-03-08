@@ -15,22 +15,19 @@ See [docs/dev/embeddable-api.md](embeddable-api.md) for full design.
 - [ ] Custom UDF registration via DataFusion (separate design doc)
 - [ ] Pure in-memory backend that bypasses Lance / filesystem metadata
 
-## CLI Ergonomics
-
-- [ ] Structured JSON errors — when `--json` is set, emit `{"error": "...", "kind": "..."}` instead of stderr text. Critical for agent consumption.
-- [ ] `--dry-run` on `load` and mutation `run` — show type-checked plan, affected types, estimated row counts without writing. (`migrate --dry-run` already exists.)
-- [ ] Consistent `--json` vs `--format` — pick one mechanism. Currently `--json` is global and `--format` is per-command; some commands check both. Unify so `--json` globally switches all output (including errors) to structured JSON.
-- [x] Schema introspection — `nanograph describe --type Person` for single-type schema introspection with agent metadata and derived relationship hints.
-- [ ] Inline query — `--query-inline 'insert Person { name: $name }'` or `--query -` for stdin, so one-liners don't need a `.gq` file.
-- [ ] Stdin for load — `--data -` reads JSONL from stdin for pipeline composition (`cat data.jsonl | nanograph load my.nano --data - --mode append`).
-
-## CLI (existing)
+## CLI
 
 - [x] `nanograph describe` — print schema definition for a type or all types
 - [x] `--format json` output (array of objects, in addition to existing `table|csv|jsonl`)
 - [x] `--json` on all commands (`check`, `migrate`, `load`, `init`, `delete`) — machine-readable output for agents
 - [x] `nanograph export --format jsonl` — dump full graph to stdout for git-friendly snapshots
 - [x] `nanograph version --db` — print current Lance version per dataset type
+- [ ] Structured JSON errors — when `--json` is set, emit `{"error": "...", "kind": "..."}` instead of stderr text. Critical for agent consumption.
+- [ ] `--dry-run` on `load` and mutation `run` — show type-checked plan, affected types, estimated row counts without writing. (`migrate --dry-run` already exists.)
+- [ ] Consistent `--json` vs `--format` — pick one mechanism. Currently `--json` is global and `--format` is per-command; some commands check both. Unify so `--json` globally switches all output (including errors) to structured JSON.
+- [x] Schema introspection — `nanograph describe --type Person` for single-type schema introspection with agent metadata and derived relationship hints.
+- [ ] Inline query — `--query-inline 'insert Person { name: $name }'` or `--query -` for stdin, so one-liners don't need a `.gq` file.
+- [ ] Stdin for load — `--data -` reads JSONL from stdin for pipeline composition (`cat data.jsonl | nanograph load my.nano --data - --mode append`).
 - [ ] Progress bars on `nanograph load` for large datasets — stream row counts via indicatif during JSONL parse and Lance write phases
 - [ ] Locked node types — mark types as read-only in schema (`@locked`?) to prevent mutation/delete via CLI or query mutations
 - [ ] Encryption at rest — encrypt Lance datasets and JSONL logs on disk, key management via env var or keyring
@@ -54,6 +51,29 @@ See [docs/dev/embeddable-api.md](embeddable-api.md) for full design.
 ## Performance
 
 - [ ] Benchmark suite — criterion harnesses for NodeScan 10K, 2-hop expansion 10K, JSONL load 100K; track regressions in CI
+
+## Integrations
+
+- [ ] Claude Code plugin / skills integration for agent workflows:
+  - schema-from-data
+  - graph-health audits
+  - setup and maintenance flows
+  - backed by CLI and SDK machine-readable surfaces
+
+## Graph Analytics
+
+- [ ] Community detection — Leiden-style clustering with cohesion scores, exposed in CLI and queryable surfaces
+- [ ] Centrality scoring — degree / betweenness style hub metrics
+- [ ] Process / flow tracing — ordered execution path extraction
+- [ ] Blast-radius analysis — downstream impact tracing from changed nodes
+
+## Remote Storage
+
+- [ ] S3-backed storage — Lance datasets on S3 or S3-compatible object stores with conflict-aware write strategy
+
+## Exploration Tool
+
+- [ ] Agent-operated UI — let an agent drive filters, layouts, highlighting, pinning, and layer toggles programmatically
 
 ## UX
 

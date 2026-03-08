@@ -5,6 +5,7 @@
 | Document | Description |
 |----------|-------------|
 | [quick-start.md](user/quick-start.md) | Zero to first query in 5 minutes |
+| [config.md](user/config.md) | `nanograph.toml`, `.env.nano`, defaults, aliases, and precedence |
 | [cli-reference.md](user/cli-reference.md) | All commands, options, and data formats |
 | [schema.md](user/schema.md) | Schema language reference — types, annotations, naming |
 | [queries.md](user/queries.md) | Query language reference — match, return, traversal, mutations |
@@ -16,9 +17,11 @@
 
 | Document | Description |
 |----------|-------------|
-| [architecture.md](dev/architecture.md) | System overview, module map, data flow |
-| [db-features.md](dev/db-features.md) | Feature status and remaining work |
-| [test-framework.md](dev/test-framework.md) | Test tiers, commands, fixture policy, CI guidance |
-| [backlog.md](backlog/backlog.md) | Implementation backlog with phase status |
+| [embeddable-api.md](dev/embeddable-api.md) | Current embeddable API, streaming ingest, and SDK status |
+| [backlog.md](dev/backlog.md) | High-level shipped milestones and deferred follow-up |
+| [typescript-sdk.md](dev/typescript-sdk.md) | TypeScript SDK notes and current surface |
+| [swift-sdk.md](dev/swift-sdk.md) | Swift SDK notes and current surface |
+| [release-checklist.md](dev/release-checklist.md) | CI, release, npm, and Swift packaging checklist |
+| [swift-split-repo.md](dev/swift-split-repo.md) | Swift distribution-repo packaging plan |
 
 Also see `grammar.ebnf` in the repo root for the formal grammar of both DSLs.

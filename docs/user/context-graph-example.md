@@ -29,6 +29,8 @@ The example config gives you:
 - aliases like `why`, `trace`, `value`, `pipeline`, and `signals`
 - deterministic mock embeddings for `Signal.summaryEmbedding`
 
+See [Project Config](config.md) for the full config and env model.
+
 ## Describe the schema
 
 The schema carries agent-oriented metadata on types like `Decision` and `Signal`.
@@ -100,6 +102,7 @@ With the new search fields, you can also ask retrieval-style questions inside th
 
 ## See also
 
+- [Project Config](config.md)
 - [Star Wars Example](starwars-example.md)
 - [Search Guide](search.md)
 - [Schema Language Reference](schema.md)

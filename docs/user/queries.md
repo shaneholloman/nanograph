@@ -51,6 +51,14 @@ query semantic_search($q: String)
 
 `nanograph run` prints this metadata before results in the default table output. It is advisory only and does not change planning or execution semantics.
 
+Aliases from [Project Config](config.md) compose cleanly with query metadata. For example:
+
+```bash
+nanograph run search "father and son conflict"
+```
+
+In table mode this prints the query name plus any `@description(...)` / `@instruction(...)` text before the result rows. Machine-oriented formats like `json`, `jsonl`, and `csv` keep their payloads unchanged.
+
 ## Parameters
 
 Parameters are typed and prefixed with `$`:

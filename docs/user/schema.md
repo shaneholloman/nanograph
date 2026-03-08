@@ -123,6 +123,13 @@ title: String @description("Short human-readable label")
 
 **Restrictions**: List properties cannot have `@key`, `@unique`, `@index`, or `@embed`. `@instruction` is only valid on node and edge types, not on properties.
 
+These annotations are metadata, not behavior:
+
+- `describe --format json` surfaces them in CLI introspection
+- TS and Swift `describe()` surface them in SDK schema metadata
+- query-level metadata appears in `nanograph run` table preambles
+- they do not change planning, execution, or load semantics
+
 Example with agent-facing metadata:
 
 ```graphql

@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/nanograph)](https://crates.io/crates/nanograph)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-On-device graph database for agents and humans. One CLI. One folder. Schema-as-code. No server.
+On-device typed property graph DB for agents and humans. One CLI. One folder. Schema-as-code. No server.
 
 Built on Rust, Lance, Arrow, and DataFusion.
 
@@ -39,13 +39,17 @@ cargo install nanograph-cli
 ## Quick start
 
 ```bash
-nanograph init my.nano --schema schema.pg
-nanograph load my.nano --data data.jsonl --mode overwrite
-nanograph check --db my.nano --query queries.gq
-nanograph run --db my.nano --query queries.gq --name my_query
+cd examples/starwars
+
+nanograph init
+nanograph load --data starwars.jsonl --mode overwrite
+nanograph check --query starwars.gq
+nanograph run search "father and son conflict"
 ```
 
-See [`examples/starwars/`](examples/starwars/) for a ready-to-run demo with 66 nodes, 146 edges, and 30 queries.
+For new projects, `nanograph init` scaffolds `nanograph.toml` for shared defaults and `.env.nano` for local secrets. See [`docs/user/config.md`](docs/user/config.md) for config, env, and query alias details.
+
+See [`examples/starwars/`](examples/starwars/) and [`examples/revops/`](examples/revops/) for the canonical ready-to-run examples.
 
 ## Use cases
 

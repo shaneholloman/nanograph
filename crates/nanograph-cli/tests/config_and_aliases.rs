@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ExampleProject, ExampleWorkspace};
+use common::{ExampleProject, ExampleWorkspace, scalar_string};
 
 #[test]
 fn starwars_config_aliases_and_metadata_work() {
@@ -83,4 +83,30 @@ fn revops_aliases_and_query_roots_work() {
     assert_eq!(pipeline.len(), 1);
     assert_eq!(pipeline[0]["stage"], "won");
     assert_eq!(pipeline[0]["deals"], 1);
+}
+
+#[test]
+fn revops_mutation_aliases_work() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    workspace.init();
+    workspace.load();
+    workspace.check();
+
+    let inserted = workspace.jsonl_rows(&["run", "capture"]);
+    assert_eq!(scalar_string(&inserted[0]["affected_nodes"]), "1");
+    assert_eq!(scalar_string(&inserted[0]["affected_edges"]), "0");
+
+    let signal = workspace.json_rows(&[
+        "run",
+        "--query",
+        "revops.gq",
+        "--name",
+        "signal_lookup",
+        "--format",
+        "json",
+        "--param",
+        "slug=sig-vendor-renewal",
+    ]);
+    assert_eq!(signal.len(), 1);
+    assert_eq!(signal[0]["urgency"], "medium");
 }
