@@ -69,7 +69,7 @@ nanograph init
 nanograph load --data starwars.jsonl --mode overwrite
 ```
 
-The checked-in [examples/starwars/nanograph.toml](/Users/andrew/code/nanograph/examples/starwars/nanograph.toml) supplies the default DB path, query root, mock embedding mode, and search aliases. `init` creates the database directory from the schema, and `load` ingests JSONL data with schema validation.
+The checked-in [examples/starwars/nanograph.toml](../../examples/starwars/nanograph.toml) supplies the default DB path, query root, mock embedding mode, and search aliases. `init` creates the database directory from the schema, and `load` ingests JSONL data with schema validation.
 
 For new projects outside the examples, `init` also scaffolds `nanograph.toml` and `.env.nano`. See [Project Config](config.md) for the exact layout.
 

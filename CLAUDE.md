@@ -14,12 +14,12 @@ cargo build -p nanograph                 # library only
 cargo build -p nanograph-cli             # CLI only
 cargo test                               # all tests (unit + e2e + migration)
 cargo test -p nanograph                  # library tests only
-cargo test -p nanograph --test e2e       # e2e integration tests only
-cargo test -p nanograph --test schema_migration  # migration tests only
+cargo test -p nanograph --test engine_integration  # engine integration tests
+cargo test -p nanograph --test schema_migration    # migration tests only
 cargo test test_bind_by_property         # single test by name
 cargo test -- --nocapture                # show stdout
-bash tests/cli/run-cli-e2e.sh            # all CLI shell scenarios
-bash tests/cli/run-cli-e2e.sh lifecycle  # single CLI scenario by name
+cargo test -p nanograph-cli               # CLI integration tests
+cargo test -p nanograph-cli --test starwars_workflows  # single CLI test file
 cargo clippy                             # lint
 cargo fmt                                # format
 RUST_LOG=debug cargo run -p nanograph-cli -- run ...  # enable tracing
@@ -92,6 +92,8 @@ Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/emb
 | `store/txlog.rs` | Transaction catalog + CDC log (`_tx_catalog.jsonl`, `_cdc_log.jsonl`) |
 | `embedding.rs` | OpenAI embedding client, retry logic, mock mode |
 | `json_output.rs` | Shared Arrow→JSON serialization for CLI and SDKs. Handles JS safe integer range (i64/u64 > 2^53 are stringified) |
+| `query_input.rs` | Query param parsing, named query lookup from `.gq` files, JSON→ParamMap conversion |
+| `result.rs` | `RunResult`, `QueryResult`, `MutationResult` — structured result types for CLI and SDKs |
 | `types.rs` | Core type definitions, `PropType`, Arrow type mappings |
 | `error.rs` | `NanoError` error type |
 
@@ -102,7 +104,11 @@ pub use catalog::{build_catalog, schema_ir};   // SchemaIR — compiled schema u
 pub use ir::ParamMap;                           // query parameter map
 pub use ir::lower::{lower_query, lower_mutation_query};
 pub use plan::planner::execute_query;
-pub use plan::physical::{execute_mutation, MutationExecResult};
+pub use plan::physical::MutationExecResult;
+pub use query::ast::Literal;
+pub use query_input::{JsonParamMode, RunInputError, RunInputResult, ToParam,
+                      find_named_query, json_params_to_param_map};
+pub use result::{MutationResult, QueryResult, RunResult};
 pub use types::{Direction, EdgeId, NodeId, PropType, ScalarType};
 ```
 
@@ -168,9 +174,13 @@ delete Person where name = $name
 
 `insert` = append. `update` requires `@key`, uses merge. `delete` cascades edges. Typechecked at compile time (T10-T14).
 
+## Project Config
+
+`nanograph init` scaffolds `nanograph.toml` (shared defaults, safe to commit) and `.env.nano` (local secrets, gitignored). Config discovery: `--config <path>` or `./nanograph.toml` — does not walk parent dirs. Key sections: `[db]` (default_path), `[schema]` (default_path), `[query]` (roots), `[embedding]` (provider, model, chunk settings), `[cli]` (output_format, json), `[query_aliases.<name>]` (shortcuts for `nanograph run`). Query aliases map positional args to named params — e.g. `nanograph run search "query text"`. See `docs/user/config.md` for full reference.
+
 ## Environment Variables
 
-The CLI loads `.env` from CWD at startup (custom parser, no external dependency). Variables are only set if not already present in the environment.
+The CLI loads `.env.nano` then `.env` from the config base directory at startup (custom parser, no external dependency). Variables are only set if not already present in the environment. Precedence: process env → `.env.nano` → `.env` → `[embedding]` in `nanograph.toml` → engine defaults.
 
 - `OPENAI_API_KEY` — required only for real embedding API calls.
 - `OPENAI_BASE_URL` — custom OpenAI-compatible endpoint (default: OpenAI API).
@@ -213,11 +223,9 @@ Source of truth for behavior is code. Update docs in the same PR when behavior c
 
 ## Test Fixtures
 
-Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `crates/nanograph/tests/schema_migration.rs`. Index performance harness in `crates/nanograph/tests/index_perf.rs` (run with `--ignored`). Write amplification harness in `crates/nanograph/tests/write_amp_perf.rs` (run with `--ignored`).
+Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Library integration tests: `engine_integration.rs` (core query engine), `schema_migration.rs` (schema evolution). Performance harnesses (run with `--ignored`): `index_perf.rs`, `write_amp_perf.rs`, `json_output_perf.rs`.
 
-CLI scenario scripts live in `tests/cli/scenarios/` and use shared helpers from `tests/cli/lib/common.sh` (build helpers, assertion macros, query runners). Scenarios: `lifecycle`, `migration`, `query_mutations`, `maintenance`, `revops_typed_cdc`, `text_search`, `context_graph_search`, `starwars_search`. Run all via `bash tests/cli/run-cli-e2e.sh` or one via `bash tests/cli/run-cli-e2e.sh <scenario>`.
-
-CLI integration tests (Rust) in `crates/nanograph-cli/tests/` — `semantic_search.rs` (embed + nearest with mock) and `search_features.rs` (search predicates and ordering).
+CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `load_modes_and_export`, `revops_admin_and_cdc`, `revops_workflows`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
 
 ## Not Yet Implemented
 
