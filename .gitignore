@@ -1,4 +1,5 @@
 /target
+/crates/nanograph/target/
 *.nano
 *.nanograph
 *.lance

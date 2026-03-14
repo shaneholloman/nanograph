@@ -32,7 +32,7 @@ cargo build -p nanograph-ts              # TS SDK crate (not in default-members)
 
 Workspace `default-members` = `nanograph` + `nanograph-cli`. Plain `cargo build`/`cargo test` skip the FFI and TS SDK crates — target them explicitly with `-p`.
 
-**Requires `protoc`** (Protocol Buffers compiler) at build time for the Lance dependency. MSRV 1.85, Rust edition 2024. `debug = 0` in dev profile (no debuginfo — builds are faster but backtraces are address-only). Dependencies are compiled with `opt-level = 2` even in dev profile so tests run at reasonable speed while the nanograph crate itself stays unoptimized for fast rebuilds. Release profile uses `lto = "thin"` and `codegen-units = 16`.
+**Requires `protoc`** (Protocol Buffers compiler) at build time for the Lance dependency. MSRV 1.91, Rust edition 2024. `debug = 0` in dev profile (no debuginfo — builds are faster but backtraces are address-only). Dependencies are compiled with `opt-level = 2` even in dev profile so tests run at reasonable speed while the nanograph crate itself stays unoptimized for fast rebuilds. Release profile uses `lto = "thin"` and `codegen-units = 16`.
 
 ## Architecture
 

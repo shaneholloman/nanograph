@@ -25,7 +25,7 @@ Built on Rust, Lance, Arrow, and DataFusion.
 brew install nanograph/tap/nanograph
 ```
 
-Or from source (requires [Rust](https://www.rust-lang.org/tools/install) 1.85+ and `protoc`):
+Or from source (requires [Rust](https://www.rust-lang.org/tools/install) 1.91+ and `protoc`):
 
 ```bash
 cargo install nanograph-cli

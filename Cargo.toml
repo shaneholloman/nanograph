@@ -27,9 +27,9 @@ datafusion-execution = "52"
 datafusion-common = "52"
 
 # Lance (local-only — no cloud backends)
-lance = { version = "2.0", default-features = false }
-lance-index = "2.0"
-lance-linalg = "2.0"
+lance = { version = "3.0", default-features = false }
+lance-index = "3.0"
+lance-linalg = "3.0"
 
 futures = "0.3"
 async-trait = "0.1"
