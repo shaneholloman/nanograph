@@ -5,23 +5,21 @@ slug: best-practices
 
 # Best Practices
 
-NanoGraph is built for AI agents, but agents routinely misuse it — batch reingestion instead of mutations, skipping typechecks, wrong JSONL format, stale schemas. This guide covers the most common mistakes and how to avoid them.
+nanograph is designed to give people and agents a safe, structured way to work with graph data. This guide collects the habits that make day-to-day use smooth: targeted mutations, reliable schema changes, clear machine-readable output, and repeatable operational workflows.
 
-## Start here
+## TL;DR
 
-If you remember nothing else:
-
-- Run nanograph commands from the directory where `nanograph.toml` lives.
-- Use mutation queries for data changes — do not export, edit JSONL, and re-load.
-- Put `@key` on every node type.
-- After editing `.gq` or `.pg` files, run `nanograph check --query <file>`.
-- Use `--json`, `--format json`, or `--format jsonl` for machine-readable output.
+- Run nanograph commands from the directory where `nanograph.toml` lives so project defaults resolve correctly.
+- Use mutation queries for data changes so updates stay targeted and history remains intact.
+- Put `@key` on every node type so updates, merges, and edge wiring stay reliable.
+- After editing `.gq` or `.pg` files, run `nanograph check --query <file>` before executing anything else.
+- Use `--json`, `--format json`, or `--format jsonl` when output will be consumed by agents or tooling.
 
 ## Project setup
 
 ### Run from the project directory
 
-NanoGraph resolves `nanograph.toml` from the current working directory. It does not walk parent directories.
+nanograph resolves `nanograph.toml` from the current working directory. It does not walk parent directories.
 
 ```bash
 # Wrong — "database path is required" or missing-config behavior
@@ -109,10 +107,10 @@ Then rotate the exposed key immediately.
 
 ### Add nanograph rules to `CLAUDE.md` or `AGENTS.md`
 
-AI agents read `CLAUDE.md` and `AGENTS.md` at the repo root. If a project uses NanoGraph, include operational rules:
+AI agents read `CLAUDE.md` and `AGENTS.md` at the repo root. If a project uses nanograph, include operational rules:
 
 ```markdown
-## NanoGraph
+## nanograph
 
 This project uses a nanograph database at `app.nano`.
 
@@ -350,7 +348,7 @@ If the project keeps the desired schema outside the DB directory, configure `sch
 
 ### Scope with graph traversal, then rank
 
-NanoGraph's strength is combining graph structure with search. Avoid global search followed by application-side filtering:
+nanograph's strength is combining graph structure with search. Avoid global search followed by application-side filtering:
 
 ```graphql
 // Wrong — search globally, then filter later
@@ -420,7 +418,7 @@ Do not compact after every single mutation. Batch work and compact periodically.
 
 ### Keep nanograph up to date
 
-NanoGraph is under active development. Updating regularly matters for migration, CDC, embeddings, and CLI behavior:
+nanograph is under active development. Updating regularly matters for migration, CDC, embeddings, and CLI behavior:
 
 ```bash
 nanograph version
@@ -431,7 +429,7 @@ When something behaves unexpectedly, check the CLI version first.
 
 ### Lance storage format
 
-NanoGraph 1.0 uses Lance v3, which writes datasets in storage format v2.2. Databases created with earlier versions use format v2. Both formats are readable, but v2.2 is required for new Lance features. Check with `nanograph doctor --verbose`.
+nanograph 1.0 uses Lance v3, which writes datasets in storage format v2.2. Databases created with earlier versions use format v2. Both formats are readable, but v2.2 is required for new Lance features. Check with `nanograph doctor --verbose`.
 
 See [Lance Migration](lance-migration.md) for the upgrade procedure and a summary of v2.2 improvements.
 
