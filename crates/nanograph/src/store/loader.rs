@@ -3,6 +3,10 @@ use std::path::Path;
 
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
+use crate::store::database::cdc::{
+    build_delete_cdc_events_from_batch, build_insert_cdc_events_from_batch,
+};
+use crate::store::txlog::CdcLogEntry;
 
 use super::database::LoadMode;
 use super::graph::GraphStorage;
@@ -20,6 +24,11 @@ pub(crate) use jsonl::{
     parse_date64_literal,
 };
 
+pub(crate) struct LoadBuildResult {
+    pub(crate) next_storage: GraphStorage,
+    pub(crate) cdc_events: Vec<CdcLogEntry>,
+}
+
 /// Build the next storage snapshot for a `Database::load` operation.
 ///
 /// Behavior:
@@ -33,7 +42,7 @@ pub(crate) async fn build_next_storage_for_load(
     schema_ir: &SchemaIR,
     data_source: &str,
     mode: LoadMode,
-) -> Result<GraphStorage> {
+) -> Result<LoadBuildResult> {
     let reader = Cursor::new(data_source.as_bytes());
     build_next_storage_for_load_reader(db_path, existing, schema_ir, reader, mode).await
 }
@@ -44,7 +53,21 @@ pub(crate) async fn build_next_storage_for_load_reader<R: BufRead>(
     schema_ir: &SchemaIR,
     reader: R,
     mode: LoadMode,
-) -> Result<GraphStorage> {
+) -> Result<LoadBuildResult> {
+    build_next_storage_for_load_reader_with_options(
+        db_path, existing, schema_ir, reader, mode, true,
+    )
+    .await
+}
+
+pub(crate) async fn build_next_storage_for_load_reader_with_options<R: BufRead>(
+    db_path: &Path,
+    existing: &GraphStorage,
+    schema_ir: &SchemaIR,
+    reader: R,
+    mode: LoadMode,
+    build_indices: bool,
+) -> Result<LoadBuildResult> {
     let annotations = constraints::load_node_constraint_annotations(schema_ir)?;
     let key_props = annotations.key_props;
     if mode == LoadMode::Merge && key_props.is_empty() {
@@ -91,22 +114,78 @@ pub(crate) async fn build_next_storage_for_load_reader<R: BufRead>(
         )?;
     }
 
-    let mut next_storage = match mode {
-        LoadMode::Overwrite => incoming_storage,
+    let (mut next_storage, cdc_events) = match mode {
+        LoadMode::Overwrite => {
+            let cdc_events = build_overwrite_cdc_events(existing, &incoming_storage, schema_ir)?;
+            (incoming_storage, cdc_events)
+        }
         LoadMode::Merge => {
-            merge::merge_storage_with_node_keys(
+            let result = merge::merge_storage_with_node_keys(
                 db_path,
                 existing,
                 &incoming_storage,
                 schema_ir,
                 &key_props,
             )
-            .await?
+            .await?;
+            (result.storage, result.cdc_events)
         }
-        LoadMode::Append => merge::append_storage(existing, &incoming_storage, schema_ir)?,
+        LoadMode::Append => {
+            let result = merge::append_storage(existing, &incoming_storage, schema_ir)?;
+            (result.storage, result.cdc_events)
+        }
     };
 
     constraints::enforce_node_unique_constraints(&next_storage, &annotations.unique_props)?;
-    next_storage.build_indices()?;
-    Ok(next_storage)
+    if build_indices {
+        next_storage.build_indices()?;
+    }
+    Ok(LoadBuildResult {
+        next_storage,
+        cdc_events,
+    })
+}
+
+fn build_overwrite_cdc_events(
+    previous: &GraphStorage,
+    next: &GraphStorage,
+    schema_ir: &SchemaIR,
+) -> Result<Vec<CdcLogEntry>> {
+    let mut events = Vec::new();
+
+    for node_def in schema_ir.node_types() {
+        if let Some(batch) = previous.get_all_nodes(&node_def.name)? {
+            events.extend(build_delete_cdc_events_from_batch(
+                &batch,
+                "node",
+                &node_def.name,
+            )?);
+        }
+        if let Some(batch) = next.get_all_nodes(&node_def.name)? {
+            events.extend(build_insert_cdc_events_from_batch(
+                &batch,
+                "node",
+                &node_def.name,
+            )?);
+        }
+    }
+
+    for edge_def in schema_ir.edge_types() {
+        if let Some(batch) = previous.edge_batch_for_save(&edge_def.name)? {
+            events.extend(build_delete_cdc_events_from_batch(
+                &batch,
+                "edge",
+                &edge_def.name,
+            )?);
+        }
+        if let Some(batch) = next.edge_batch_for_save(&edge_def.name)? {
+            events.extend(build_insert_cdc_events_from_batch(
+                &batch,
+                "edge",
+                &edge_def.name,
+            )?);
+        }
+    }
+
+    Ok(events)
 }

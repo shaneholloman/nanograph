@@ -462,7 +462,7 @@ fn parse_traversal_bounds(pair: pest::iterators::Pair<Rule>) -> Result<(u32, Opt
 fn parse_filter(pair: pest::iterators::Pair<Rule>) -> Result<Filter> {
     let mut inner = pair.into_inner();
     let left = parse_expr(inner.next().unwrap())?;
-    let op = parse_comp_op(inner.next().unwrap())?;
+    let op = parse_filter_op(inner.next().unwrap())?;
     let right = parse_expr(inner.next().unwrap())?;
 
     Ok(Filter { left, op, right })
@@ -640,6 +640,13 @@ fn parse_comp_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
         ">=" => Ok(CompOp::Ge),
         "<=" => Ok(CompOp::Le),
         other => Err(NanoError::Parse(format!("unknown operator: {}", other))),
+    }
+}
+
+fn parse_filter_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
+    match pair.as_str() {
+        "contains" => Ok(CompOp::Contains),
+        _ => parse_comp_op(pair),
     }
 }
 
@@ -1085,6 +1092,42 @@ query test() {
             }
             _ => panic!("expected Filter"),
         }
+    }
+
+    #[test]
+    fn test_parse_contains_filter() {
+        let input = r#"
+query tagged($tag: String) {
+    match {
+        $p: Person
+        $p.tags contains $tag
+    }
+    return { $p.name }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Filter(f) => {
+                assert_eq!(f.op, CompOp::Contains);
+                assert!(matches!(
+                    &f.left,
+                    Expr::PropAccess { variable, property } if variable == "p" && property == "tags"
+                ));
+                assert!(matches!(&f.right, Expr::Variable(v) if v == "tag"));
+            }
+            _ => panic!("expected Filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_contains_is_rejected_in_mutation_predicate() {
+        let input = r#"
+query drop_person($tag: String) {
+    delete Person where tags contains $tag
+}
+"#;
+        assert!(parse_query(input).is_err());
     }
 
     #[test]

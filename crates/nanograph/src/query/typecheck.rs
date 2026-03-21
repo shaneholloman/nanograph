@@ -512,7 +512,7 @@ fn typecheck_clauses(
 ) -> Result<()> {
     for clause in clauses {
         match clause {
-            Clause::Binding(b) => typecheck_binding(catalog, b, ctx)?,
+            Clause::Binding(b) => typecheck_binding(catalog, b, ctx, params)?,
             Clause::Traversal(t) => typecheck_traversal(catalog, t, ctx)?,
             Clause::Filter(f) => typecheck_filter(catalog, f, ctx, params)?,
             Clause::Negation(inner) => {
@@ -559,7 +559,12 @@ fn typecheck_clauses(
     Ok(())
 }
 
-fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext) -> Result<()> {
+fn typecheck_binding(
+    catalog: &Catalog,
+    binding: &Binding,
+    ctx: &mut TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<()> {
     // T1: binding type must exist in catalog
     if !catalog.node_types.contains_key(&binding.type_name) {
         return Err(NanoError::Type(format!(
@@ -582,10 +587,12 @@ fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext
         // T3: check value type matches property type
         match &pm.value {
             MatchValue::Literal(lit) => {
-                check_literal_type(lit, prop, &pm.prop_name)?;
+                check_binding_literal_type(lit, prop, &pm.prop_name)?;
             }
-            MatchValue::Variable(_) => {
-                // Variable match — will be unified, no static check needed here
+            MatchValue::Variable(v) => {
+                if let Some(actual) = params.get(v) {
+                    check_binding_variable_type(actual, prop, &pm.prop_name)?;
+                }
             }
             MatchValue::Now => check_now_match_value_type(prop, &pm.prop_name)?,
         }
@@ -610,6 +617,67 @@ fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext
         },
     );
 
+    Ok(())
+}
+
+fn check_binding_literal_type(lit: &Literal, expected: &PropType, property: &str) -> Result<()> {
+    if expected.list {
+        let lit_type = literal_type(lit)?;
+        if lit_type.list {
+            return Err(NanoError::Type(format!(
+                "T3: list equality is not supported for property `{}`; use a scalar value to match list membership",
+                property
+            )));
+        }
+
+        let expected_member = PropType::scalar(expected.scalar, expected.nullable);
+        if !types_compatible(&lit_type, &expected_member) {
+            return Err(NanoError::Type(format!(
+                "T3: property `{}` has type {} but membership match got {}",
+                property,
+                expected.display_name(),
+                lit_type.display_name()
+            )));
+        }
+        return Ok(());
+    }
+
+    check_literal_type(lit, expected, property)
+}
+
+fn check_binding_variable_type(
+    actual: &PropType,
+    expected: &PropType,
+    property: &str,
+) -> Result<()> {
+    if expected.list {
+        if actual.list {
+            return Err(NanoError::Type(format!(
+                "T7: list equality is not supported for property `{}`; use a scalar parameter for membership matching",
+                property
+            )));
+        }
+
+        let expected_member = PropType::scalar(expected.scalar, expected.nullable);
+        if !types_compatible(actual, &expected_member) {
+            return Err(NanoError::Type(format!(
+                "T7: cannot compare {} membership against {} for property `{}`",
+                actual.display_name(),
+                expected.display_name(),
+                property
+            )));
+        }
+        return Ok(());
+    }
+
+    if !types_compatible(actual, expected) {
+        return Err(NanoError::Type(format!(
+            "T7: cannot assign/compare {} with {} for property `{}`",
+            actual.display_name(),
+            expected.display_name(),
+            property
+        )));
+    }
     Ok(())
 }
 
@@ -736,11 +804,42 @@ fn typecheck_filter(
     let left_type = resolve_expr_type(catalog, &filter.left, ctx, params)?;
     let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
 
-    // T7: check type compatibility
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
+        if filter.op == CompOp::Contains {
+            if !l.list {
+                return Err(NanoError::Type(format!(
+                    "T7: contains requires a list property on the left, got {}",
+                    l.display_name()
+                )));
+            }
+            if r.list {
+                return Err(NanoError::Type(
+                    "T7: contains requires a scalar right operand".to_string(),
+                ));
+            }
+            if matches!(l.scalar, ScalarType::Vector(_))
+                || matches!(r.scalar, ScalarType::Vector(_))
+            {
+                return Err(NanoError::Type(
+                    "T7: vector membership filters are not supported".to_string(),
+                ));
+            }
+
+            let expected_member = PropType::scalar(l.scalar, l.nullable);
+            if !types_compatible(&expected_member, r) {
+                return Err(NanoError::Type(format!(
+                    "T7: cannot test membership of {} in {}",
+                    r.display_name(),
+                    l.display_name()
+                )));
+            }
+            return Ok(());
+        }
+
+        // T7: check type compatibility
         if l.list || r.list {
             return Err(NanoError::Type(
-                "T7: list comparisons in filters are not supported".to_string(),
+                "T7: list comparisons in filters are not supported; use `contains` for list membership".to_string(),
             ));
         }
         if matches!(l.scalar, ScalarType::Vector(_)) || matches!(r.scalar, ScalarType::Vector(_)) {
@@ -1555,6 +1654,19 @@ node Doc {
         build_catalog(&schema).unwrap()
     }
 
+    fn setup_list() -> Catalog {
+        let schema = parse_schema(
+            r#"
+node Person {
+    name: String
+    tags: [String]?
+}
+"#,
+        )
+        .unwrap();
+        build_catalog(&schema).unwrap()
+    }
+
     fn setup_embed_vector() -> Catalog {
         let schema = parse_schema(
             r#"
@@ -1631,6 +1743,119 @@ query q() {
         .unwrap();
         let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T3"));
+    }
+
+    #[test]
+    fn test_list_membership_match_accepts_scalar_literal() {
+        let catalog = setup_list();
+        let qf = parse_query(
+            r#"
+query q() {
+    match { $p: Person { tags: "rust" } }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_list_membership_match_accepts_scalar_param() {
+        let catalog = setup_list();
+        let qf = parse_query(
+            r#"
+query q($tag: String) {
+    match { $p: Person { tags: $tag } }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_list_equality_match_is_rejected() {
+        let catalog = setup_list();
+        let qf = parse_query(
+            r#"
+query q() {
+    match { $p: Person { tags: ["rust"] } }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("list equality is not supported"));
+        assert!(msg.contains("membership"));
+    }
+
+    #[test]
+    fn test_contains_filter_accepts_list_membership() {
+        let catalog = setup_list();
+        let qf = parse_query(
+            r#"
+query q($tag: String) {
+    match {
+        $p: Person
+        $p.tags contains $tag
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_contains_filter_requires_list_left_operand() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p.name contains "Al"
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contains requires a list property on the left")
+        );
+    }
+
+    #[test]
+    fn test_contains_filter_rejects_list_right_operand() {
+        let catalog = setup_list();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p.tags contains ["rust"]
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contains requires a scalar right operand")
+        );
     }
 
     #[test]

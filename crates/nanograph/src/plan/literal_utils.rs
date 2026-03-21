@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use arrow_array::builder::BooleanBuilder;
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, ListArray,
+    StringArray,
 };
 
+use crate::json_output::array_value_to_json;
 use crate::query::ast::Literal;
 use crate::store::loader::{parse_date32_literal, parse_date64_literal};
 
@@ -84,4 +87,46 @@ pub(crate) fn literal_to_json_value_for_display(lit: &Literal) -> serde_json::Va
                 .collect(),
         ),
     }
+}
+
+pub(crate) fn compare_list_membership(
+    left: &ArrayRef,
+    right: &ArrayRef,
+) -> std::result::Result<BooleanArray, String> {
+    let list = left.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        format!(
+            "contains requires left operand to be List(..), got {:?}",
+            left.data_type()
+        )
+    })?;
+
+    if right.data_type().is_nested() {
+        return Err(format!(
+            "contains requires a scalar right operand, got {:?}",
+            right.data_type()
+        ));
+    }
+
+    if list.len() != right.len() {
+        return Err(format!(
+            "contains requires equal row counts, got {} and {}",
+            list.len(),
+            right.len()
+        ));
+    }
+
+    let mut builder = BooleanBuilder::new();
+    for row in 0..list.len() {
+        if list.is_null(row) || right.is_null(row) {
+            builder.append_value(false);
+            continue;
+        }
+
+        let needle = array_value_to_json(right, row);
+        let values = list.value(row);
+        let found = (0..values.len()).any(|idx| array_value_to_json(&values, idx) == needle);
+        builder.append_value(found);
+    }
+
+    Ok(builder.finish())
 }

@@ -40,7 +40,7 @@ base_type = { "String" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" 
 
 match_clause = { "match" ~ "{" ~ clause+ ~ "}" }
 
-clause = { negation | binding | filter | traversal | text_search_clause }
+clause = { negation | binding | traversal | filter | text_search_clause }
 text_search_clause = { search_call | fuzzy_call | match_text_call }
 
 // Binding: $p: Person { name: "Alice" }
@@ -55,7 +55,7 @@ traversal = { variable ~ edge_ident ~ traversal_bounds? ~ variable }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: $f.age > 25
-filter = { expr ~ comp_op ~ expr }
+filter = { expr ~ filter_op ~ expr }
 
 // Negation: not { ... }
 negation = { "not" ~ "{" ~ clause+ ~ "}" }
@@ -89,6 +89,7 @@ agg_call = { agg_func ~ "(" ~ expr ~ ")" }
 agg_func = { "count" | "sum" | "avg" | "min" | "max" }
 
 comp_op = { ">=" | "<=" | "!=" | ">" | "<" | "=" }
+filter_op = { "contains" | comp_op }
 
 // Terminals
 variable = @{ "$" ~ (ident_chars | "_") }

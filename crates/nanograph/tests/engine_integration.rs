@@ -44,6 +44,23 @@ node Person {
 "#
 }
 
+fn list_membership_test_schema() -> &'static str {
+    r#"
+node Person {
+    name: String @key
+    tags: [String]?
+}
+"#
+}
+
+fn list_membership_test_data() -> &'static str {
+    r#"{"type":"Person","data":{"name":"Alice","tags":["rust","db"]}}
+{"type":"Person","data":{"name":"Bob","tags":["graph"]}}
+{"type":"Person","data":{"name":"Cara","tags":["rust"]}}
+{"type":"Person","data":{"name":"Dylan","tags":null}}
+"#
+}
+
 fn indexed_test_data() -> &'static str {
     r#"{"type":"Person","data":{"name":"Alice","email":"alice@example.com"}}
 {"type":"Person","data":{"name":"Bob","email":"bob@example.com"}}
@@ -370,6 +387,101 @@ query q() {
 
     let names = extract_string_column(&results, "name");
     assert_eq!(names, vec!["Charlie"]);
+}
+
+#[tokio::test]
+async fn test_list_membership_inline_binding_filter_with_literal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let db = Database::init(&db_path, list_membership_test_schema())
+        .await
+        .unwrap();
+    db.load(list_membership_test_data()).await.unwrap();
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q() {
+    match { $p: Person { tags: "rust" } }
+    return { $p.name }
+    order { $p.name asc }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Alice", "Cara"]);
+}
+
+#[tokio::test]
+async fn test_list_membership_inline_binding_filter_with_param() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let db = Database::init(&db_path, list_membership_test_schema())
+        .await
+        .unwrap();
+    db.load(list_membership_test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "tag".to_string(),
+        nanograph::query::ast::Literal::String("graph".to_string()),
+    );
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($tag: String) {
+    match { $p: Person { tags: $tag } }
+    return { $p.name }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Bob"]);
+}
+
+#[tokio::test]
+async fn test_list_membership_contains_filter_with_param() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let db = Database::init(&db_path, list_membership_test_schema())
+        .await
+        .unwrap();
+    db.load(list_membership_test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "tag".to_string(),
+        nanograph::query::ast::Literal::String("rust".to_string()),
+    );
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($tag: String) {
+    match {
+        $p: Person
+        $p.tags contains $tag
+    }
+    return { $p.name }
+    order { $p.name asc }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Alice", "Cara"]);
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal};
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{error::Error as StdError, fmt};
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -30,18 +30,21 @@ mod tests;
 
 use config::{LoadedConfig, ResolvedRunConfig, TableCellLayout};
 use metadata::{cmd_describe, cmd_export, cmd_version};
-use nanograph::ParamMap;
 use nanograph::error::{NanoError, ParseDiagnostic};
-use nanograph::query::ast::Literal;
+use nanograph::query::ast::{Clause, CompOp, Expr, Literal, MatchValue, QueryDecl};
 use nanograph::query::parser::parse_query_diagnostic;
-use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
+use nanograph::query::typecheck::{BindingKind, CheckedQuery, TypeContext, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema_diagnostic;
+use nanograph::store::GraphStorage;
 use nanograph::store::database::{
     CdcAnalyticsMaterializeOptions, CleanupOptions, CompactOptions, Database, DeleteOp,
-    DeletePredicate, EmbedOptions, LoadMode,
+    DeletePredicate, EmbedOptions, LoadMode, cleanup_database, compact_database,
+    load_database_file_sparse, run_mutation_query_sparse,
 };
+use nanograph::store::metadata::DatabaseMetadata;
 use nanograph::store::migration::{SchemaDiffReport, analyze_schema_diff};
 use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
+use nanograph::{ParamMap, execute_query, lower_query};
 use schema_ops::{cmd_migrate, cmd_schema_diff, schema_compatibility_label};
 use ui::{
     StatusTone, format_status_line, stderr_supports_color, stdout_supports_color, style_key,
@@ -1076,9 +1079,17 @@ async fn cmd_load(
     json: bool,
     quiet: bool,
 ) -> Result<()> {
-    let db = Database::open(db_path).await?;
+    let load_result = match mode {
+        LoadModeArg::Append | LoadModeArg::Merge => {
+            load_database_file_sparse(db_path, data_path, mode.into()).await
+        }
+        LoadModeArg::Overwrite => {
+            let db = Database::open(db_path).await?;
+            db.load_file_with_mode(data_path, mode.into()).await
+        }
+    };
 
-    if let Err(err) = db.load_file_with_mode(data_path, mode.into()).await {
+    if let Err(err) = load_result {
         render_load_error(db_path, &err, json);
         return Err(err.into());
     }
@@ -1316,8 +1327,8 @@ async fn cmd_changes(
         window.to_db_version_inclusive,
     )?;
     if no_embeddings {
-        let db = Database::open(db_path).await?;
-        let embedding_props = build_embedding_property_map(&db);
+        let metadata = DatabaseMetadata::open(db_path)?;
+        let embedding_props = build_embedding_property_map(metadata.schema_ir());
         strip_embedding_payloads(&mut rows, &embedding_props);
     }
 
@@ -1325,9 +1336,11 @@ async fn cmd_changes(
     render_changes(effective_format, &rows)
 }
 
-fn build_embedding_property_map(db: &Database) -> HashMap<(String, String), HashSet<String>> {
+fn build_embedding_property_map(
+    schema_ir: &nanograph::schema_ir::SchemaIR,
+) -> HashMap<(String, String), HashSet<String>> {
     let mut out = HashMap::new();
-    for node in db.schema_ir.node_types() {
+    for node in schema_ir.node_types() {
         let props = node
             .properties
             .iter()
@@ -1338,7 +1351,7 @@ fn build_embedding_property_map(db: &Database) -> HashMap<(String, String), Hash
             out.insert(("node".to_string(), node.name.clone()), props);
         }
     }
-    for edge in db.schema_ir.edge_types() {
+    for edge in schema_ir.edge_types() {
         let props = edge
             .properties
             .iter()
@@ -1432,14 +1445,15 @@ async fn cmd_compact(
     json: bool,
     quiet: bool,
 ) -> Result<()> {
-    let db = Database::open(db_path).await?;
-    let result = db
-        .compact(CompactOptions {
+    let result = compact_database(
+        db_path,
+        CompactOptions {
             target_rows_per_fragment,
             materialize_deletions,
             materialize_deletions_threshold,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     if json {
         println!(
@@ -1492,13 +1506,14 @@ async fn cmd_cleanup(
     json: bool,
     quiet: bool,
 ) -> Result<()> {
-    let db = Database::open(db_path).await?;
-    let result = db
-        .cleanup(CleanupOptions {
+    let result = cleanup_database(
+        db_path,
+        CleanupOptions {
             retain_tx_versions,
             retain_dataset_versions,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     if json {
         println!(
@@ -1678,6 +1693,280 @@ fn render_check_error(
         )
     } else {
         rendered
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RunExecutionClass {
+    LanceFirst(LanceFirstRunPlan),
+    SparseMutation,
+    GraphAware,
+}
+
+#[derive(Debug, Clone)]
+struct LanceFirstRunPlan {
+    node_type: String,
+    type_ctx: TypeContext,
+}
+
+fn classify_run_execution(
+    query: &QueryDecl,
+    checked: &CheckedQuery,
+    metadata: &DatabaseMetadata,
+) -> RunExecutionClass {
+    match checked {
+        CheckedQuery::Read(type_ctx) => {
+            if !query_is_lance_first_eligible(query, type_ctx, metadata) {
+                return RunExecutionClass::GraphAware;
+            }
+            let Some(binding) = type_ctx.bindings.values().next() else {
+                return RunExecutionClass::GraphAware;
+            };
+            RunExecutionClass::LanceFirst(LanceFirstRunPlan {
+                node_type: binding.type_name.clone(),
+                type_ctx: type_ctx.clone(),
+            })
+        }
+        CheckedQuery::Mutation(_) => {
+            if query_is_sparse_mutation_eligible(query, metadata) {
+                RunExecutionClass::SparseMutation
+            } else {
+                RunExecutionClass::GraphAware
+            }
+        }
+    }
+}
+
+fn query_is_sparse_mutation_eligible(query: &QueryDecl, metadata: &DatabaseMetadata) -> bool {
+    match query.mutation.as_ref() {
+        Some(nanograph::query::ast::Mutation::Insert(insert)) => {
+            metadata
+                .catalog()
+                .node_types
+                .contains_key(&insert.type_name)
+                || metadata
+                    .catalog()
+                    .edge_types
+                    .contains_key(&insert.type_name)
+        }
+        Some(nanograph::query::ast::Mutation::Update(update)) => {
+            metadata
+                .catalog()
+                .node_types
+                .contains_key(&update.type_name)
+                && !metadata
+                    .catalog()
+                    .edge_types
+                    .contains_key(&update.type_name)
+                && metadata
+                    .schema_ir()
+                    .node_types()
+                    .find(|node| node.name == update.type_name)
+                    .map(|node| node.properties.iter().any(|prop| prop.key))
+                    .unwrap_or(false)
+        }
+        Some(nanograph::query::ast::Mutation::Delete(delete)) => {
+            if metadata
+                .catalog()
+                .edge_types
+                .contains_key(&delete.type_name)
+            {
+                return true;
+            }
+            metadata
+                .catalog()
+                .node_types
+                .contains_key(&delete.type_name)
+                && !metadata.catalog().edge_types.values().any(|edge| {
+                    edge.from_type == delete.type_name || edge.to_type == delete.type_name
+                })
+        }
+        _ => false,
+    }
+}
+
+fn query_is_lance_first_eligible(
+    query: &QueryDecl,
+    type_ctx: &TypeContext,
+    metadata: &DatabaseMetadata,
+) -> bool {
+    if query.mutation.is_some() || !type_ctx.traversals.is_empty() || type_ctx.bindings.len() != 1 {
+        return false;
+    }
+    let Some(binding) = type_ctx.bindings.values().next() else {
+        return false;
+    };
+    if binding.kind != BindingKind::Node {
+        return false;
+    }
+
+    let bound_var = binding.var_name.as_str();
+    query.match_clause.iter().all(|clause| {
+        clause_is_lance_first_eligible(clause, bound_var, &binding.type_name, metadata)
+    }) && query
+        .return_clause
+        .iter()
+        .all(|projection| expr_is_lance_first_eligible(&projection.expr, bound_var, true))
+        && query
+            .order_clause
+            .iter()
+            .all(|ordering| expr_is_lance_first_eligible(&ordering.expr, bound_var, false))
+}
+
+fn clause_is_lance_first_eligible(
+    clause: &Clause,
+    bound_var: &str,
+    bound_type: &str,
+    metadata: &DatabaseMetadata,
+) -> bool {
+    match clause {
+        Clause::Binding(binding) => {
+            binding.variable == bound_var
+                && binding.prop_matches.iter().all(|prop| {
+                    match_value_is_lance_first_eligible(&prop.value)
+                        && binding_prop_is_lance_first_eligible(
+                            bound_type,
+                            &prop.prop_name,
+                            metadata,
+                        )
+                })
+        }
+        Clause::Filter(filter) => filter_is_lance_first_eligible(filter, bound_var),
+        Clause::Traversal(_) | Clause::Negation(_) => false,
+    }
+}
+
+fn binding_prop_is_lance_first_eligible(
+    bound_type: &str,
+    prop_name: &str,
+    metadata: &DatabaseMetadata,
+) -> bool {
+    metadata
+        .catalog()
+        .node_types
+        .get(bound_type)
+        .and_then(|node_type| node_type.properties.get(prop_name))
+        .map(|prop| !prop.list)
+        .unwrap_or(false)
+}
+
+fn match_value_is_lance_first_eligible(value: &MatchValue) -> bool {
+    matches!(
+        value,
+        MatchValue::Literal(_) | MatchValue::Variable(_) | MatchValue::Now
+    )
+}
+
+fn filter_is_lance_first_eligible(filter: &nanograph::query::ast::Filter, bound_var: &str) -> bool {
+    if filter.op == CompOp::Contains {
+        return false;
+    }
+    (is_bound_prop_access(&filter.left, bound_var) && is_simple_filter_operand(&filter.right))
+        || (is_bound_prop_access(&filter.right, bound_var)
+            && is_simple_filter_operand(&filter.left))
+}
+
+fn is_simple_filter_operand(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_) | Expr::Variable(_) | Expr::Now)
+}
+
+fn expr_is_lance_first_eligible(expr: &Expr, bound_var: &str, allow_literal: bool) -> bool {
+    match expr {
+        Expr::Variable(variable) => variable == bound_var,
+        Expr::PropAccess { variable, .. } => variable == bound_var,
+        Expr::Nearest {
+            variable,
+            query,
+            property: _,
+        } => variable == bound_var && nearest_query_is_lance_first_eligible(query),
+        Expr::Literal(_) => allow_literal,
+        Expr::Now
+        | Expr::Search { .. }
+        | Expr::Fuzzy { .. }
+        | Expr::MatchText { .. }
+        | Expr::Bm25 { .. }
+        | Expr::Rrf { .. }
+        | Expr::Aggregate { .. }
+        | Expr::AliasRef(_) => false,
+    }
+}
+
+fn nearest_query_is_lance_first_eligible(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_) | Expr::Variable(_))
+}
+
+fn is_bound_prop_access(expr: &Expr, bound_var: &str) -> bool {
+    matches!(
+        expr,
+        Expr::PropAccess {
+            variable,
+            property: _
+        } if variable == bound_var
+    )
+}
+
+fn params_with_runtime_now(params: &ParamMap) -> Result<ParamMap> {
+    let mut runtime_params = params.clone();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| eyre!("failed to read system time: {}", e))?;
+    let millis =
+        i64::try_from(now.as_millis()).map_err(|_| eyre!("system time exceeds supported range"))?;
+    let dt = arrow_array::temporal_conversions::date64_to_datetime(millis)
+        .ok_or_else(|| eyre!("failed to convert system time to DateTime literal"))?;
+    runtime_params.insert(
+        "__nanograph_now".to_string(),
+        Literal::DateTime(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+    );
+    Ok(runtime_params)
+}
+
+async fn execute_lance_first_query(
+    metadata: &DatabaseMetadata,
+    plan: &LanceFirstRunPlan,
+    query: &QueryDecl,
+    params: &ParamMap,
+) -> Result<Vec<RecordBatch>> {
+    let mut storage = GraphStorage::new(metadata.catalog().clone());
+    if let Some(locator) = metadata.node_dataset_locator(&plan.node_type) {
+        storage.set_node_dataset_path(&plan.node_type, locator.dataset_path);
+        storage.set_node_dataset_version(&plan.node_type, locator.dataset_version);
+    }
+    let ir = lower_query(metadata.catalog(), query, &plan.type_ctx)?;
+    let runtime_params = params_with_runtime_now(params)?;
+    Ok(execute_query(&ir, std::sync::Arc::new(storage), &runtime_params).await?)
+}
+
+async fn execute_run_query_batches(
+    db_path: &Path,
+    query: &QueryDecl,
+    params: &ParamMap,
+) -> Result<Vec<RecordBatch>> {
+    let metadata = DatabaseMetadata::open(db_path)?;
+    let checked = typecheck_query_decl(metadata.catalog(), query)?;
+    match classify_run_execution(query, &checked, &metadata) {
+        RunExecutionClass::LanceFirst(plan) => {
+            debug!(
+                query = %query.name,
+                node_type = %plan.node_type,
+                "executing run query via Lance-first path"
+            );
+            execute_lance_first_query(&metadata, &plan, query, params).await
+        }
+        RunExecutionClass::SparseMutation => {
+            debug!(
+                query = %query.name,
+                "executing run mutation via sparse mutation path"
+            );
+            let result = run_mutation_query_sparse(db_path, query, params).await?;
+            Ok(vec![result.to_record_batch()?])
+        }
+        RunExecutionClass::GraphAware => {
+            debug!(query = %query.name, "executing run query via full graph path");
+            let db = Database::open(db_path).await?;
+            let run_result = db.run_query(query, params).await?;
+            Ok(run_result.into_record_batches()?)
+        }
     }
 }
 
@@ -1904,8 +2193,8 @@ async fn cmd_check(
 ) -> Result<()> {
     let query_src = std::fs::read_to_string(query_path)
         .wrap_err_with(|| format!("failed to read query: {}", query_path.display()))?;
-    let db = Database::open(&db_path).await?;
-    let catalog = db.catalog().clone();
+    let metadata = DatabaseMetadata::open(&db_path)?;
+    let catalog = metadata.catalog().clone();
     let schema_drift = desired_schema_path
         .map(|path| load_schema_drift_summary(&db_path, path))
         .transpose()?;
@@ -2070,10 +2359,8 @@ async fn cmd_run(
     {
         print!("{}", preamble);
     }
-    let db = Database::open(&db_path).await?;
     let started = Instant::now();
-    let run_result = db.run_query(query, &param_map).await?;
-    let results = run_result.into_record_batches()?;
+    let results = execute_run_query_batches(&db_path, query, &param_map).await?;
     let elapsed = started.elapsed();
     if human_output {
         render_results(

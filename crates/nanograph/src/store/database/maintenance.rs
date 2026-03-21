@@ -22,138 +22,146 @@ use crate::store::txlog::{
     read_tx_catalog_entries, read_visible_cdc_entries, reconcile_logs_to_manifest,
 };
 
-impl Database {
-    /// Compact all manifest-tracked Lance datasets and commit updated dataset versions.
-    pub async fn compact(&self, options: CompactOptions) -> Result<CompactResult> {
-        let _writer = self.lock_writer().await;
-        let previous_manifest = GraphManifest::read(&self.path)?;
-        reconcile_logs_to_manifest(&self.path, previous_manifest.db_version)?;
-        let mut next_manifest = previous_manifest.clone();
-        let mut result = CompactResult {
-            datasets_considered: next_manifest.datasets.len(),
+/// Compact all manifest-tracked Lance datasets and commit updated dataset versions.
+pub async fn compact_database(db_path: &Path, options: CompactOptions) -> Result<CompactResult> {
+    let previous_manifest = GraphManifest::read(db_path)?;
+    reconcile_logs_to_manifest(db_path, previous_manifest.db_version)?;
+    let mut next_manifest = previous_manifest.clone();
+    let mut result = CompactResult {
+        datasets_considered: next_manifest.datasets.len(),
+        ..Default::default()
+    };
+
+    for entry in &mut next_manifest.datasets {
+        let dataset_path = db_path.join(&entry.dataset_path);
+        let uri = dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri)
+            .await
+            .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+        let mut dataset = dataset
+            .checkout_version(entry.dataset_version)
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "checkout version {} error: {}",
+                    entry.dataset_version, e
+                ))
+            })?;
+        let before_version = dataset.version().version;
+
+        let compact_opts = LanceCompactionOptions {
+            target_rows_per_fragment: options.target_rows_per_fragment,
+            materialize_deletions: options.materialize_deletions,
+            materialize_deletions_threshold: options.materialize_deletions_threshold,
             ..Default::default()
         };
 
-        for entry in &mut next_manifest.datasets {
-            let dataset_path = self.path.join(&entry.dataset_path);
-            let uri = dataset_path.to_string_lossy().to_string();
-            let dataset = Dataset::open(&uri)
-                .await
-                .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
-            let mut dataset = dataset
-                .checkout_version(entry.dataset_version)
-                .await
-                .map_err(|e| {
-                    NanoError::Lance(format!(
-                        "checkout version {} error: {}",
-                        entry.dataset_version, e
-                    ))
-                })?;
-            let before_version = dataset.version().version;
+        let metrics = compact_files(&mut dataset, compact_opts, None)
+            .await
+            .map_err(|e| NanoError::Lance(format!("compact error: {}", e)))?;
+        result.fragments_removed += metrics.fragments_removed;
+        result.fragments_added += metrics.fragments_added;
+        result.files_removed += metrics.files_removed;
+        result.files_added += metrics.files_added;
 
-            let compact_opts = LanceCompactionOptions {
-                target_rows_per_fragment: options.target_rows_per_fragment,
-                materialize_deletions: options.materialize_deletions,
-                materialize_deletions_threshold: options.materialize_deletions_threshold,
-                ..Default::default()
-            };
-
-            let metrics = compact_files(&mut dataset, compact_opts, None)
-                .await
-                .map_err(|e| NanoError::Lance(format!("compact error: {}", e)))?;
-            result.fragments_removed += metrics.fragments_removed;
-            result.fragments_added += metrics.fragments_added;
-            result.files_removed += metrics.files_removed;
-            result.files_added += metrics.files_added;
-
-            let after_version = dataset.version().version;
-            if after_version != before_version {
-                entry.dataset_version = after_version;
-                result.datasets_compacted += 1;
-            }
+        let after_version = dataset.version().version;
+        if after_version != before_version {
+            entry.dataset_version = after_version;
+            result.datasets_compacted += 1;
         }
-
-        if result.datasets_compacted > 0 {
-            next_manifest.db_version = previous_manifest.db_version.saturating_add(1);
-            next_manifest.last_tx_id = format!("manifest-{}", next_manifest.db_version);
-            next_manifest.committed_at = now_unix_seconds_string();
-            commit_manifest_and_logs(&self.path, &next_manifest, &[], "maintenance:compact")?;
-            result.manifest_committed = true;
-        }
-
-        Ok(result)
     }
 
-    /// Prune tx/CDC logs and old Lance dataset versions while preserving manifest-visible state.
+    if result.datasets_compacted > 0 {
+        next_manifest.db_version = previous_manifest.db_version.saturating_add(1);
+        next_manifest.last_tx_id = format!("manifest-{}", next_manifest.db_version);
+        next_manifest.committed_at = now_unix_seconds_string();
+        commit_manifest_and_logs(db_path, &next_manifest, &[], "maintenance:compact")?;
+        result.manifest_committed = true;
+    }
+
+    Ok(result)
+}
+
+/// Prune tx/CDC logs and old Lance dataset versions while preserving manifest-visible state.
+pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result<CleanupResult> {
+    if options.retain_tx_versions == 0 {
+        return Err(NanoError::Storage(
+            "retain_tx_versions must be >= 1".to_string(),
+        ));
+    }
+    if options.retain_dataset_versions == 0 {
+        return Err(NanoError::Storage(
+            "retain_dataset_versions must be >= 1".to_string(),
+        ));
+    }
+
+    let manifest = GraphManifest::read(db_path)?;
+    reconcile_logs_to_manifest(db_path, manifest.db_version)?;
+    let log_prune = prune_logs_for_replay_window(db_path, options.retain_tx_versions)?;
+    let mut result = CleanupResult {
+        tx_rows_removed: log_prune.tx_rows_removed,
+        tx_rows_kept: log_prune.tx_rows_kept,
+        cdc_rows_removed: log_prune.cdc_rows_removed,
+        cdc_rows_kept: log_prune.cdc_rows_kept,
+        ..Default::default()
+    };
+
+    for entry in &manifest.datasets {
+        let dataset_path = db_path.join(&entry.dataset_path);
+        let uri = dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri)
+            .await
+            .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+        dataset
+            .checkout_version(entry.dataset_version)
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "checkout version {} error: {}",
+                    entry.dataset_version, e
+                ))
+            })?;
+
+        let versions = dataset
+            .versions()
+            .await
+            .map_err(|e| NanoError::Lance(format!("list versions error: {}", e)))?;
+        let effective_retain_n = versions
+            .iter()
+            .position(|v| v.version == entry.dataset_version)
+            .map(|idx| {
+                let needed_for_manifest = versions.len().saturating_sub(idx);
+                options.retain_dataset_versions.max(needed_for_manifest)
+            })
+            .unwrap_or(options.retain_dataset_versions);
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&dataset, effective_retain_n)
+            .await
+            .map_err(|e| NanoError::Lance(format!("cleanup policy error: {}", e)))?
+            .build();
+        let stats = dataset
+            .cleanup_with_policy(policy)
+            .await
+            .map_err(|e| NanoError::Lance(format!("cleanup error: {}", e)))?;
+        if stats.old_versions > 0 {
+            result.datasets_cleaned += 1;
+        }
+        result.dataset_old_versions_removed += stats.old_versions;
+        result.dataset_bytes_removed += stats.bytes_removed;
+    }
+
+    Ok(result)
+}
+
+impl Database {
+    pub async fn compact(&self, options: CompactOptions) -> Result<CompactResult> {
+        let _writer = self.lock_writer().await;
+        compact_database(&self.path, options).await
+    }
+
     pub async fn cleanup(&self, options: CleanupOptions) -> Result<CleanupResult> {
         let _writer = self.lock_writer().await;
-        if options.retain_tx_versions == 0 {
-            return Err(NanoError::Storage(
-                "retain_tx_versions must be >= 1".to_string(),
-            ));
-        }
-        if options.retain_dataset_versions == 0 {
-            return Err(NanoError::Storage(
-                "retain_dataset_versions must be >= 1".to_string(),
-            ));
-        }
-
-        let manifest = GraphManifest::read(&self.path)?;
-        reconcile_logs_to_manifest(&self.path, manifest.db_version)?;
-        let log_prune = prune_logs_for_replay_window(&self.path, options.retain_tx_versions)?;
-        let mut result = CleanupResult {
-            tx_rows_removed: log_prune.tx_rows_removed,
-            tx_rows_kept: log_prune.tx_rows_kept,
-            cdc_rows_removed: log_prune.cdc_rows_removed,
-            cdc_rows_kept: log_prune.cdc_rows_kept,
-            ..Default::default()
-        };
-
-        for entry in &manifest.datasets {
-            let dataset_path = self.path.join(&entry.dataset_path);
-            let uri = dataset_path.to_string_lossy().to_string();
-            let dataset = Dataset::open(&uri)
-                .await
-                .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
-            dataset
-                .checkout_version(entry.dataset_version)
-                .await
-                .map_err(|e| {
-                    NanoError::Lance(format!(
-                        "checkout version {} error: {}",
-                        entry.dataset_version, e
-                    ))
-                })?;
-
-            let versions = dataset
-                .versions()
-                .await
-                .map_err(|e| NanoError::Lance(format!("list versions error: {}", e)))?;
-            let effective_retain_n = versions
-                .iter()
-                .position(|v| v.version == entry.dataset_version)
-                .map(|idx| {
-                    let needed_for_manifest = versions.len().saturating_sub(idx);
-                    options.retain_dataset_versions.max(needed_for_manifest)
-                })
-                .unwrap_or(options.retain_dataset_versions);
-            let policy = CleanupPolicyBuilder::default()
-                .retain_n_versions(&dataset, effective_retain_n)
-                .await
-                .map_err(|e| NanoError::Lance(format!("cleanup policy error: {}", e)))?
-                .build();
-            let stats = dataset
-                .cleanup_with_policy(policy)
-                .await
-                .map_err(|e| NanoError::Lance(format!("cleanup error: {}", e)))?;
-            if stats.old_versions > 0 {
-                result.datasets_cleaned += 1;
-            }
-            result.dataset_old_versions_removed += stats.old_versions;
-            result.dataset_bytes_removed += stats.bytes_removed;
-        }
-
-        Ok(result)
+        cleanup_database(&self.path, options).await
     }
 
     /// Materialize visible CDC rows into a derived Lance dataset for analytics workloads.

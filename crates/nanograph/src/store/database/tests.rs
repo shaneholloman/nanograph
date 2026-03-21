@@ -664,7 +664,9 @@ async fn test_load_and_reopen_preserves_data() {
 
     let knows_seg = &storage2.edge_segments["Knows"];
     assert_eq!(knows_seg.edge_ids.len(), 2);
-    assert!(knows_seg.csr.is_some());
+    assert!(knows_seg.csr.is_none());
+    assert!(storage2.edge_dataset_path("Knows").is_some());
+    assert!(storage2.edge_dataset_version("Knows").is_some());
 }
 
 #[tokio::test]
@@ -855,7 +857,7 @@ async fn test_open_repairs_trailing_partial_tx_catalog_row() {
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
-    let tx_path = path.join("_tx_catalog.jsonl");
+    let tx_path = path.join("_wal.jsonl");
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&tx_path)
@@ -1867,28 +1869,37 @@ async fn test_load_reopen_query() {
     drop(db);
 
     let db2 = Database::open(path).await.unwrap();
-    let snapshot = db2.snapshot();
+    assert!(db2.snapshot().edge_segments["Knows"].csr.is_none());
 
-    let persons = snapshot.get_all_nodes("Person").unwrap().unwrap();
-    let id_col = persons
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow_array::UInt64Array>()
-        .unwrap();
-    let name_col = persons
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
-        .unwrap();
-    let alice_id = (0..persons.num_rows())
-        .find(|&i| name_col.value(i) == "Alice")
-        .map(|i| id_col.value(i))
-        .expect("Alice not found");
+    let query = parse_query(
+        r#"
+query alice_friends() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+    }
+    return { $f.name }
+}
+"#,
+    )
+    .unwrap()
+    .queries
+    .into_iter()
+    .next()
+    .unwrap();
 
-    let knows_seg = &snapshot.edge_segments["Knows"];
-    let csr = knows_seg.csr.as_ref().unwrap();
-    let alice_friends = csr.neighbors(alice_id);
-    assert_eq!(alice_friends.len(), 2);
+    let rows = match db2.run_query(&query, &ParamMap::new()).await.unwrap() {
+        RunResult::Query(rows) => rows.to_rust_json(),
+        RunResult::Mutation(_) => panic!("expected query result"),
+    };
+    let mut names: Vec<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Bob".to_string(), "Charlie".to_string()]);
 }
 
 #[tokio::test]

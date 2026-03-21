@@ -4,7 +4,7 @@ use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Date64Array, Int32Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
-use nanograph::store::manifest::GraphManifest;
+use nanograph::store::metadata::DatabaseMetadata;
 use nanograph::store::txlog::read_visible_cdc_entries;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1191,9 +1191,8 @@ edge Knows: Person -> Person"#,
         2
     );
 
-    let db = Database::open(&db_path).await.unwrap();
-    let manifest = GraphManifest::read(&db_path).unwrap();
-    let describe = build_describe_payload(&db_path, &db, &manifest, None).unwrap();
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let describe = build_describe_payload(&db_path, &metadata, None).unwrap();
     assert_eq!(describe["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(describe["edges"].as_array().unwrap().len(), 1);
     assert_eq!(describe["nodes"][0]["rows"].as_u64(), Some(2));
@@ -1211,7 +1210,7 @@ edge Knows: Person -> Person"#,
         .expect("embedding property present in describe payload");
     assert_eq!(embedding_prop["embed_source"].as_str(), Some("summary"));
 
-    let rows = build_export_rows(&db, false, true).unwrap();
+    let rows = build_export_rows(&db_path, false, true).await.unwrap();
     assert_eq!(rows.len(), 3);
     assert!(
         rows.iter()
@@ -1248,9 +1247,8 @@ edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use o
         .await
         .unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
-    let manifest = GraphManifest::read(&db_path).unwrap();
-    let task = build_describe_payload(&db_path, &db, &manifest, Some("Task")).unwrap();
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let task = build_describe_payload(&db_path, &metadata, Some("Task")).unwrap();
     assert_eq!(task["nodes"].as_array().unwrap().len(), 1);
     assert!(task["edges"].as_array().unwrap().is_empty());
     assert_eq!(
@@ -1270,13 +1268,749 @@ edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use o
         Some("DependsOn")
     );
 
-    let edge = build_describe_payload(&db_path, &db, &manifest, Some("DependsOn")).unwrap();
+    let edge = build_describe_payload(&db_path, &metadata, Some("DependsOn")).unwrap();
     assert!(edge["nodes"].as_array().unwrap().is_empty());
     assert_eq!(edge["edges"].as_array().unwrap().len(), 1);
     assert_eq!(
         edge["edges"][0]["endpoint_keys"]["src"].as_str(),
         Some("slug")
     );
+}
+
+#[tokio::test]
+async fn describe_uses_manifest_metadata_without_opening_datasets() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob"}}"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let manifest = build_version_payload(Some(&db_path)).unwrap();
+    let dataset_path = manifest["db"]["dataset_versions"][0]["dataset_path"]
+        .as_str()
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let describe = build_describe_payload(&db_path, &metadata, Some("Person")).unwrap();
+    assert_eq!(describe["nodes"][0]["rows"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn check_uses_schema_ir_without_opening_datasets() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("query.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query people() {
+    match { $p: Person }
+    return { $p.slug }
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let manifest = build_version_payload(Some(&db_path)).unwrap();
+    let dataset_path = manifest["db"]["dataset_versions"][0]["dataset_path"]
+        .as_str()
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
+
+    cmd_check(db_path, &query_path, None, true, true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn changes_no_embeddings_uses_schema_ir_without_opening_datasets() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    summary: String
+    embedding: Vector(3) @embed(summary)
+}"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","summary":"Alpha","embedding":[1.0,0.0,0.0]}}"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let manifest = build_version_payload(Some(&db_path)).unwrap();
+    let dataset_path = manifest["db"]["dataset_versions"][0]["dataset_path"]
+        .as_str()
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
+
+    cmd_changes(&db_path, None, None, None, "json", true, true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn simple_run_query_uses_lance_first_without_full_graph_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("query.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob"}}
+{"edge":"Knows","from":"alice","to":"bob"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query people() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.name asc }
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let edge_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(edge_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(&db_path, &queries.queries[0], &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let names = results[0]
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Bob");
+}
+
+#[tokio::test]
+async fn load_append_uses_sparse_restore_without_opening_unrelated_datasets() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let initial_path = dir.path().join("initial.jsonl");
+    let append_path = dir.path().join("append.jsonl");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &initial_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"alice","to":"alice"}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &append_path,
+        r#"{"type":"Person","data":{"slug":"bob","name":"Bob"}}
+{"edge":"WorksAt","from":"bob","to":"acme"}"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(
+        &db_path,
+        &initial_path,
+        LoadModeArg::Overwrite,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let knows_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "Knows")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(knows_dataset_path)).unwrap();
+
+    cmd_load(&db_path, &append_path, LoadModeArg::Append, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let people = build_describe_payload(&db_path, &metadata, Some("Person")).unwrap();
+    let works_at = build_describe_payload(&db_path, &metadata, Some("WorksAt")).unwrap();
+    assert_eq!(people["nodes"][0]["rows"].as_u64(), Some(2));
+    assert_eq!(works_at["edges"][0]["rows"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn load_merge_uses_sparse_restore_without_opening_unrelated_datasets() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let initial_path = dir.path().join("initial.jsonl");
+    let merge_path = dir.path().join("merge.jsonl");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &initial_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"alice","to":"alice"}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &merge_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice Cooper"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob"}}"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(
+        &db_path,
+        &initial_path,
+        LoadModeArg::Overwrite,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "WorksAt")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(works_at_dataset_path)).unwrap();
+
+    cmd_load(&db_path, &merge_path, LoadModeArg::Merge, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let people = build_describe_payload(&db_path, &metadata, Some("Person")).unwrap();
+    assert_eq!(people["nodes"][0]["rows"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn run_insert_node_uses_sparse_mutation_without_full_graph_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("insert.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query add_person($slug: String, $name: String) {
+    insert Person {
+        slug: $slug
+        name: $name
+    }
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "WorksAt")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(works_at_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(
+        &db_path,
+        &queries.queries[0],
+        &ParamMap::from([
+            ("slug".to_string(), Literal::String("bob".to_string())),
+            ("name".to_string(), Literal::String("Bob".to_string())),
+        ]),
+    )
+    .await
+    .unwrap();
+    let affected_nodes = results[0]
+        .column_by_name("affected_nodes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(affected_nodes.value(0), 1);
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let people = build_describe_payload(&db_path, &metadata, Some("Person")).unwrap();
+    assert_eq!(people["nodes"][0]["rows"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn run_update_node_uses_sparse_mutation_without_full_graph_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("update.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query rename_person($slug: String, $name: String) {
+    update Person set {
+        name: $name
+    } where slug = $slug
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "WorksAt")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(works_at_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(
+        &db_path,
+        &queries.queries[0],
+        &ParamMap::from([
+            ("slug".to_string(), Literal::String("alice".to_string())),
+            (
+                "name".to_string(),
+                Literal::String("Alice Cooper".to_string()),
+            ),
+        ]),
+    )
+    .await
+    .unwrap();
+    let affected_nodes = results[0]
+        .column_by_name("affected_nodes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(affected_nodes.value(0), 1);
+
+    let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
+    let update_row = cdc_rows.last().unwrap();
+    assert_eq!(update_row.op, "update");
+    assert_eq!(update_row.type_name, "Person");
+    assert_eq!(update_row.payload["after"]["name"], "Alice Cooper");
+}
+
+#[tokio::test]
+async fn run_insert_edge_uses_sparse_mutation_without_full_graph_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("insert-edge.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query add_work($from: String, $to: String) {
+    insert WorksAt {
+        from: $from
+        to: $to
+    }
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let knows_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "Knows")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(knows_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(
+        &db_path,
+        &queries.queries[0],
+        &ParamMap::from([
+            ("from".to_string(), Literal::String("bob".to_string())),
+            ("to".to_string(), Literal::String("acme".to_string())),
+        ]),
+    )
+    .await
+    .unwrap();
+    let affected_edges = results[0]
+        .column_by_name("affected_edges")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(affected_edges.value(0), 1);
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at = build_describe_payload(&db_path, &metadata, Some("WorksAt")).unwrap();
+    assert_eq!(works_at["edges"][0]["rows"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn run_delete_edge_uses_sparse_mutation_without_full_graph_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("delete-edge.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query remove_work($from: String) {
+    delete WorksAt where from = $from
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let knows_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "Knows")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(knows_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(
+        &db_path,
+        &queries.queries[0],
+        &ParamMap::from([("from".to_string(), Literal::String("Alice".to_string()))]),
+    )
+    .await
+    .unwrap();
+    let affected_edges = results[0]
+        .column_by_name("affected_edges")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(affected_edges.value(0), 1);
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at = build_describe_payload(&db_path, &metadata, Some("WorksAt")).unwrap();
+    assert_eq!(works_at["edges"][0]["rows"].as_u64(), Some(0));
+
+    let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
+    let delete_row = cdc_rows.last().unwrap();
+    assert_eq!(delete_row.op, "delete");
+    assert_eq!(delete_row.type_name, "WorksAt");
+}
+
+#[tokio::test]
+async fn run_delete_node_without_incident_edges_uses_sparse_mutation_without_full_graph_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("delete-node.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+node Project {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Project","data":{"slug":"alpha","name":"Alpha"}}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query remove_project($slug: String) {
+    delete Project where slug = $slug
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "WorksAt")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(works_at_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(
+        &db_path,
+        &queries.queries[0],
+        &ParamMap::from([("slug".to_string(), Literal::String("alpha".to_string()))]),
+    )
+    .await
+    .unwrap();
+    let affected_nodes = results[0]
+        .column_by_name("affected_nodes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(affected_nodes.value(0), 1);
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let projects = build_describe_payload(&db_path, &metadata, Some("Project")).unwrap();
+    assert_eq!(projects["nodes"][0]["rows"].as_u64(), Some(0));
+
+    let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
+    let delete_row = cdc_rows.last().unwrap();
+    assert_eq!(delete_row.op, "delete");
+    assert_eq!(delete_row.type_name, "Project");
 }
 
 #[tokio::test]
@@ -1314,8 +2048,7 @@ edge MadeBy: ActionItem -> Person"#,
         .await
         .unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
-    let rows = build_export_rows(&db, false, true).unwrap();
+    let rows = build_export_rows(&db_path, false, true).await.unwrap();
     let edge = rows
         .iter()
         .find(|row| row["edge"] == "MadeBy")
@@ -1346,8 +2079,9 @@ edge MadeBy: ActionItem -> Person"#,
     .await
     .unwrap();
 
-    let roundtrip_db = Database::open(&roundtrip_db_path).await.unwrap();
-    let roundtrip_rows = build_export_rows(&roundtrip_db, false, true).unwrap();
+    let roundtrip_rows = build_export_rows(&roundtrip_db_path, false, true)
+        .await
+        .unwrap();
     let roundtrip_edge = roundtrip_rows
         .iter()
         .find(|row| row["edge"] == "MadeBy")
@@ -1390,8 +2124,7 @@ edge Follows: User -> User"#,
         .await
         .unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
-    let rows = build_export_rows(&db, false, true).unwrap();
+    let rows = build_export_rows(&db_path, false, true).await.unwrap();
     assert!(
         rows.iter()
             .any(|row| row["type"] == "User" && row["data"]["id"] == "usr_01")
@@ -1424,8 +2157,9 @@ edge Follows: User -> User"#,
     .await
     .unwrap();
 
-    let roundtrip_db = Database::open(&roundtrip_db_path).await.unwrap();
-    let roundtrip_rows = build_export_rows(&roundtrip_db, false, true).unwrap();
+    let roundtrip_rows = build_export_rows(&roundtrip_db_path, false, true)
+        .await
+        .unwrap();
     assert!(
         roundtrip_rows
             .iter()

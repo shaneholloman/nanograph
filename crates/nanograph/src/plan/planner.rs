@@ -20,6 +20,7 @@ use crate::embedding::EmbeddingClient;
 use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
+use crate::store::database::EdgeIndexCache;
 use crate::store::graph::GraphStorage;
 use crate::store::lance_io::logical_node_field_to_lance;
 use crate::types::ScalarType;
@@ -37,6 +38,17 @@ pub async fn execute_query(
     ir: &QueryIR,
     storage: Arc<GraphStorage>,
     params: &ParamMap,
+) -> Result<Vec<RecordBatch>> {
+    execute_query_with_edge_index_cache(ir, storage, params, Arc::new(EdgeIndexCache::default()))
+        .await
+}
+
+#[instrument(skip(ir, storage, params, edge_index_cache), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
+pub(crate) async fn execute_query_with_edge_index_cache(
+    ir: &QueryIR,
+    storage: Arc<GraphStorage>,
+    params: &ParamMap,
+    edge_index_cache: Arc<EdgeIndexCache>,
 ) -> Result<Vec<RecordBatch>> {
     let resolved_ir = resolve_nearest_query_embeddings(ir, storage.as_ref(), params).await?;
     info!("executing query");
@@ -80,6 +92,7 @@ pub async fn execute_query(
     let plan = build_physical_plan(
         &resolved_ir.pipeline,
         storage.clone(),
+        edge_index_cache,
         params,
         scan_limit_pushdown,
         &scan_projections,
@@ -800,6 +813,7 @@ async fn try_execute_single_node_nearest_ann_fast_path(
         Some(path) => path.to_path_buf(),
         None => return Ok(None),
     };
+    let dataset_version = storage.node_dataset_version(&candidate.type_name);
 
     let query_vec = resolve_nearest_query_vector(&candidate.query, params, vector_dim)?;
     let query_array = Float32Array::from(query_vec);
@@ -815,6 +829,21 @@ async fn try_execute_single_node_nearest_ann_fast_path(
             );
             return Ok(None);
         }
+    };
+    let dataset = match dataset_version {
+        Some(version) => match dataset.checkout_version(version).await {
+            Ok(dataset) => dataset,
+            Err(e) => {
+                debug!(
+                    node_type = %candidate.type_name,
+                    dataset_version = version,
+                    error = %e,
+                    "nearest ANN fast path unavailable, falling back to exact path"
+                );
+                return Ok(None);
+            }
+        },
+        None => dataset,
     };
 
     let field_idx = node_type
@@ -977,6 +1006,11 @@ fn build_lance_sql_filter_for_pushdown_preds(
             CompOp::Lt => "<",
             CompOp::Ge => ">=",
             CompOp::Le => "<=",
+            CompOp::Contains => {
+                return Err(NanoError::Execution(
+                    "membership predicate is not supported in Lance filter pushdown".to_string(),
+                ));
+            }
         };
         clauses.push(format!(
             "{} {} {}",
@@ -1034,6 +1068,7 @@ fn wrap_projected_node_batch(
 fn build_physical_plan(
     pipeline: &[IROp],
     storage: Arc<GraphStorage>,
+    edge_index_cache: Arc<EdgeIndexCache>,
     params: &ParamMap,
     scan_limit_pushdown: Option<usize>,
     scan_projections: &ScanProjectionMap,
@@ -1137,6 +1172,7 @@ fn build_physical_plan(
                         max_hops: *max_hops,
                     },
                     storage.clone(),
+                    edge_index_cache.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
             }
@@ -1152,6 +1188,7 @@ fn build_physical_plan(
                 let inner_plan = build_physical_plan_with_input(
                     inner,
                     storage.clone(),
+                    edge_index_cache.clone(),
                     outer.clone(),
                     params,
                     scan_projections,
@@ -1177,6 +1214,7 @@ fn build_physical_plan(
 fn build_physical_plan_with_input(
     pipeline: &[IROp],
     storage: Arc<GraphStorage>,
+    edge_index_cache: Arc<EdgeIndexCache>,
     input: Arc<dyn ExecutionPlan>,
     params: &ParamMap,
     scan_projections: &ScanProjectionMap,
@@ -1273,6 +1311,7 @@ fn build_physical_plan_with_input(
                         max_hops: *max_hops,
                     },
                     storage.clone(),
+                    edge_index_cache.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
             }
@@ -1285,6 +1324,7 @@ fn build_physical_plan_with_input(
                 let inner_plan = build_physical_plan_with_input(
                     inner,
                     storage.clone(),
+                    edge_index_cache.clone(),
                     outer.clone(),
                     params,
                     scan_projections,
@@ -1641,6 +1681,7 @@ fn flip_comp_op(op: CompOp) -> CompOp {
         CompOp::Lt => CompOp::Gt,
         CompOp::Ge => CompOp::Le,
         CompOp::Le => CompOp::Ge,
+        CompOp::Contains => CompOp::Contains,
     }
 }
 
@@ -1717,7 +1758,7 @@ fn apply_single_filter(
         let right = eval_ir_expr(&filter.right, batch, params)?;
 
         // Cast right to match left's data type if they differ
-        let right = if left.data_type() != right.data_type() {
+        let right = if filter.op != CompOp::Contains && left.data_type() != right.data_type() {
             arrow_cast::cast(&right, left.data_type())
                 .map_err(|e| NanoError::Execution(format!("cast error: {}", e)))?
         } else {
@@ -2375,6 +2416,9 @@ fn compare_arrays(
     op: CompOp,
 ) -> Result<arrow_array::BooleanArray> {
     use arrow_ord::cmp;
+    if op == CompOp::Contains {
+        return literal_utils::compare_list_membership(left, right).map_err(NanoError::Execution);
+    }
     let result = match op {
         CompOp::Eq => cmp::eq(left, right),
         CompOp::Ne => cmp::neq(left, right),
@@ -2382,6 +2426,7 @@ fn compare_arrays(
         CompOp::Lt => cmp::lt(left, right),
         CompOp::Ge => cmp::gt_eq(left, right),
         CompOp::Le => cmp::lt_eq(left, right),
+        CompOp::Contains => unreachable!("handled above"),
     }
     .map_err(|e| NanoError::Execution(format!("comparison error: {}", e)))?;
     Ok(result)

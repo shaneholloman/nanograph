@@ -29,6 +29,15 @@ pub(crate) fn logical_node_field_to_lance(field_name: &str) -> &str {
     }
 }
 
+pub(crate) fn logical_edge_field_to_lance(field_name: &str) -> &str {
+    match field_name {
+        "id" => LANCE_INTERNAL_ID_FIELD,
+        "src" => LANCE_INTERNAL_SRC_FIELD,
+        "dst" => LANCE_INTERNAL_DST_FIELD,
+        other => other,
+    }
+}
+
 fn lance_dataset_kind(path: &Path) -> LanceDatasetKind {
     match path
         .parent()
@@ -257,6 +266,57 @@ pub(crate) async fn read_lance_batches(path: &Path, version: u64) -> Result<Vec<
 
     let kind = lance_dataset_kind(path);
     let scanner = dataset.scan();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| NanoError::Lance(format!("scan error: {}", e)))?
+        .map(|batch| batch.map_err(|e| NanoError::Lance(format!("stream error: {}", e))))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|batch| lance_batch_to_logical(&batch, kind))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(batches)
+}
+
+pub(crate) async fn read_lance_projected_batches(
+    path: &Path,
+    version: u64,
+    columns: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    info!(
+        dataset_path = %path.display(),
+        dataset_version = version,
+        projection = ?columns,
+        "reading projected Lance dataset"
+    );
+    let uri = path.to_string_lossy().to_string();
+    let dataset = Dataset::open(&uri)
+        .await
+        .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+    let dataset = dataset
+        .checkout_version(version)
+        .await
+        .map_err(|e| NanoError::Lance(format!("checkout version {} error: {}", version, e)))?;
+
+    let kind = lance_dataset_kind(path);
+    let projected_columns: Vec<String> = columns
+        .iter()
+        .map(|column| match kind {
+            LanceDatasetKind::Node => logical_node_field_to_lance(column),
+            LanceDatasetKind::Edge => logical_edge_field_to_lance(column),
+            LanceDatasetKind::Plain => column,
+        })
+        .map(ToString::to_string)
+        .collect();
+
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&projected_columns)
+        .map_err(|e| NanoError::Lance(format!("projection error: {}", e)))?;
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await

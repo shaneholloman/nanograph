@@ -130,6 +130,23 @@ query search_opportunities($q: String) {
 "#
 }
 
+fn list_membership_schema() -> &'static str {
+    r#"
+node Person {
+    slug: String @key
+    tags: [String]?
+}
+"#
+}
+
+fn list_membership_data() -> &'static str {
+    r#"
+{"type":"Person","data":{"slug":"alice","tags":["rust","db"]}}
+{"type":"Person","data":{"slug":"bob","tags":["graph"]}}
+{"type":"Person","data":{"slug":"cara","tags":["rust"]}}
+"#
+}
+
 fn write_bug_fixture(workspace: &ExampleWorkspace) {
     workspace.write_file("bug.pg", bug_schema());
     workspace.write_file("bug.jsonl", bug_seed_data());
@@ -185,6 +202,56 @@ fn init_stale_vector_db(workspace: &ExampleWorkspace) {
         "stale.nano",
         "--data",
         "stale.jsonl",
+        "--mode",
+        "overwrite",
+    ]);
+    assert_eq!(load["status"], "ok");
+}
+
+fn init_list_membership_db(workspace: &ExampleWorkspace) {
+    workspace.write_file("list.pg", list_membership_schema());
+    workspace.write_file("list.jsonl", list_membership_data());
+    workspace.write_file(
+        "list.gq",
+        r#"
+query tagged($tag: String) {
+    match { $p: Person { tags: $tag } }
+    return { $p.slug }
+    order { $p.slug asc }
+}
+"#,
+    );
+    workspace.write_file(
+        "list-contains.gq",
+        r#"
+query tagged_contains($tag: String) {
+    match {
+        $p: Person
+        $p.tags contains $tag
+    }
+    return { $p.slug }
+    order { $p.slug asc }
+}
+"#,
+    );
+    workspace.write_file(
+        "list-equality.gq",
+        r#"
+query tagged_exact() {
+    match { $p: Person { tags: ["rust"] } }
+    return { $p.slug }
+}
+"#,
+    );
+
+    let init = workspace.json_value(&["--json", "init", "list.nano", "--schema", "list.pg"]);
+    assert_eq!(init["status"], "ok");
+    let load = workspace.json_value(&[
+        "--json",
+        "load",
+        "list.nano",
+        "--data",
+        "list.jsonl",
         "--mode",
         "overwrite",
     ]);
@@ -612,4 +679,76 @@ fn merge_mode_materializes_missing_embeddings_end_to_end() {
     assert_eq!(rows[1]["slug"], "def456");
     assert_eq!(rows[0]["embedding"].as_array().map(Vec::len), Some(1536));
     assert_eq!(rows[1]["embedding"].as_array().map(Vec::len), Some(1536));
+}
+
+#[test]
+fn list_membership_filters_work_end_to_end() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    init_list_membership_db(&workspace);
+
+    let check = workspace.run_ok(&["--json", "check", "--db", "list.nano", "--query", "list.gq"]);
+    let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("check json");
+    assert_eq!(check_value["status"], "ok");
+
+    let run = workspace.run_ok(&[
+        "--json",
+        "run",
+        "--db",
+        "list.nano",
+        "--query",
+        "list.gq",
+        "--name",
+        "tagged",
+        "--param",
+        "tag=rust",
+    ]);
+    let run_value = serde_json::from_str::<serde_json::Value>(&run.stdout).expect("run json");
+    let rows = run_value["rows"].as_array().expect("rows");
+    let slugs = rows
+        .iter()
+        .map(|row| row["slug"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(slugs, vec!["alice".to_string(), "cara".to_string()]);
+
+    let contains_run = workspace.run_ok(&[
+        "--json",
+        "run",
+        "--db",
+        "list.nano",
+        "--query",
+        "list-contains.gq",
+        "--name",
+        "tagged_contains",
+        "--param",
+        "tag=rust",
+    ]);
+    let contains_value =
+        serde_json::from_str::<serde_json::Value>(&contains_run.stdout).expect("contains run json");
+    let contains_rows = contains_value["rows"].as_array().expect("rows");
+    let contains_slugs = contains_rows
+        .iter()
+        .map(|row| row["slug"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contains_slugs,
+        vec!["alice".to_string(), "cara".to_string()]
+    );
+
+    let rejected = workspace.run_fail(&[
+        "--json",
+        "check",
+        "--db",
+        "list.nano",
+        "--query",
+        "list-equality.gq",
+    ]);
+    let rejected_value =
+        serde_json::from_str::<serde_json::Value>(&rejected.stdout).expect("rejected json");
+    assert_eq!(rejected_value["status"], "error");
+    assert!(
+        rejected_value["results"][0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("list equality is not supported")
+    );
 }

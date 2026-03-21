@@ -136,9 +136,22 @@ fn lower_clauses(
 
     // Lower bindings into NodeScan ops
     for binding in &bindings {
+        let node_type = catalog
+            .node_types
+            .get(&binding.type_name)
+            .expect("binding type was validated during typecheck");
         // Collect inline filters from prop matches
         let mut scan_filters = Vec::new();
         for pm in &binding.prop_matches {
+            let prop = node_type
+                .properties
+                .get(&pm.prop_name)
+                .expect("binding property was validated during typecheck");
+            let op = if prop.list {
+                CompOp::Contains
+            } else {
+                CompOp::Eq
+            };
             match &pm.value {
                 MatchValue::Literal(lit) => {
                     scan_filters.push(IRFilter {
@@ -146,7 +159,7 @@ fn lower_clauses(
                             variable: binding.variable.clone(),
                             property: pm.prop_name.clone(),
                         },
-                        op: CompOp::Eq,
+                        op,
                         right: IRExpr::Literal(lit.clone()),
                     });
                 }
@@ -156,7 +169,7 @@ fn lower_clauses(
                             variable: binding.variable.clone(),
                             property: pm.prop_name.clone(),
                         },
-                        op: CompOp::Eq,
+                        op,
                         right: IRExpr::Param(NOW_PARAM_NAME.to_string()),
                     });
                 }
@@ -171,7 +184,7 @@ fn lower_clauses(
                             variable: binding.variable.clone(),
                             property: pm.prop_name.clone(),
                         },
-                        op: CompOp::Eq,
+                        op,
                         right,
                     });
                 }

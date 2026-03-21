@@ -77,6 +77,7 @@ pub enum CompOp {
     Lt,
     Ge,
     Le,
+    Contains,
 }
 
 impl std::fmt::Display for CompOp {
@@ -88,6 +89,7 @@ impl std::fmt::Display for CompOp {
             Self::Lt => write!(f, "<"),
             Self::Ge => write!(f, ">="),
             Self::Le => write!(f, "<="),
+            Self::Contains => write!(f, "contains"),
         }
     }
 }

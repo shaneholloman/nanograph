@@ -21,7 +21,9 @@ use crate::error::{NanoError, Result};
 use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
 use crate::query::ast::{CompOp, Literal};
 use crate::store::csr::CsrIndex;
-use crate::store::database::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate};
+use crate::store::database::{
+    Database, DatabaseWriteGuard, DeleteOp, DeletePredicate, EdgeIndexCache, EdgeIndexPair,
+};
 use crate::store::graph::GraphStorage;
 use crate::types::Direction;
 
@@ -39,6 +41,7 @@ pub(crate) struct ExpandExec {
     max_hops: Option<u32>,
     output_schema: SchemaRef,
     storage: Arc<GraphStorage>,
+    edge_index_cache: Arc<EdgeIndexCache>,
     properties: PlanProperties,
 }
 
@@ -58,6 +61,7 @@ impl ExpandExec {
         input: Arc<dyn ExecutionPlan>,
         spec: ExpandSpec,
         storage: Arc<GraphStorage>,
+        edge_index_cache: Arc<EdgeIndexCache>,
     ) -> Self {
         let input_schema = input.schema();
         let ExpandSpec {
@@ -106,6 +110,7 @@ impl ExpandExec {
             max_hops,
             output_schema,
             storage,
+            edge_index_cache,
             properties,
         }
     }
@@ -163,6 +168,7 @@ impl ExecutionPlan for ExpandExec {
                 max_hops: self.max_hops,
             },
             self.storage.clone(),
+            self.edge_index_cache.clone(),
         )))
     }
 
@@ -181,6 +187,7 @@ impl ExecutionPlan for ExpandExec {
         let min_hops = self.min_hops;
         let max_hops = self.max_hops;
         let storage = self.storage.clone();
+        let edge_index_cache = self.edge_index_cache.clone();
 
         let stream = futures::stream::once(async move {
             use datafusion_physical_plan::common::collect;
@@ -200,6 +207,7 @@ impl ExecutionPlan for ExpandExec {
                 max_hops,
                 output_schema: schema.clone(),
                 storage,
+                edge_index_cache,
                 properties: PlanProperties::new(
                     EquivalenceProperties::new(schema.clone()),
                     datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
@@ -207,12 +215,13 @@ impl ExecutionPlan for ExpandExec {
                     datafusion_physical_plan::execution_plan::Boundedness::Bounded,
                 ),
             };
+            let edge_indices = expand.resolve_edge_indices().await?;
 
             let mut result_columns: Vec<Vec<ArrayRef>> = Vec::new();
             let mut total_rows = 0usize;
 
             for batch in &batches {
-                let expanded = expand.expand_batch(batch)?;
+                let expanded = expand.expand_batch(batch, edge_indices.as_ref())?;
                 if expanded.num_rows() > 0 {
                     if result_columns.is_empty() {
                         result_columns.resize(expanded.num_columns(), Vec::new());
@@ -250,6 +259,46 @@ impl ExecutionPlan for ExpandExec {
 }
 
 impl ExpandExec {
+    async fn resolve_edge_indices(&self) -> DFResult<Arc<EdgeIndexPair>> {
+        let edge_seg = self
+            .storage
+            .edge_segments
+            .get(&self.edge_type)
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "edge type {} not found",
+                    self.edge_type
+                ))
+            })?;
+
+        if let (Some(dataset_path), Some(dataset_version)) = (
+            self.storage.edge_dataset_path(&self.edge_type),
+            self.storage.edge_dataset_version(&self.edge_type),
+        ) {
+            return self
+                .edge_index_cache
+                .get_or_build(
+                    &self.edge_type,
+                    dataset_path,
+                    dataset_version,
+                    self.storage.next_node_id(),
+                )
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()));
+        }
+
+        let csr = edge_seg.csr.clone().ok_or_else(|| {
+            datafusion_common::DataFusionError::Execution("CSR not built".to_string())
+        })?;
+        let csc = edge_seg.csc.clone().ok_or_else(|| {
+            datafusion_common::DataFusionError::Execution("CSC not built".to_string())
+        })?;
+        Ok(Arc::new(EdgeIndexPair {
+            csr: Arc::new(csr),
+            csc: Arc::new(csc),
+        }))
+    }
+
     fn output_struct_fields(output_schema: &SchemaRef, struct_name: &str) -> DFResult<Vec<Field>> {
         let struct_idx = output_schema.index_of(struct_name).map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
@@ -318,26 +367,15 @@ impl ExpandExec {
         })
     }
 
-    fn expand_batch(&self, input: &RecordBatch) -> DFResult<RecordBatch> {
-        let edge_seg = self
-            .storage
-            .edge_segments
-            .get(&self.edge_type)
-            .ok_or_else(|| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "edge type {} not found",
-                    self.edge_type
-                ))
-            })?;
-
+    fn expand_batch(
+        &self,
+        input: &RecordBatch,
+        edge_indices: &EdgeIndexPair,
+    ) -> DFResult<RecordBatch> {
         let csr = match self.direction {
-            Direction::Out => edge_seg.csr.as_ref(),
-            Direction::In => edge_seg.csc.as_ref(),
-        }
-        .ok_or_else(|| {
-            datafusion_common::DataFusionError::Execution("CSR not built".to_string())
-        })?;
-
+            Direction::Out => edge_indices.csr.as_ref(),
+            Direction::In => edge_indices.csc.as_ref(),
+        };
         // Find the src struct column
         let src_col_idx = input
             .schema()
@@ -906,6 +944,9 @@ fn comp_op_to_delete_op(op: CompOp) -> Result<DeleteOp> {
         CompOp::Lt => Ok(DeleteOp::Lt),
         CompOp::Ge => Ok(DeleteOp::Ge),
         CompOp::Le => Ok(DeleteOp::Le),
+        CompOp::Contains => Err(NanoError::Execution(
+            "membership predicates are not supported for delete operations".to_string(),
+        )),
     }
 }
 

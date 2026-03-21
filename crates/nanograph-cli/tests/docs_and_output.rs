@@ -61,6 +61,19 @@ fn revops_example_doc_commands_stay_green() {
     workspace.init();
     workspace.load();
     workspace.check();
+    workspace.write_file(
+        "contains.gq",
+        r#"
+query tagged_clients($tag: String) {
+    match {
+        $c: Client
+        $c.tags contains $tag
+    }
+    return { $c.slug, $c.name, $c.tags }
+    order { $c.slug asc }
+}
+"#,
+    );
 
     let describe = workspace.json_value(&["describe", "--type", "Signal", "--format", "json"]);
     assert_eq!(describe["nodes"][0]["name"], "Signal");
@@ -88,6 +101,23 @@ fn revops_example_doc_commands_stay_green() {
         "json",
     ]);
     assert!(!signals.is_empty());
+
+    let contains_check = workspace.json_value(&["--json", "check", "--query", "contains.gq"]);
+    assert_eq!(contains_check["status"], "ok");
+
+    let tagged_clients = workspace.json_rows(&[
+        "run",
+        "--query",
+        "contains.gq",
+        "--name",
+        "tagged_clients",
+        "--format",
+        "json",
+        "--param",
+        "tag=client",
+    ]);
+    assert_eq!(tagged_clients.len(), 1);
+    assert_eq!(tagged_clients[0]["slug"], "cli-priya-shah");
 
     let embed = workspace.json_value(&[
         "--json",

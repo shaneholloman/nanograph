@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::builder::BooleanBuilder;
@@ -10,10 +10,14 @@ use arrow_array::{
 use arrow_schema::DataType;
 use tracing::instrument;
 
+use super::mutation::{DatasetMutationPlan, EdgeDelta, NodeDelta};
+use super::persist::{
+    collect_ids_from_batch, filter_record_batch_by_delete_mask, read_sparse_edge_batch,
+    read_sparse_node_batch, select_record_batch_rows,
+};
 use super::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate, DeleteResult, MutationPlan};
-use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
-use crate::store::graph::GraphStorage;
+use crate::store::metadata::DatabaseMetadata;
 use crate::store::txlog::CdcLogEntry;
 
 impl Database {
@@ -35,68 +39,90 @@ impl Database {
         predicate: &DeletePredicate,
         writer: &mut DatabaseWriteGuard<'_>,
     ) -> Result<DeleteResult> {
-        let current = self.snapshot();
-        let target_batch = match current.get_all_nodes(type_name)? {
+        let metadata = DatabaseMetadata::open(self.path())?;
+        let target_batch = match read_sparse_node_batch(&metadata, type_name).await? {
             Some(batch) => batch,
             None => return Ok(DeleteResult::default()),
         };
 
         let delete_mask = build_delete_mask_for_mutation(&target_batch, predicate)?;
-        let deleted_node_ids = collect_deleted_node_ids(&target_batch, &delete_mask)?;
+        let deleted_node_rows: Vec<usize> = (0..target_batch.num_rows())
+            .filter(|&row| !delete_mask.is_null(row) && delete_mask.value(row))
+            .collect();
+        let deleted_batch = select_record_batch_rows(&target_batch, &deleted_node_rows)?;
+        let deleted_node_ids = collect_ids_from_batch(&deleted_batch)?;
         if deleted_node_ids.is_empty() {
             return Ok(DeleteResult::default());
         }
         let deleted_node_set: HashSet<u64> = deleted_node_ids.into_iter().collect();
-
-        let mut keep_builder = BooleanBuilder::with_capacity(target_batch.num_rows());
-        for row in 0..target_batch.num_rows() {
-            let delete = !delete_mask.is_null(row) && delete_mask.value(row);
-            keep_builder.append_value(!delete);
-        }
-        let keep_mask = keep_builder.finish();
-        let filtered_target = arrow_select::filter::filter_record_batch(&target_batch, &keep_mask)
-            .map_err(|e| NanoError::Storage(format!("node delete filter error: {}", e)))?;
-
-        let old_next_node_id = current.next_node_id();
-        let old_next_edge_id = current.next_edge_id();
-        let mut new_storage = GraphStorage::new(self.catalog.clone());
-
-        for node_def in self.schema_ir.node_types() {
-            if node_def.name == type_name {
-                if filtered_target.num_rows() > 0 {
-                    new_storage.load_node_batch(type_name, filtered_target.clone())?;
-                }
-                continue;
-            }
-
-            if let Some(batch) = current.get_all_nodes(&node_def.name)? {
-                new_storage.load_node_batch(&node_def.name, batch)?;
-            }
-        }
+        let filtered_target = filter_record_batch_by_delete_mask(&target_batch, &delete_mask, "node")?;
+        let mut mutation_plan = DatasetMutationPlan::new(
+            "mutation:delete_nodes",
+            metadata.manifest().next_node_id,
+            metadata.manifest().next_edge_id,
+        );
+        mutation_plan.node_replacements.insert(
+            type_name.to_string(),
+            (filtered_target.num_rows() > 0).then_some(filtered_target),
+        );
+        mutation_plan.delta.node_changes.insert(
+            type_name.to_string(),
+            NodeDelta {
+                delete_ids: deleted_node_set.iter().copied().collect(),
+                before_for_deletes: Some(deleted_batch),
+                ..Default::default()
+            },
+        );
 
         let mut deleted_edges = 0usize;
         for edge_def in self.schema_ir.edge_types() {
-            if let Some(edge_batch) = current.edge_batch_for_save(&edge_def.name)? {
-                let filtered = filter_edge_batch_by_deleted_nodes(&edge_batch, &deleted_node_set)?;
-                deleted_edges += edge_batch.num_rows().saturating_sub(filtered.num_rows());
-                if filtered.num_rows() > 0 {
-                    new_storage.load_edge_batch(&edge_def.name, filtered)?;
-                }
+            if edge_def.src_type_name != type_name && edge_def.dst_type_name != type_name {
+                continue;
             }
+            let Some(edge_batch) = read_sparse_edge_batch(&metadata, &edge_def.name).await? else {
+                continue;
+            };
+            let src_arr = edge_batch
+                .column_by_name("src")
+                .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| NanoError::Storage("edge src column is not UInt64".to_string()))?;
+            let dst_arr = edge_batch
+                .column_by_name("dst")
+                .ok_or_else(|| NanoError::Storage("edge batch missing dst column".to_string()))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| NanoError::Storage("edge dst column is not UInt64".to_string()))?;
+            let deleted_edge_rows: Vec<usize> = (0..edge_batch.num_rows())
+                .filter(|&row| {
+                    deleted_node_set.contains(&src_arr.value(row))
+                        || deleted_node_set.contains(&dst_arr.value(row))
+                })
+                .collect();
+            if deleted_edge_rows.is_empty() {
+                continue;
+            }
+            let filtered = filter_edge_batch_by_deleted_nodes(&edge_batch, &deleted_node_set)?;
+            let deleted_edge_batch = select_record_batch_rows(&edge_batch, &deleted_edge_rows)?;
+            let deleted_edge_ids = collect_ids_from_batch(&deleted_edge_batch)?;
+            deleted_edges += deleted_edge_ids.len();
+            mutation_plan.edge_replacements.insert(
+                edge_def.name.clone(),
+                (filtered.num_rows() > 0).then_some(filtered),
+            );
+            mutation_plan.delta.edge_changes.insert(
+                edge_def.name.clone(),
+                EdgeDelta {
+                    delete_ids: deleted_edge_ids,
+                    before_for_deletes: Some(deleted_edge_batch),
+                    ..Default::default()
+                },
+            );
         }
 
-        if new_storage.next_node_id() < old_next_node_id {
-            new_storage.set_next_node_id(old_next_node_id);
-        }
-        if new_storage.next_edge_id() < old_next_edge_id {
-            new_storage.set_next_edge_id(old_next_edge_id);
-        }
-        new_storage.build_indices()?;
-        self.apply_mutation_plan_locked(
-            MutationPlan::prepared_storage(new_storage, "mutation:delete_nodes"),
-            writer,
-        )
-        .await?;
+        self.apply_mutation_plan_locked(MutationPlan::prepared_datasets(mutation_plan), writer)
+            .await?;
 
         Ok(DeleteResult {
             deleted_nodes: deleted_node_set.len(),
@@ -129,63 +155,44 @@ impl Database {
             )));
         }
 
-        let current = self.snapshot();
-        let target_batch = match current.edge_batch_for_save(type_name)? {
+        let metadata = DatabaseMetadata::open(self.path())?;
+        let target_batch = match read_sparse_edge_batch(&metadata, type_name).await? {
             Some(batch) => batch,
             None => return Ok(DeleteResult::default()),
         };
 
         let delete_mask = build_delete_mask_for_mutation(&target_batch, predicate)?;
-        let mut keep_builder = BooleanBuilder::with_capacity(target_batch.num_rows());
-        for row in 0..target_batch.num_rows() {
-            let delete = !delete_mask.is_null(row) && delete_mask.value(row);
-            keep_builder.append_value(!delete);
-        }
-        let keep_mask = keep_builder.finish();
-        let filtered_target = arrow_select::filter::filter_record_batch(&target_batch, &keep_mask)
-            .map_err(|e| NanoError::Storage(format!("edge delete filter error: {}", e)))?;
+        let filtered_target = filter_record_batch_by_delete_mask(&target_batch, &delete_mask, "edge")?;
         let deleted_edges = target_batch
             .num_rows()
             .saturating_sub(filtered_target.num_rows());
         if deleted_edges == 0 {
             return Ok(DeleteResult::default());
         }
-
-        let old_next_node_id = current.next_node_id();
-        let old_next_edge_id = current.next_edge_id();
-        let mut new_storage = GraphStorage::new(self.catalog.clone());
-
-        for node_def in self.schema_ir.node_types() {
-            if let Some(batch) = current.get_all_nodes(&node_def.name)? {
-                new_storage.load_node_batch(&node_def.name, batch)?;
-            }
-        }
-
-        for edge_def in self.schema_ir.edge_types() {
-            if edge_def.name == type_name {
-                if filtered_target.num_rows() > 0 {
-                    new_storage.load_edge_batch(type_name, filtered_target.clone())?;
-                }
-                continue;
-            }
-
-            if let Some(batch) = current.edge_batch_for_save(&edge_def.name)? {
-                new_storage.load_edge_batch(&edge_def.name, batch)?;
-            }
-        }
-
-        if new_storage.next_node_id() < old_next_node_id {
-            new_storage.set_next_node_id(old_next_node_id);
-        }
-        if new_storage.next_edge_id() < old_next_edge_id {
-            new_storage.set_next_edge_id(old_next_edge_id);
-        }
-        new_storage.build_indices()?;
-        self.apply_mutation_plan_locked(
-            MutationPlan::prepared_storage(new_storage, "mutation:delete_edges"),
-            writer,
-        )
-        .await?;
+        let deleted_edge_rows: Vec<usize> = (0..target_batch.num_rows())
+            .filter(|&row| !delete_mask.is_null(row) && delete_mask.value(row))
+            .collect();
+        let deleted_batch = select_record_batch_rows(&target_batch, &deleted_edge_rows)?;
+        let delete_ids = collect_ids_from_batch(&deleted_batch)?;
+        let mut mutation_plan = DatasetMutationPlan::new(
+            "mutation:delete_edges",
+            metadata.manifest().next_node_id,
+            metadata.manifest().next_edge_id,
+        );
+        mutation_plan.edge_replacements.insert(
+            type_name.to_string(),
+            (filtered_target.num_rows() > 0).then_some(filtered_target),
+        );
+        mutation_plan.delta.edge_changes.insert(
+            type_name.to_string(),
+            EdgeDelta {
+                delete_ids,
+                before_for_deletes: Some(deleted_batch),
+                ..Default::default()
+            },
+        );
+        self.apply_mutation_plan_locked(MutationPlan::prepared_datasets(mutation_plan), writer)
+            .await?;
 
         Ok(DeleteResult {
             deleted_nodes: 0,
@@ -341,21 +348,6 @@ pub(super) fn build_delete_mask_for_mutation(
     compare_for_delete(&left, &right, predicate.op)
 }
 
-fn collect_deleted_node_ids(batch: &RecordBatch, delete_mask: &BooleanArray) -> Result<Vec<u64>> {
-    let id_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| NanoError::Storage("node id column is not UInt64".to_string()))?;
-    let mut ids = Vec::new();
-    for row in 0..batch.num_rows() {
-        if !delete_mask.is_null(row) && delete_mask.value(row) {
-            ids.push(id_arr.value(row));
-        }
-    }
-    Ok(ids)
-}
-
 fn filter_edge_batch_by_deleted_nodes(
     batch: &RecordBatch,
     deleted_node_ids: &HashSet<u64>,
@@ -399,72 +391,103 @@ fn filter_edge_batch_by_deleted_nodes(
         .map_err(|e| NanoError::Storage(format!("edge delete filter error: {}", e)))
 }
 
-pub(super) fn build_cdc_events_for_storage_transition(
-    previous: &GraphStorage,
-    next: &GraphStorage,
-    schema_ir: &SchemaIR,
+pub(super) fn build_delete_cdc_events_from_rows(
+    batch: &RecordBatch,
+    entity_kind: &str,
+    type_name: &str,
+    rows: &[usize],
 ) -> Result<Vec<CdcLogEntry>> {
-    let mut events = Vec::new();
-
-    for node_def in schema_ir.node_types() {
-        let before_rows = collect_rows_by_id(previous.get_all_nodes(&node_def.name)?)?;
-        let after_rows = collect_rows_by_id(next.get_all_nodes(&node_def.name)?)?;
-        append_entity_diff_events(
-            &mut events,
-            "node",
-            &node_def.name,
-            &before_rows,
-            &after_rows,
-        );
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let payload = record_batch_row_to_json_map(batch, *row)?;
+        let id = cdc_internal_entity_id_from_row(&payload).ok_or_else(|| {
+            NanoError::Storage(format!(
+                "missing id field while building delete CDC for {} {}",
+                entity_kind, type_name
+            ))
+        })?;
+        events.push(make_pending_cdc_event(
+            "delete",
+            entity_kind,
+            type_name,
+            id,
+            &payload,
+            serde_json::Value::Object(payload.clone()),
+        ));
     }
-
-    for edge_def in schema_ir.edge_types() {
-        let before_rows = collect_rows_by_id(previous.edge_batch_for_save(&edge_def.name)?)?;
-        let after_rows = collect_rows_by_id(next.edge_batch_for_save(&edge_def.name)?)?;
-        append_entity_diff_events(
-            &mut events,
-            "edge",
-            &edge_def.name,
-            &before_rows,
-            &after_rows,
-        );
-    }
-
     Ok(events)
 }
 
-fn collect_rows_by_id(
-    batch: Option<RecordBatch>,
-) -> Result<BTreeMap<u64, serde_json::Map<String, serde_json::Value>>> {
-    let mut rows = BTreeMap::new();
-    let Some(batch) = batch else {
-        return Ok(rows);
-    };
-
-    let id_arr = batch
-        .column_by_name("id")
-        .ok_or_else(|| NanoError::Storage("batch missing id column for CDC".to_string()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| NanoError::Storage("CDC id column is not UInt64".to_string()))?;
-
-    for row in 0..batch.num_rows() {
-        rows.insert(
-            id_arr.value(row),
-            record_batch_row_to_json_map(&batch, row)?,
-        );
-    }
-
-    Ok(rows)
+pub(crate) fn build_delete_cdc_events_from_batch(
+    batch: &RecordBatch,
+    entity_kind: &str,
+    type_name: &str,
+) -> Result<Vec<CdcLogEntry>> {
+    let rows: Vec<usize> = (0..batch.num_rows()).collect();
+    build_delete_cdc_events_from_rows(batch, entity_kind, type_name, &rows)
 }
 
-fn record_batch_row_to_json_map(
+pub(crate) fn build_insert_cdc_events_from_batch(
+    batch: &RecordBatch,
+    entity_kind: &str,
+    type_name: &str,
+) -> Result<Vec<CdcLogEntry>> {
+    let mut events = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let payload = record_batch_row_to_json_map(batch, row)?;
+        let id = cdc_internal_entity_id_from_row(&payload).ok_or_else(|| {
+            NanoError::Storage(format!(
+                "missing id field while building insert CDC for {} {}",
+                entity_kind, type_name
+            ))
+        })?;
+        events.push(make_pending_cdc_event(
+            "insert",
+            entity_kind,
+            type_name,
+            id,
+            &payload,
+            serde_json::Value::Object(payload.clone()),
+        ));
+    }
+    Ok(events)
+}
+
+pub(crate) fn build_update_cdc_event(
+    entity_kind: &str,
+    type_name: &str,
+    before: &serde_json::Map<String, serde_json::Value>,
+    after: &serde_json::Map<String, serde_json::Value>,
+) -> Option<CdcLogEntry> {
+    if before == after {
+        return None;
+    }
+
+    let id = cdc_internal_entity_id_from_row(after)
+        .or_else(|| cdc_internal_entity_id_from_row(before))?;
+    Some(make_pending_cdc_event(
+        "update",
+        entity_kind,
+        type_name,
+        id,
+        after,
+        serde_json::json!({
+            "before": before,
+            "after": after,
+        }),
+    ))
+}
+
+pub(crate) fn record_batch_row_to_json_map(
     batch: &RecordBatch,
     row: usize,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut map = serde_json::Map::new();
     for (col_idx, field) in batch.schema().fields().iter().enumerate() {
         let value = cdc_array_value_to_json(batch.column(col_idx), row);
+        if col_idx == 0 && field.name() == "id" {
+            map.insert("__ng_id".to_string(), value.clone());
+        }
         map.insert(field.name().clone(), value);
     }
     Ok(map)
@@ -570,59 +593,7 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
     }
 }
 
-fn append_entity_diff_events(
-    out: &mut Vec<CdcLogEntry>,
-    entity_kind: &str,
-    type_name: &str,
-    before_rows: &BTreeMap<u64, serde_json::Map<String, serde_json::Value>>,
-    after_rows: &BTreeMap<u64, serde_json::Map<String, serde_json::Value>>,
-) {
-    for (id, before) in before_rows {
-        if !after_rows.contains_key(id) {
-            out.push(make_pending_cdc_event(
-                "delete",
-                entity_kind,
-                type_name,
-                *id,
-                before,
-                serde_json::Value::Object(before.clone()),
-            ));
-        }
-    }
-
-    for (id, after) in after_rows {
-        if let Some(before) = before_rows.get(id)
-            && before != after
-        {
-            out.push(make_pending_cdc_event(
-                "update",
-                entity_kind,
-                type_name,
-                *id,
-                after,
-                serde_json::json!({
-                    "before": before,
-                    "after": after,
-                }),
-            ));
-        }
-    }
-
-    for (id, after) in after_rows {
-        if !before_rows.contains_key(id) {
-            out.push(make_pending_cdc_event(
-                "insert",
-                entity_kind,
-                type_name,
-                *id,
-                after,
-                serde_json::Value::Object(after.clone()),
-            ));
-        }
-    }
-}
-
-fn make_pending_cdc_event(
+pub(crate) fn make_pending_cdc_event(
     op: &str,
     entity_kind: &str,
     type_name: &str,
@@ -678,8 +649,7 @@ fn cdc_deleted_entity_id(event: &CdcLogEntry) -> Option<u64> {
     if let Some(id) = event
         .payload
         .as_object()
-        .and_then(|row| row.get("id"))
-        .and_then(|value| value.as_u64())
+        .and_then(cdc_internal_entity_id_from_row)
     {
         return Some(id);
     }
@@ -689,4 +659,12 @@ fn cdc_deleted_entity_id(event: &CdcLogEntry) -> Option<u64> {
         .strip_prefix("id=")
         .and_then(|raw| raw.split(',').next())
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn cdc_internal_entity_id_from_row(
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    row.get("__ng_id")
+        .and_then(|value| value.as_u64())
+        .or_else(|| row.get("id").and_then(|value| value.as_u64()))
 }

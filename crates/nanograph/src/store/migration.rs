@@ -15,16 +15,60 @@ use crate::catalog::schema_ir::{
 use crate::error::{NanoError, Result};
 use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
-use crate::store::database::Database;
 use crate::store::graph::GraphStorage;
 use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
-use crate::store::lance_io::write_lance_batch;
+use crate::store::lance_io::{read_lance_batches, write_lance_batch};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
+use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::txlog::commit_manifest_and_logs;
 use crate::types::ScalarType;
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
 const SCHEMA_IR_FILENAME: &str = "schema.ir.json";
+
+struct MigrationDataView {
+    metadata: DatabaseMetadata,
+    node_batches: HashMap<String, Option<RecordBatch>>,
+    edge_batches: HashMap<String, Option<RecordBatch>>,
+}
+
+impl MigrationDataView {
+    fn open(db_path: &Path) -> Result<Self> {
+        Ok(Self {
+            metadata: DatabaseMetadata::open(db_path)?,
+            node_batches: HashMap::new(),
+            edge_batches: HashMap::new(),
+        })
+    }
+
+    fn metadata(&self) -> &DatabaseMetadata {
+        &self.metadata
+    }
+
+    async fn node_batch(&mut self, type_name: &str) -> Result<Option<RecordBatch>> {
+        if let Some(batch) = self.node_batches.get(type_name) {
+            return Ok(batch.clone());
+        }
+        let batch = read_dataset_batch(self.metadata.node_dataset_locator(type_name)).await?;
+        self.node_batches.insert(type_name.to_string(), batch.clone());
+        Ok(batch)
+    }
+
+    async fn edge_batch(&mut self, type_name: &str) -> Result<Option<RecordBatch>> {
+        if let Some(batch) = self.edge_batches.get(type_name) {
+            return Ok(batch.clone());
+        }
+        let batch = read_dataset_batch(self.metadata.edge_dataset_locator(type_name)).await?;
+        self.edge_batches.insert(type_name.to_string(), batch.clone());
+        Ok(batch)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PropertyStorageKind {
+    Node,
+    Edge,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -402,10 +446,11 @@ async fn plan_schema_migration(
     manifest.next_type_id = next_type_id;
     manifest.next_prop_id = next_prop_id;
 
-    // Open once so planner can validate cast/nullability/endpoint rebind against existing data.
-    let db = Database::open(db_path).await?;
+    // Open metadata and manifest-pinned datasets so planner can validate cast/nullability
+    // and endpoint rebind against existing data without restoring a full GraphStorage snapshot.
+    let mut data_view = MigrationDataView::open(db_path)?;
     let mut steps = Vec::new();
-    diff_schema(&old_ir, &new_ir, &db, &mut steps, &mut blocked)?;
+    diff_schema(&old_ir, &new_ir, &mut data_view, &mut steps, &mut blocked).await?;
 
     let new_ir_json = serde_json::to_string_pretty(&new_ir)
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
@@ -1618,10 +1663,10 @@ fn prop_display_type(prop: &PropDef) -> String {
     }
 }
 
-fn diff_schema(
+async fn diff_schema(
     old_ir: &SchemaIR,
     new_ir: &SchemaIR,
-    db: &Database,
+    data_view: &mut MigrationDataView,
     steps: &mut Vec<PlannedStep>,
     blocked: &mut Vec<String>,
 ) -> Result<()> {
@@ -1689,14 +1734,15 @@ fn diff_schema(
                         source_type_name: &old_node.name,
                         display_type_name: &new_node.name,
                         type_id: old_node.type_id,
+                        storage_kind: PropertyStorageKind::Node,
                     },
                     &old_node.properties,
                     &new_node.properties,
-                    get_node_column,
-                    db,
+                    data_view,
                     steps,
                     blocked,
-                )?;
+                )
+                .await?;
             }
         }
     }
@@ -1745,7 +1791,8 @@ fn diff_schema(
                 if old_edge.src_type_id != new_edge.src_type_id
                     || old_edge.dst_type_id != new_edge.dst_type_id
                 {
-                    let (safety, reason) = classify_endpoint_rebind(db, old_ir, old_edge, new_edge);
+                    let (safety, reason) =
+                        classify_endpoint_rebind(data_view, old_ir, old_edge, new_edge).await;
                     if safety == MigrationSafety::Blocked {
                         blocked.push(reason.clone());
                     }
@@ -1768,14 +1815,15 @@ fn diff_schema(
                         source_type_name: &old_edge.name,
                         display_type_name: &new_edge.name,
                         type_id: old_edge.type_id,
+                        storage_kind: PropertyStorageKind::Edge,
                     },
                     &old_edge.properties,
                     &new_edge.properties,
-                    get_edge_column,
-                    db,
+                    data_view,
                     steps,
                     blocked,
-                )?;
+                )
+                .await?;
             }
         }
     }
@@ -1800,20 +1848,17 @@ struct PropertyDiffTarget<'a> {
     source_type_name: &'a str,
     display_type_name: &'a str,
     type_id: u32,
+    storage_kind: PropertyStorageKind,
 }
 
-fn diff_properties<F>(
+async fn diff_properties(
     target: PropertyDiffTarget<'_>,
     old_props: &[PropDef],
     new_props: &[PropDef],
-    column_getter: F,
-    db: &Database,
+    data_view: &mut MigrationDataView,
     steps: &mut Vec<PlannedStep>,
     blocked: &mut Vec<String>,
-) -> Result<()>
-where
-    F: Fn(&Database, &str, &str) -> Result<Option<ArrayRef>>,
-{
+) -> Result<()> {
     let old_by_id = old_props
         .iter()
         .map(|p| (p.prop_id, p))
@@ -1864,13 +1909,14 @@ where
                 }
                 if old_p.scalar_type != new_p.scalar_type {
                     let (safety, reason) = classify_type_change(
-                        db,
+                        data_view,
+                        target.storage_kind,
                         target.source_type_name,
                         target.display_type_name,
                         &old_p.name,
                         &new_p.scalar_type,
-                        &column_getter,
-                    )?;
+                    )
+                    .await?;
                     if safety == MigrationSafety::Blocked {
                         blocked.push(reason.clone());
                     }
@@ -1889,14 +1935,15 @@ where
                 }
                 if old_p.nullable != new_p.nullable {
                     let (safety, reason) = classify_nullability_change(
-                        db,
+                        data_view,
+                        target.storage_kind,
                         target.source_type_name,
                         target.display_type_name,
                         &old_p.name,
                         old_p.nullable,
                         new_p.nullable,
-                        &column_getter,
-                    )?;
+                    )
+                    .await?;
                     if safety == MigrationSafety::Blocked {
                         blocked.push(reason.clone());
                     }
@@ -1934,22 +1981,19 @@ where
     Ok(())
 }
 
-fn classify_type_change<F>(
-    db: &Database,
+async fn classify_type_change(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
     source_type_name: &str,
     display_type_name: &str,
     old_prop_name: &str,
     target_scalar: &str,
-    column_getter: &F,
-) -> Result<(MigrationSafety, String)>
-where
-    F: Fn(&Database, &str, &str) -> Result<Option<ArrayRef>>,
-{
+) -> Result<(MigrationSafety, String)> {
     let target = ScalarType::from_str_name(target_scalar)
         .ok_or_else(|| NanoError::Catalog(format!("unknown scalar type: {}", target_scalar)))?
         .to_arrow();
 
-    match column_getter(db, source_type_name, old_prop_name)? {
+    match get_property_column(data_view, storage_kind, source_type_name, old_prop_name).await? {
         None => Ok((
             MigrationSafety::Confirm,
             "type change requires data cast".to_string(),
@@ -1973,20 +2017,18 @@ where
     }
 }
 
-fn classify_nullability_change<F>(
-    db: &Database,
+async fn classify_nullability_change(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
     source_type_name: &str,
     display_type_name: &str,
     old_prop_name: &str,
     old_nullable: bool,
     new_nullable: bool,
-    column_getter: &F,
-) -> Result<(MigrationSafety, String)>
-where
-    F: Fn(&Database, &str, &str) -> Result<Option<ArrayRef>>,
-{
+) -> Result<(MigrationSafety, String)> {
     if old_nullable && !new_nullable {
-        if let Some(col) = column_getter(db, source_type_name, old_prop_name)?
+        if let Some(col) =
+            get_property_column(data_view, storage_kind, source_type_name, old_prop_name).await?
             && col.null_count() > 0
         {
             return Ok((
@@ -2015,27 +2057,55 @@ where
     ))
 }
 
-fn classify_endpoint_rebind(
-    db: &Database,
+async fn classify_endpoint_rebind(
+    data_view: &mut MigrationDataView,
     old_ir: &SchemaIR,
     old_edge: &EdgeTypeDef,
     new_edge: &EdgeTypeDef,
 ) -> (MigrationSafety, String) {
-    let storage = db.snapshot();
-    let Some(seg) = storage.edge_segments.get(&old_edge.name) else {
-        return (
-            MigrationSafety::Blocked,
-            format!("edge segment for `{}` not found", old_edge.name),
-        );
+    let edge_batch = match data_view.edge_batch(&old_edge.name).await {
+        Ok(batch) => batch,
+        Err(err) => {
+            return (
+                MigrationSafety::Blocked,
+                format!("failed to read edge batch for `{}`: {}", old_edge.name, err),
+            );
+        }
     };
-    if seg.edge_ids.is_empty() {
+    let Some(edge_batch) = edge_batch else {
         return (
             MigrationSafety::Safe,
             "edge endpoint rebind has no existing rows".to_string(),
         );
-    }
+    };
+    let Some(src_ids) = edge_batch
+        .column_by_name("src")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+    else {
+        return (
+            MigrationSafety::Blocked,
+            format!("edge batch for `{}` is missing UInt64 src column", old_edge.name),
+        );
+    };
+    let Some(dst_ids) = edge_batch
+        .column_by_name("dst")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+    else {
+        return (
+            MigrationSafety::Blocked,
+            format!("edge batch for `{}` is missing UInt64 dst column", old_edge.name),
+        );
+    };
 
-    let node_sets = build_node_id_sets_by_type_id(old_ir, storage.as_ref());
+    let node_sets = match build_node_id_sets_by_type_id(old_ir, data_view).await {
+        Ok(sets) => sets,
+        Err(err) => {
+            return (
+                MigrationSafety::Blocked,
+                format!("failed to read node ids for endpoint validation: {}", err),
+            );
+        }
+    };
     let new_src = node_sets.get(&new_edge.src_type_id);
     let new_dst = node_sets.get(&new_edge.dst_type_id);
     if new_src.is_none() || new_dst.is_none() {
@@ -2051,8 +2121,8 @@ fn classify_endpoint_rebind(
     let new_dst = new_dst.expect("checked above");
 
     let mut invalid = 0usize;
-    for i in 0..seg.edge_ids.len() {
-        if !new_src.contains(&seg.src_ids[i]) || !new_dst.contains(&seg.dst_ids[i]) {
+    for i in 0..edge_batch.num_rows() {
+        if !new_src.contains(&src_ids.value(i)) || !new_dst.contains(&dst_ids.value(i)) {
             invalid += 1;
         }
     }
@@ -2073,17 +2143,17 @@ fn classify_endpoint_rebind(
     }
 }
 
-fn build_node_id_sets_by_type_id(
+async fn build_node_id_sets_by_type_id(
     old_ir: &SchemaIR,
-    storage: &GraphStorage,
-) -> HashMap<u32, HashSet<u64>> {
+    data_view: &mut MigrationDataView,
+) -> Result<HashMap<u32, HashSet<u64>>> {
     let mut out = HashMap::new();
     for ty in &old_ir.types {
         let TypeDef::Node(n) = ty else {
             continue;
         };
         let mut set = HashSet::new();
-        if let Ok(Some(batch)) = storage.get_all_nodes(&n.name)
+        if let Some(batch) = data_view.node_batch(&n.name).await?
             && let Some(col) = batch.column_by_name("id")
             && let Some(ids) = col.as_any().downcast_ref::<UInt64Array>()
         {
@@ -2093,23 +2163,20 @@ fn build_node_id_sets_by_type_id(
         }
         out.insert(n.type_id, set);
     }
-    out
+    Ok(out)
 }
 
-fn get_node_column(db: &Database, type_name: &str, prop_name: &str) -> Result<Option<ArrayRef>> {
-    let storage = db.snapshot();
-    let Some(batch) = storage.get_all_nodes(type_name)? else {
-        return Ok(None);
+async fn get_property_column(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
+    type_name: &str,
+    prop_name: &str,
+) -> Result<Option<ArrayRef>> {
+    let batch = match storage_kind {
+        PropertyStorageKind::Node => data_view.node_batch(type_name).await?,
+        PropertyStorageKind::Edge => data_view.edge_batch(type_name).await?,
     };
-    Ok(batch.column_by_name(prop_name).cloned())
-}
-
-fn get_edge_column(db: &Database, type_name: &str, prop_name: &str) -> Result<Option<ArrayRef>> {
-    let storage = db.snapshot();
-    let Some(batch) = storage.edge_batch_for_save(type_name)? else {
-        return Ok(None);
-    };
-    Ok(batch.column_by_name(prop_name).cloned())
+    Ok(batch.and_then(|batch| batch.column_by_name(prop_name).cloned()))
 }
 
 async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> Result<()> {
@@ -2131,8 +2198,6 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
         )));
     }
 
-    let old_db = Database::open(db_path).await?;
-
     let mut journal = MigrationJournal {
         version: 1,
         state: JournalState::Prepared,
@@ -2149,7 +2214,9 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
     write_journal(&names.journal_path, &journal)?;
 
     let new_catalog = build_catalog_from_ir(&planned.new_ir)?;
-    let new_storage = transform_storage_for_new_schema(&old_db, &planned.new_ir, &new_catalog)?;
+    let mut data_view = MigrationDataView::open(db_path)?;
+    let new_storage =
+        transform_storage_for_new_schema(&mut data_view, &planned.new_ir, &new_catalog).await?;
 
     if names.staging_path.exists() {
         std::fs::remove_dir_all(&names.staging_path)?;
@@ -2266,16 +2333,15 @@ fn write_journal(path: &Path, journal: &MigrationJournal) -> Result<()> {
     Ok(())
 }
 
-fn transform_storage_for_new_schema(
-    old_db: &Database,
+async fn transform_storage_for_new_schema(
+    data_view: &mut MigrationDataView,
     new_ir: &SchemaIR,
     new_catalog: &Catalog,
 ) -> Result<GraphStorage> {
     let mut out = GraphStorage::new(new_catalog.clone());
-    let old_storage = old_db.snapshot();
+    let old_ir = data_view.metadata().schema_ir().clone();
 
-    let old_nodes_by_id = old_db
-        .schema_ir
+    let old_nodes_by_id = old_ir
         .types
         .iter()
         .filter_map(|t| match t {
@@ -2283,8 +2349,7 @@ fn transform_storage_for_new_schema(
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    let old_edges_by_id = old_db
-        .schema_ir
+    let old_edges_by_id = old_ir
         .types
         .iter()
         .filter_map(|t| match t {
@@ -2300,7 +2365,7 @@ fn transform_storage_for_new_schema(
         let Some(old_node) = old_nodes_by_id.get(&new_node.type_id) else {
             continue;
         };
-        let Some(old_batch) = old_storage.get_all_nodes(&old_node.name)? else {
+        let Some(old_batch) = data_view.node_batch(&old_node.name).await? else {
             continue;
         };
         let old_props_by_id = old_node
@@ -2364,7 +2429,7 @@ fn transform_storage_for_new_schema(
         let Some(old_edge) = old_edges_by_id.get(&new_edge.type_id) else {
             continue;
         };
-        let Some(old_batch) = old_storage.edge_batch_for_save(&old_edge.name)? else {
+        let Some(old_batch) = data_view.edge_batch(&old_edge.name).await? else {
             continue;
         };
         let old_props_by_id = old_edge
@@ -2508,6 +2573,23 @@ fn collect_node_ids(storage: &GraphStorage, type_name: &str) -> Result<HashSet<u
         }
     }
     Ok(set)
+}
+
+async fn read_dataset_batch(locator: Option<DatasetLocator>) -> Result<Option<RecordBatch>> {
+    let Some(locator) = locator else {
+        return Ok(None);
+    };
+    let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    if batches.len() == 1 {
+        return Ok(Some(batches[0].clone()));
+    }
+    let schema = batches[0].schema();
+    let batch = arrow_select::concat::concat_batches(&schema, &batches)
+        .map_err(|e| NanoError::Storage(format!("concat migration batch error: {}", e)))?;
+    Ok(Some(batch))
 }
 
 fn propdef_to_prop_type(prop: &PropDef) -> Result<crate::types::PropType> {

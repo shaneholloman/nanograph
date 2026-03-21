@@ -21,6 +21,9 @@ pub struct GraphStorage {
     pub node_segments: HashMap<String, NodeSegment>,
     pub edge_segments: HashMap<String, EdgeSegment>,
     node_dataset_paths: HashMap<String, PathBuf>,
+    node_dataset_versions: HashMap<String, u64>,
+    edge_dataset_paths: HashMap<String, PathBuf>,
+    edge_dataset_versions: HashMap<String, u64>,
     next_node_id: u64,
     next_edge_id: u64,
 }
@@ -85,6 +88,9 @@ impl GraphStorage {
             node_segments,
             edge_segments,
             node_dataset_paths: HashMap::new(),
+            node_dataset_versions: HashMap::new(),
+            edge_dataset_paths: HashMap::new(),
+            edge_dataset_versions: HashMap::new(),
             next_node_id: 0,
             next_edge_id: 0,
         }
@@ -281,6 +287,19 @@ impl GraphStorage {
         self.load_node_batch(type_name, batch)
     }
 
+    pub fn clear_node_type(&mut self, type_name: &str) -> Result<()> {
+        let segment = self
+            .node_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown node type: {}", type_name)))?;
+        segment.batches.clear();
+        segment.id_to_row.clear();
+        segment.next_local_id = 0;
+        self.node_dataset_paths.remove(type_name);
+        self.node_dataset_versions.remove(type_name);
+        Ok(())
+    }
+
     /// Load edge data from a combined batch (edge_id, src, dst, ...props).
     /// Extracts vectors and optional property columns.
     pub fn load_edge_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
@@ -392,6 +411,27 @@ impl GraphStorage {
         Ok(Some(batch))
     }
 
+    pub fn replace_edge_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
+        self.clear_edge_type(type_name)?;
+        self.load_edge_batch(type_name, batch)
+    }
+
+    pub fn clear_edge_type(&mut self, type_name: &str) -> Result<()> {
+        let segment = self
+            .edge_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", type_name)))?;
+        segment.src_ids.clear();
+        segment.dst_ids.clear();
+        segment.edge_ids.clear();
+        segment.batches.clear();
+        segment.csr = None;
+        segment.csc = None;
+        self.edge_dataset_paths.remove(type_name);
+        self.edge_dataset_versions.remove(type_name);
+        Ok(())
+    }
+
     pub fn set_next_node_id(&mut self, id: u64) {
         self.next_node_id = id;
     }
@@ -412,12 +452,44 @@ impl GraphStorage {
         self.node_dataset_paths.insert(type_name.to_string(), path);
     }
 
+    pub fn set_node_dataset_version(&mut self, type_name: &str, version: u64) {
+        self.node_dataset_versions
+            .insert(type_name.to_string(), version);
+    }
+
     pub fn clear_node_dataset_paths(&mut self) {
         self.node_dataset_paths.clear();
+        self.node_dataset_versions.clear();
+    }
+
+    pub fn clear_edge_dataset_paths(&mut self) {
+        self.edge_dataset_paths.clear();
+        self.edge_dataset_versions.clear();
     }
 
     pub fn node_dataset_path(&self, type_name: &str) -> Option<&Path> {
         self.node_dataset_paths.get(type_name).map(|p| p.as_path())
+    }
+
+    pub fn node_dataset_version(&self, type_name: &str) -> Option<u64> {
+        self.node_dataset_versions.get(type_name).copied()
+    }
+
+    pub fn set_edge_dataset_path(&mut self, type_name: &str, path: PathBuf) {
+        self.edge_dataset_paths.insert(type_name.to_string(), path);
+    }
+
+    pub fn set_edge_dataset_version(&mut self, type_name: &str, version: u64) {
+        self.edge_dataset_versions
+            .insert(type_name.to_string(), version);
+    }
+
+    pub fn edge_dataset_path(&self, type_name: &str) -> Option<&Path> {
+        self.edge_dataset_paths.get(type_name).map(|p| p.as_path())
+    }
+
+    pub fn edge_dataset_version(&self, type_name: &str) -> Option<u64> {
+        self.edge_dataset_versions.get(type_name).copied()
     }
 }
 

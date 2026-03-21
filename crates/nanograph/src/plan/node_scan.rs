@@ -75,6 +75,11 @@ impl NodeScanExec {
     fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: CompOp) -> Result<BooleanArray> {
         use arrow_ord::cmp;
 
+        if op == CompOp::Contains {
+            return literal_utils::compare_list_membership(left, right)
+                .map_err(datafusion_common::DataFusionError::Execution);
+        }
+
         match op {
             CompOp::Eq => cmp::eq(left, right),
             CompOp::Ne => cmp::neq(left, right),
@@ -82,6 +87,7 @@ impl NodeScanExec {
             CompOp::Lt => cmp::lt(left, right),
             CompOp::Ge => cmp::gt_eq(left, right),
             CompOp::Le => cmp::lt_eq(left, right),
+            CompOp::Contains => unreachable!("handled above"),
         }
         .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))
     }
@@ -104,7 +110,8 @@ impl NodeScanExec {
                 .clone();
 
             let right = Self::literal_to_array(&predicate.literal, current.num_rows())?;
-            let right = if left.data_type() != right.data_type() {
+            let right = if predicate.op != CompOp::Contains && left.data_type() != right.data_type()
+            {
                 arrow_cast::cast(&right, left.data_type())
                     .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?
             } else {
@@ -239,6 +246,12 @@ impl NodeScanExec {
                 CompOp::Lt => "<",
                 CompOp::Ge => ">=",
                 CompOp::Le => "<=",
+                CompOp::Contains => {
+                    return Err(format!(
+                        "membership predicate for property {} is not supported in Lance SQL pushdown",
+                        pred.property
+                    ));
+                }
             };
             let lit = Self::literal_to_lance_sql(&pred.literal).ok_or_else(|| {
                 format!(
@@ -331,11 +344,22 @@ impl ExecutionPlan for NodeScanExec {
             };
             let filter_sql_for_debug = filter_sql.clone();
             let limit = self.limit.and_then(|v| i64::try_from(v).ok());
+            let dataset_version = self.storage.node_dataset_version(&self.type_name);
             let stream = futures::stream::once(async move {
                 let uri = dataset_path.to_string_lossy().to_string();
                 let dataset = Dataset::open(&uri).await.map_err(|e| {
                     DataFusionError::Execution(format!("lance dataset open error: {}", e))
                 })?;
+                let dataset = if let Some(version) = dataset_version {
+                    dataset.checkout_version(version).await.map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "lance dataset checkout version {} error: {}",
+                            version, e
+                        ))
+                    })?
+                } else {
+                    dataset
+                };
                 let mut scanner = dataset.scan();
                 scanner.project(&projected_columns).map_err(|e| {
                     DataFusionError::Execution(format!("lance projection pushdown error: {}", e))
@@ -386,6 +410,7 @@ impl ExecutionPlan for NodeScanExec {
                 node_type = %self.type_name,
                 filter_sql = ?filter_sql_for_debug,
                 limit = ?self.limit,
+                dataset_version = ?dataset_version,
                 index_eligible = self.has_index_eligible_pushdown(),
                 "using Lance-native node scan pushdown path"
             );

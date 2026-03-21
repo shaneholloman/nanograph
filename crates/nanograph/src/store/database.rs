@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ahash::AHashMap;
 use arrow_array::{BooleanArray, RecordBatch};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -14,6 +15,7 @@ use crate::catalog::schema_ir::{SchemaIR, build_catalog_from_ir, build_schema_ir
 use crate::error::{NanoError, Result};
 use crate::ir::{ParamMap, QueryIR};
 use crate::plan::physical::execute_mutation;
+use crate::plan::planner::execute_query_with_edge_index_cache;
 use crate::query::ast::{Literal, NOW_PARAM_NAME, QueryDecl};
 use crate::query::parser::parse_query;
 use crate::query::typecheck::{
@@ -24,21 +26,25 @@ use crate::query_input::{
 };
 use crate::result::{MutationResult, QueryResult, RunResult};
 use crate::schema::parser::parse_schema;
+use crate::store::csr::CsrIndex;
 use crate::store::graph::GraphStorage;
-use crate::store::lance_io::read_lance_batches;
+use crate::store::lance_io::{read_lance_batches, read_lance_projected_batches};
 use crate::store::manifest::{GraphManifest, hash_string};
-use crate::store::migration::reconcile_migration_sidecars;
-use crate::store::txlog::{CdcLogEntry, reconcile_logs_to_manifest};
-use crate::{execute_query, lower_mutation_query, lower_query};
+use crate::store::metadata::{DatabaseMetadata, SCHEMA_IR_FILENAME};
+use crate::{lower_mutation_query, lower_query};
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
-const SCHEMA_IR_FILENAME: &str = "schema.ir.json";
 const CDC_ANALYTICS_DATASET_DIR: &str = "__cdc_analytics";
 const CDC_ANALYTICS_STATE_FILE: &str = "__cdc_analytics.state.json";
 
-mod cdc;
+pub(crate) mod cdc;
 mod maintenance;
+pub(crate) mod mutation;
 mod persist;
+
+pub use maintenance::{cleanup_database, compact_database};
+pub(crate) use mutation::DatasetMutationPlan;
+pub use persist::{load_database_file_sparse, run_mutation_query_sparse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOp {
@@ -194,14 +200,13 @@ struct CdcAnalyticsState {
 enum MutationSource {
     LoadString { mode: LoadMode, data_source: String },
     LoadFile { mode: LoadMode, data_path: PathBuf },
-    PreparedStorage(Box<GraphStorage>),
+    PreparedDatasets(DatasetMutationPlan),
 }
 
 #[derive(Debug, Clone)]
 struct MutationPlan {
     source: MutationSource,
     op_summary: String,
-    cdc_events: Vec<CdcLogEntry>,
 }
 
 impl MutationPlan {
@@ -212,7 +217,6 @@ impl MutationPlan {
                 data_source: data_source.to_string(),
             },
             op_summary: load_mode_op_summary(mode).to_string(),
-            cdc_events: Vec::new(),
         }
     }
 
@@ -223,7 +227,6 @@ impl MutationPlan {
                 data_path: data_path.to_path_buf(),
             },
             op_summary: load_mode_op_summary(mode).to_string(),
-            cdc_events: Vec::new(),
         }
     }
 
@@ -234,7 +237,6 @@ impl MutationPlan {
                 data_source: data_source.to_string(),
             },
             op_summary: op_summary.to_string(),
-            cdc_events: Vec::new(),
         }
     }
 
@@ -245,15 +247,13 @@ impl MutationPlan {
                 data_source: data_source.to_string(),
             },
             op_summary: op_summary.to_string(),
-            cdc_events: Vec::new(),
         }
     }
 
-    fn prepared_storage(storage: GraphStorage, op_summary: &str) -> Self {
+    fn prepared_datasets(plan: DatasetMutationPlan) -> Self {
         Self {
-            source: MutationSource::PreparedStorage(Box::new(storage)),
-            op_summary: op_summary.to_string(),
-            cdc_events: Vec::new(),
+            op_summary: plan.op_summary.clone(),
+            source: MutationSource::PreparedDatasets(plan),
         }
     }
 }
@@ -265,6 +265,7 @@ pub struct DatabaseShared {
     pub catalog: Catalog,
     storage: RwLock<Arc<GraphStorage>>,
     writer: Mutex<()>,
+    edge_index_cache: Arc<EdgeIndexCache>,
 }
 
 #[derive(Clone)]
@@ -276,11 +277,80 @@ pub(crate) struct DatabaseWriteGuard<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
+#[derive(Debug)]
+pub(crate) struct EdgeIndexPair {
+    pub(crate) csr: Arc<CsrIndex>,
+    pub(crate) csc: Arc<CsrIndex>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EdgeIndexCache {
+    inner: Mutex<AHashMap<(String, u64), Arc<EdgeIndexPair>>>,
+}
+
+impl EdgeIndexCache {
+    pub(crate) async fn get_or_build(
+        &self,
+        edge_type: &str,
+        dataset_path: &Path,
+        dataset_version: u64,
+        max_node_id: u64,
+    ) -> Result<Arc<EdgeIndexPair>> {
+        let key = (edge_type.to_string(), dataset_version);
+        let mut guard = self.inner.lock().await;
+        if let Some(pair) = guard.get(&key) {
+            return Ok(pair.clone());
+        }
+
+        let batches =
+            read_lance_projected_batches(dataset_path, dataset_version, &["id", "src", "dst"])
+                .await?;
+        let mut out_edges = Vec::new();
+        let mut in_edges = Vec::new();
+        for batch in batches {
+            let id_arr = batch
+                .column_by_name("id")
+                .ok_or_else(|| NanoError::Storage("edge batch missing id column".to_string()))?
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| NanoError::Storage("edge id column is not UInt64".to_string()))?;
+            let src_arr = batch
+                .column_by_name("src")
+                .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| NanoError::Storage("edge src column is not UInt64".to_string()))?;
+            let dst_arr = batch
+                .column_by_name("dst")
+                .ok_or_else(|| NanoError::Storage("edge batch missing dst column".to_string()))?
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| NanoError::Storage("edge dst column is not UInt64".to_string()))?;
+
+            for row in 0..batch.num_rows() {
+                let edge_id = id_arr.value(row);
+                let src = src_arr.value(row);
+                let dst = dst_arr.value(row);
+                out_edges.push((src, dst, edge_id));
+                in_edges.push((dst, src, edge_id));
+            }
+        }
+
+        let pair = Arc::new(EdgeIndexPair {
+            csr: Arc::new(CsrIndex::build(max_node_id as usize, &mut out_edges)),
+            csc: Arc::new(CsrIndex::build(max_node_id as usize, &mut in_edges)),
+        });
+        guard.insert(key, pair.clone());
+        Ok(pair)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedReadQuery {
     ir: QueryIR,
     output_schema: arrow_schema::SchemaRef,
     storage: Arc<GraphStorage>,
+    edge_index_cache: Arc<EdgeIndexCache>,
 }
 
 impl PreparedReadQuery {
@@ -288,17 +358,25 @@ impl PreparedReadQuery {
         ir: QueryIR,
         output_schema: arrow_schema::SchemaRef,
         storage: Arc<GraphStorage>,
+        edge_index_cache: Arc<EdgeIndexCache>,
     ) -> Self {
         Self {
             ir,
             output_schema,
             storage,
+            edge_index_cache,
         }
     }
 
     pub async fn execute(&self, params: &ParamMap) -> Result<QueryResult> {
         let runtime_params = params_with_runtime_now(params)?;
-        let batches = execute_query(&self.ir, self.storage.clone(), &runtime_params).await?;
+        let batches = execute_query_with_edge_index_cache(
+            &self.ir,
+            self.storage.clone(),
+            &runtime_params,
+            self.edge_index_cache.clone(),
+        )
+        .await?;
         Ok(QueryResult::new(self.output_schema.clone(), batches))
     }
 
@@ -384,36 +462,10 @@ impl Database {
     #[instrument(fields(db_path = %db_path.display()))]
     pub async fn open(db_path: &Path) -> Result<Self> {
         info!("opening database");
-        reconcile_migration_sidecars(db_path)?;
-        if !db_path.exists() {
-            return Err(NanoError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("database not found: {}", db_path.display()),
-            )));
-        }
-
-        // Read schema IR
-        let ir_json = std::fs::read_to_string(db_path.join(SCHEMA_IR_FILENAME))?;
-        let schema_ir: SchemaIR = serde_json::from_str(&ir_json)
-            .map_err(|e| NanoError::Manifest(format!("parse IR error: {}", e)))?;
-
-        // Build catalog from IR
-        let catalog = build_catalog_from_ir(&schema_ir)?;
-
-        // Read manifest
-        let manifest = GraphManifest::read(db_path)?;
-
-        // Verify schema hash matches manifest
-        let computed_hash = hash_string(&ir_json);
-        if computed_hash != manifest.schema_ir_hash {
-            return Err(NanoError::Manifest(format!(
-                "schema mismatch: schema.ir.json has been modified since last load \
-                 (expected hash {}, got {}). Re-run 'nanograph load' to update.",
-                &manifest.schema_ir_hash[..8.min(manifest.schema_ir_hash.len())],
-                &computed_hash[..8.min(computed_hash.len())]
-            )));
-        }
-        reconcile_logs_to_manifest(db_path, manifest.db_version)?;
+        let metadata = DatabaseMetadata::open(db_path)?;
+        let schema_ir = metadata.schema_ir().clone();
+        let catalog = metadata.catalog().clone();
+        let manifest = metadata.manifest().clone();
 
         // Create storage and set ID counters
         let mut storage = GraphStorage::new(catalog.clone());
@@ -438,12 +490,15 @@ impl Database {
                         storage.load_node_batch(&entry.type_name, batch)?;
                     }
                     storage.set_node_dataset_path(&entry.type_name, dataset_path);
+                    storage.set_node_dataset_version(&entry.type_name, entry.dataset_version);
                 }
                 "edge" => {
                     let batches = read_lance_batches(&dataset_path, entry.dataset_version).await?;
                     for batch in batches {
                         storage.load_edge_batch(&entry.type_name, batch)?;
                     }
+                    storage.set_edge_dataset_path(&entry.type_name, dataset_path);
+                    storage.set_edge_dataset_version(&entry.type_name, entry.dataset_version);
                 }
                 other => {
                     return Err(NanoError::Manifest(format!(
@@ -454,8 +509,6 @@ impl Database {
             }
         }
 
-        // Build CSR/CSC indices
-        storage.build_indices()?;
         info!(
             node_types = storage.node_segments.len(),
             edge_types = storage.edge_segments.len(),
@@ -486,6 +539,7 @@ impl Database {
                 catalog,
                 storage: RwLock::new(Arc::new(storage)),
                 writer: Mutex::new(()),
+                edge_index_cache: Arc::new(EdgeIndexCache::default()),
             }),
         }
     }
@@ -541,7 +595,12 @@ impl Database {
         let type_ctx = typecheck_query(&catalog, query)?;
         let output_schema = infer_query_result_schema(&catalog, query, &type_ctx)?;
         let ir = lower_query(&catalog, query, &type_ctx)?;
-        Ok(PreparedReadQuery::new(ir, output_schema, storage))
+        Ok(PreparedReadQuery::new(
+            ir,
+            output_schema,
+            storage,
+            self.edge_index_cache.clone(),
+        ))
     }
 
     pub fn prepare_read_query(&self, query: &QueryDecl) -> Result<PreparedReadQuery> {

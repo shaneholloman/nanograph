@@ -1,13 +1,12 @@
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use arrow_array::{ArrayRef, RecordBatch};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::instrument;
 
 use crate::ui::{stdout_supports_color, style_label};
-use nanograph::store::database::Database;
+use nanograph::store::export::build_export_rows_at_path;
 use nanograph::store::manifest::GraphManifest;
+use nanograph::store::metadata::DatabaseMetadata;
 
 #[instrument(fields(db = ?db_path.as_ref().map(|p| p.display().to_string())))]
 pub(crate) async fn cmd_version(db_path: Option<PathBuf>, json: bool, quiet: bool) -> Result<()> {
@@ -134,9 +133,8 @@ pub(crate) async fn cmd_describe(
     verbose: bool,
     quiet: bool,
 ) -> Result<()> {
-    let db = Database::open(&db_path).await?;
-    let manifest = GraphManifest::read(&db_path)?;
-    let payload = build_describe_payload(&db_path, &db, &manifest, type_name)?;
+    let metadata = DatabaseMetadata::open(&db_path)?;
+    let payload = build_describe_payload(&db_path, &metadata, type_name)?;
     let effective_format = if json { "json" } else { format };
 
     match effective_format {
@@ -158,29 +156,20 @@ pub(crate) async fn cmd_describe(
 
 pub(crate) fn build_describe_payload(
     db_path: &Path,
-    db: &Database,
-    manifest: &GraphManifest,
+    metadata: &DatabaseMetadata,
     type_name: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let storage = db.snapshot();
-    let dataset_map = manifest
-        .datasets
-        .iter()
-        .map(|d| ((d.kind.clone(), d.type_name.clone()), d))
-        .collect::<HashMap<_, _>>();
+    let manifest = metadata.manifest();
+    let schema_ir = metadata.schema_ir();
 
     let mut nodes = Vec::new();
-    for node in db.schema_ir.node_types() {
+    for node in schema_ir.node_types() {
         if let Some(type_name) = type_name
             && node.name != type_name
         {
             continue;
         }
-        let rows = storage
-            .get_all_nodes(&node.name)?
-            .map(|b| b.num_rows() as u64)
-            .unwrap_or(0);
-        let dataset = dataset_map.get(&("node".to_string(), node.name.clone()));
+        let dataset = metadata.dataset_entry("node", &node.name);
         let properties = node
             .properties
             .iter()
@@ -197,8 +186,7 @@ pub(crate) fn build_describe_payload(
                 })
             })
             .collect::<Vec<_>>();
-        let outgoing_edges = db
-            .schema_ir
+        let outgoing_edges = schema_ir
             .edge_types()
             .filter(|edge| edge.src_type_name == node.name)
             .map(|edge| {
@@ -208,8 +196,7 @@ pub(crate) fn build_describe_payload(
                 })
             })
             .collect::<Vec<_>>();
-        let incoming_edges = db
-            .schema_ir
+        let incoming_edges = schema_ir
             .edge_types()
             .filter(|edge| edge.dst_type_name == node.name)
             .map(|edge| {
@@ -228,7 +215,7 @@ pub(crate) fn build_describe_payload(
             "unique_properties": node.unique_properties().map(|prop| prop.name.clone()).collect::<Vec<_>>(),
             "outgoing_edges": outgoing_edges,
             "incoming_edges": incoming_edges,
-            "rows": rows,
+            "rows": dataset.map(|d| d.row_count).unwrap_or(0),
             "dataset_path": dataset.map(|d| d.dataset_path.clone()),
             "dataset_version": dataset.map(|d| d.dataset_version),
             "properties": properties,
@@ -236,17 +223,13 @@ pub(crate) fn build_describe_payload(
     }
 
     let mut edges = Vec::new();
-    for edge in db.schema_ir.edge_types() {
+    for edge in schema_ir.edge_types() {
         if let Some(type_name) = type_name
             && edge.name != type_name
         {
             continue;
         }
-        let rows = storage
-            .edge_batch_for_save(&edge.name)?
-            .map(|b| b.num_rows() as u64)
-            .unwrap_or(0);
-        let dataset = dataset_map.get(&("edge".to_string(), edge.name.clone()));
+        let dataset = metadata.dataset_entry("edge", &edge.name);
         let properties = edge
             .properties
             .iter()
@@ -267,10 +250,10 @@ pub(crate) fn build_describe_payload(
             "description": edge.description,
             "instruction": edge.instruction,
             "endpoint_keys": {
-                "src": db.schema_ir.node_key_property_name(&edge.src_type_name),
-                "dst": db.schema_ir.node_key_property_name(&edge.dst_type_name),
+                "src": schema_ir.node_key_property_name(&edge.src_type_name),
+                "dst": schema_ir.node_key_property_name(&edge.dst_type_name),
             },
-            "rows": rows,
+            "rows": dataset.map(|d| d.row_count).unwrap_or(0),
             "dataset_path": dataset.map(|d| d.dataset_path.clone()),
             "dataset_version": dataset.map(|d| d.dataset_version),
             "properties": properties,
@@ -297,7 +280,7 @@ pub(crate) fn build_describe_payload(
             "schema_identity_version": manifest.schema_identity_version,
             "datasets": manifest.datasets.len(),
         },
-        "schema_ir_version": db.schema_ir.ir_version,
+        "schema_ir_version": schema_ir.ir_version,
         "nodes": nodes,
         "edges": edges,
     }))
@@ -529,10 +512,9 @@ pub(crate) async fn cmd_export(
     json: bool,
     no_embeddings: bool,
 ) -> Result<()> {
-    let db = Database::open(&db_path).await?;
     let effective_format = if json { "json" } else { format };
     let include_internal_fields = effective_format == "json";
-    let rows = build_export_rows(&db, include_internal_fields, !no_embeddings)?;
+    let rows = build_export_rows(&db_path, include_internal_fields, !no_embeddings).await?;
 
     match effective_format {
         "jsonl" => {
@@ -554,208 +536,14 @@ pub(crate) async fn cmd_export(
     Ok(())
 }
 
-pub(crate) fn build_export_rows(
-    db: &Database,
+pub(crate) async fn build_export_rows(
+    db_path: &Path,
     include_internal_fields: bool,
     include_embeddings: bool,
 ) -> Result<Vec<serde_json::Value>> {
-    use arrow_array::{Array, UInt64Array};
-
-    let storage = db.snapshot();
-    let mut rows = Vec::new();
-    let mut node_key_tokens: HashMap<String, HashMap<u64, String>> = HashMap::new();
-
-    for node in db.schema_ir.node_types() {
-        let Some(batch) = storage.get_all_nodes(&node.name)? else {
-            continue;
-        };
-        let id_arr = batch
-            .column_by_name("id")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| eyre!("node batch '{}' missing UInt64 id column", node.name))?;
-        let key_prop = node
-            .properties
-            .iter()
-            .find(|prop| prop.key)
-            .map(|prop| prop.name.as_str());
-        let key_col = match key_prop {
-            Some(prop_name) => {
-                let key_idx =
-                    node_property_index(batch.schema().as_ref(), prop_name).ok_or_else(|| {
-                        eyre!(
-                            "node batch '{}' missing @key property '{}'",
-                            node.name,
-                            prop_name
-                        )
-                    })?;
-                Some((prop_name.to_string(), batch.column(key_idx).clone()))
-            }
-            None => None,
-        };
-
-        let mut key_tokens = HashMap::new();
-        for row_idx in 0..batch.num_rows() {
-            let id = id_arr.value(row_idx);
-            if let Some((prop_name, key_array)) = key_col.as_ref() {
-                let key_token = export_key_token(key_array, row_idx, prop_name)?;
-                key_tokens.insert(id, key_token);
-            }
-
-            let data = export_data_map(
-                &batch,
-                row_idx,
-                &[0],
-                node.properties.iter().filter_map(|prop| {
-                    if include_embeddings || !is_embedding_property(prop) {
-                        None
-                    } else {
-                        Some(prop.name.as_str())
-                    }
-                }),
-            );
-            let mut row = serde_json::json!({
-                "type": node.name,
-                "data": data,
-            });
-            if include_internal_fields {
-                row["id"] = serde_json::Value::Number(id.into());
-            }
-            rows.push(row);
-        }
-        if !key_tokens.is_empty() {
-            node_key_tokens.insert(node.name.clone(), key_tokens);
-        }
-    }
-
-    for edge in db.schema_ir.edge_types() {
-        let Some(batch) = storage.edge_batch_for_save(&edge.name)? else {
-            continue;
-        };
-        let id_arr = batch
-            .column_by_name("id")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>())
-            .ok_or_else(|| eyre!("edge batch '{}' missing UInt64 id column", edge.name))?;
-        let src_arr = batch
-            .column_by_name("src")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>())
-            .ok_or_else(|| eyre!("edge batch '{}' missing UInt64 src column", edge.name))?;
-        let dst_arr = batch
-            .column_by_name("dst")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>())
-            .ok_or_else(|| eyre!("edge batch '{}' missing UInt64 dst column", edge.name))?;
-
-        for row_idx in 0..batch.num_rows() {
-            let id = id_arr.value(row_idx);
-            let src = src_arr.value(row_idx);
-            let dst = dst_arr.value(row_idx);
-            let from = node_key_tokens
-                .get(&edge.src_type_name)
-                .and_then(|m| m.get(&src))
-                .cloned()
-                .ok_or_else(|| {
-                    eyre!(
-                        "cannot export portable edge '{}': source {} node {} is missing an @key token",
-                        edge.name,
-                        edge.src_type_name,
-                        src
-                    )
-                })?;
-            let to = node_key_tokens
-                .get(&edge.dst_type_name)
-                .and_then(|m| m.get(&dst))
-                .cloned()
-                .ok_or_else(|| {
-                    eyre!(
-                        "cannot export portable edge '{}': destination {} node {} is missing an @key token",
-                        edge.name,
-                        edge.dst_type_name,
-                        dst
-                    )
-                })?;
-            let data = export_data_map(
-                &batch,
-                row_idx,
-                &[0, 1, 2],
-                edge.properties.iter().filter_map(|prop| {
-                    if include_embeddings || !is_embedding_property(prop) {
-                        None
-                    } else {
-                        Some(prop.name.as_str())
-                    }
-                }),
-            );
-
-            let mut row = serde_json::json!({
-                "edge": edge.name,
-                "from": from,
-                "to": to,
-                "data": data,
-            });
-            if include_internal_fields {
-                row["id"] = serde_json::Value::Number(id.into());
-                row["src"] = serde_json::Value::Number(src.into());
-                row["dst"] = serde_json::Value::Number(dst.into());
-            }
-            rows.push(row);
-        }
-    }
-
-    Ok(rows)
-}
-
-fn node_property_index(schema: &arrow_schema::Schema, prop_name: &str) -> Option<usize> {
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(idx, field)| (field.name() == prop_name).then_some(idx))
-}
-
-fn export_key_token(array: &ArrayRef, row_idx: usize, prop_name: &str) -> Result<String> {
-    match nanograph::json_output::array_value_to_json(array, row_idx) {
-        serde_json::Value::Null => Err(eyre!("@key property {} cannot be null", prop_name)),
-        serde_json::Value::String(value) => Ok(value),
-        serde_json::Value::Bool(value) => Ok(value.to_string()),
-        serde_json::Value::Number(value) => Ok(value.to_string()),
-        other => Err(eyre!(
-            "unsupported @key export value for {}: {}",
-            prop_name,
-            other
-        )),
-    }
-}
-
-fn export_data_map<I, S>(
-    batch: &RecordBatch,
-    row_idx: usize,
-    excluded_indices: &[usize],
-    excluded_names: I,
-) -> serde_json::Value
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let excluded = excluded_indices.iter().copied().collect::<HashSet<_>>();
-    let excluded_names = excluded_names
-        .into_iter()
-        .map(|name| name.as_ref().to_string())
-        .collect::<HashSet<_>>();
-    let mut data = serde_json::Map::new();
-    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-        if excluded.contains(&col_idx) || excluded_names.contains(field.name()) {
-            continue;
-        }
-        data.insert(
-            field.name().clone(),
-            nanograph::json_output::array_value_to_json(batch.column(col_idx), row_idx),
-        );
-    }
-    serde_json::Value::Object(data)
-}
-
-fn is_embedding_property(prop: &nanograph::schema_ir::PropDef) -> bool {
-    prop.embed_source.is_some() || prop.scalar_type.starts_with("Vector(")
+    build_export_rows_at_path(db_path, include_internal_fields, include_embeddings)
+        .await
+        .map_err(Into::into)
 }
 
 fn prop_type_string(prop: &nanograph::schema_ir::PropDef) -> String {
