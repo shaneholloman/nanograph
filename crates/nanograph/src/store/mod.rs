@@ -4,9 +4,9 @@ pub(crate) mod lance_io;
 pub mod manifest;
 pub mod metadata;
 pub mod migration;
+pub(crate) mod runtime;
 pub mod txlog;
 
-pub use graph::GraphStorage;
 pub use indexing::{scalar_index_name, vector_index_name};
 
 pub(crate) mod csr;

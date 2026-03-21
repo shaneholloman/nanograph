@@ -1,11 +1,9 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
     StringArray, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 
@@ -13,11 +11,12 @@ use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema;
 use nanograph::schema_ir::SchemaIR;
-use nanograph::store::database::Database;
+use nanograph::store::database::{Database, LoadMode};
+use nanograph::store::export::build_export_rows_at_path;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::txlog::read_visible_cdc_entries;
-use nanograph::store::{GraphStorage, scalar_index_name, vector_index_name};
-use nanograph::{MutationExecResult, ParamMap, build_catalog, execute_query, lower_query};
+use nanograph::store::{scalar_index_name, vector_index_name};
+use nanograph::{MutationExecResult, ParamMap, build_catalog};
 
 fn test_schema() -> &'static str {
     r#"
@@ -134,62 +133,12 @@ fn test_data() -> &'static str {
 "#
 }
 
-fn setup_storage() -> Arc<GraphStorage> {
-    let schema = parse_schema(test_schema()).unwrap();
-    let catalog = build_catalog(&schema).unwrap();
-    let mut storage = GraphStorage::new(catalog);
-
-    // Insert people
-    let person_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("age", DataType::Int32, true),
-    ]));
-    let people = RecordBatch::try_new(
-        person_schema,
-        vec![
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Diana"])),
-            Arc::new(Int32Array::from(vec![
-                Some(30),
-                Some(25),
-                Some(35),
-                Some(28),
-            ])),
-        ],
-    )
-    .unwrap();
-    let person_ids = storage.insert_nodes("Person", people).unwrap();
-
-    // Insert companies
-    let company_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
-    let companies = RecordBatch::try_new(
-        company_schema,
-        vec![Arc::new(StringArray::from(vec!["Acme", "Globex"]))],
-    )
-    .unwrap();
-    let company_ids = storage.insert_nodes("Company", companies).unwrap();
-
-    // Edges: Alice->knows->Bob, Alice->knows->Charlie, Bob->knows->Diana
-    storage
-        .insert_edges(
-            "Knows",
-            &[person_ids[0], person_ids[0], person_ids[1]],
-            &[person_ids[1], person_ids[2], person_ids[3]],
-            None,
-        )
+async fn setup_storage() -> Database {
+    let db = Database::open_in_memory(test_schema()).await.unwrap();
+    db.load_with_mode(test_data(), LoadMode::Overwrite)
+        .await
         .unwrap();
-
-    // Edges: Alice->worksAt->Acme, Bob->worksAt->Globex
-    storage
-        .insert_edges(
-            "WorksAt",
-            &[person_ids[0], person_ids[1]],
-            &[company_ids[0], company_ids[1]],
-            None,
-        )
-        .unwrap();
-
-    storage.build_indices().unwrap();
-    Arc::new(storage)
+    db
 }
 
 fn manifest_dataset_version(manifest: &GraphManifest, kind: &str, type_name: &str) -> u64 {
@@ -201,21 +150,21 @@ fn manifest_dataset_version(manifest: &GraphManifest, kind: &str, type_name: &st
         .unwrap()
 }
 
-async fn run_query_test(query_str: &str, storage: Arc<GraphStorage>) -> Vec<RecordBatch> {
-    run_query_test_with_params(query_str, storage, &ParamMap::new()).await
+async fn run_query_test(query_str: &str, db: &Database) -> Vec<RecordBatch> {
+    run_query_test_with_params(query_str, db, &ParamMap::new()).await
 }
 
 async fn run_query_test_with_params(
     query_str: &str,
-    storage: Arc<GraphStorage>,
+    db: &Database,
     params: &ParamMap,
 ) -> Vec<RecordBatch> {
-    let catalog = &storage.catalog;
     let qf = parse_query(query_str).unwrap();
     let query = &qf.queries[0];
-    let tc = typecheck_query(catalog, query).unwrap();
-    let ir = lower_query(catalog, query, &tc).unwrap();
-    execute_query(&ir, storage, params).await.unwrap()
+    match db.run_query(query, params).await.unwrap() {
+        nanograph::RunResult::Query(result) => result.into_batches(),
+        nanograph::RunResult::Mutation(_) => panic!("expected query result"),
+    }
 }
 
 async fn run_db_query_test_with_params(
@@ -223,8 +172,12 @@ async fn run_db_query_test_with_params(
     db: &Database,
     params: &ParamMap,
 ) -> Vec<RecordBatch> {
-    let storage = db.snapshot();
-    run_query_test_with_params(query_str, storage, params).await
+    let qf = parse_query(query_str).unwrap();
+    let query = &qf.queries[0];
+    match db.run_query(query, params).await.unwrap() {
+        nanograph::RunResult::Query(result) => result.into_batches(),
+        nanograph::RunResult::Mutation(_) => panic!("expected query result"),
+    }
 }
 
 async fn run_db_mutation_test_with_params(
@@ -243,6 +196,12 @@ async fn run_db_mutation_test_with_params(
         },
         nanograph::RunResult::Query(_) => panic!("expected mutation result"),
     }
+}
+
+async fn export_rows_for_db(db: &Database) -> Vec<serde_json::Value> {
+    build_export_rows_at_path(db.path(), true, true)
+        .await
+        .expect("export rows")
 }
 
 fn extract_string_column(batches: &[RecordBatch], col_name: &str) -> Vec<String> {
@@ -346,7 +305,7 @@ fn extract_f64_column(batches: &[RecordBatch], col_name: &str) -> Vec<f64> {
 
 #[tokio::test]
 async fn test_bind_by_property() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let mut params = ParamMap::new();
     params.insert(
         "name".to_string(),
@@ -359,7 +318,7 @@ query q($name: String) {
     return { $p.name, $p.age }
 }
 "#,
-        storage,
+        &storage,
         &params,
     )
     .await;
@@ -370,7 +329,7 @@ query q($name: String) {
 
 #[tokio::test]
 async fn test_filter_age() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -381,7 +340,7 @@ query q() {
     return { $p.name, $p.age }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -486,7 +445,7 @@ query q($tag: String) {
 
 #[tokio::test]
 async fn test_inline_binding_filters_with_cross_join() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -497,7 +456,7 @@ query q() {
     return { $p.name as p_name, $q.name as q_name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -509,7 +468,7 @@ query q() {
 
 #[tokio::test]
 async fn test_multi_scan_explicit_filter_on_single_binding() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -521,7 +480,7 @@ query q() {
     return { $p.name as p_name, $q.name as q_name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -535,7 +494,7 @@ query q() {
 }
 #[tokio::test]
 async fn test_one_hop_traversal() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -546,7 +505,7 @@ query q() {
     return { $f.name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -772,56 +731,8 @@ query q($topic: String, $q: Vector(4)) {
 }
 
 #[tokio::test]
-async fn test_orphan_edge_destination_fails_execution() {
-    let schema = parse_schema(test_schema()).unwrap();
-    let catalog = build_catalog(&schema).unwrap();
-    let mut storage = GraphStorage::new(catalog.clone());
-
-    let person_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("age", DataType::Int32, true),
-    ]));
-    let people = RecordBatch::try_new(
-        person_schema,
-        vec![
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
-    let person_ids = storage.insert_nodes("Person", people).unwrap();
-
-    // Insert an orphan edge pointing to a non-existent destination ID.
-    storage
-        .insert_edges("Knows", &[person_ids[0]], &[999_999], None)
-        .unwrap();
-    storage.build_indices().unwrap();
-    let storage = Arc::new(storage);
-
-    let query = r#"
-query q() {
-    match {
-        $p: Person { name: "Alice" }
-        $p knows $f
-    }
-    return { $f.name }
-}
-"#;
-
-    let qf = parse_query(query).unwrap();
-    let q = &qf.queries[0];
-    let tc = typecheck_query(&storage.catalog, q).unwrap();
-    let ir = lower_query(&storage.catalog, q, &tc).unwrap();
-    let err = execute_query(&ir, storage, &ParamMap::new())
-        .await
-        .unwrap_err();
-
-    assert!(err.to_string().contains("missing destination node id"));
-}
-
-#[tokio::test]
 async fn test_two_hop_traversal() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -833,7 +744,7 @@ query q() {
     return { $fof.name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -844,7 +755,7 @@ query q() {
 
 #[tokio::test]
 async fn test_bounded_traversal_exact_two_hops() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -855,7 +766,7 @@ query q() {
     return { $x.name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -865,7 +776,7 @@ query q() {
 
 #[tokio::test]
 async fn test_bounded_traversal_range_one_to_two_hops() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -877,7 +788,7 @@ query q() {
     order { $x.name asc }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -885,9 +796,9 @@ query q() {
     assert_eq!(names, vec!["Bob", "Charlie", "Diana"]);
 }
 
-#[test]
-fn test_unbounded_traversal_is_rejected() {
-    let storage = setup_storage();
+#[tokio::test]
+async fn test_unbounded_traversal_is_rejected() {
+    let storage = setup_storage().await;
     let qf = parse_query(
         r#"
 query q() {
@@ -900,13 +811,13 @@ query q() {
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&storage.catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(storage.catalog(), &qf.queries[0]).unwrap_err();
     assert!(err.to_string().contains("unbounded traversal is disabled"));
 }
 
 #[tokio::test]
 async fn test_negation_unemployed() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -917,7 +828,7 @@ query q() {
     return { $p.name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -929,7 +840,7 @@ query q() {
 
 #[tokio::test]
 async fn test_negation_inner_filter_applies() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -943,7 +854,7 @@ query q() {
     return { $p.name }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -955,7 +866,7 @@ query q() {
 
 #[tokio::test]
 async fn test_aggregation_friend_counts() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -970,7 +881,7 @@ query q() {
     order { friends desc }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -992,7 +903,7 @@ query q() {
 
 #[tokio::test]
 async fn test_order_and_limit() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -1004,7 +915,7 @@ query q() {
     limit 2
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -1016,7 +927,7 @@ query q() {
 
 #[tokio::test]
 async fn test_limit_without_order() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -1028,7 +939,7 @@ query q() {
     limit 2
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -1038,7 +949,7 @@ query q() {
 
 #[tokio::test]
 async fn test_limit_with_single_scan_filter_pushdown() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let results = run_query_test(
         r#"
 query q() {
@@ -1050,7 +961,7 @@ query q() {
     limit 2
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -1060,7 +971,7 @@ query q() {
 
 #[tokio::test]
 async fn test_single_scan_filter_pushdown_parity_with_nonpushdown_tautology() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let pushed = run_query_test(
         r#"
 query q() {
@@ -1072,7 +983,7 @@ query q() {
     order { $p.name asc }
 }
 "#,
-        storage.clone(),
+        &storage,
     )
     .await;
     let mixed = run_query_test(
@@ -1087,7 +998,7 @@ query q() {
     order { $p.name asc }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -1099,7 +1010,7 @@ query q() {
 
 #[tokio::test]
 async fn test_multi_scan_filter_pushdown_parity_with_nonpushdown_tautology() {
-    let storage = setup_storage();
+    let storage = setup_storage().await;
     let pushed = run_query_test(
         r#"
 query q() {
@@ -1112,7 +1023,7 @@ query q() {
     order { $q.name asc }
 }
 "#,
-        storage.clone(),
+        &storage,
     )
     .await;
     let mixed = run_query_test(
@@ -1128,7 +1039,7 @@ query q() {
     order { $q.name asc }
 }
 "#,
-        storage,
+        &storage,
     )
     .await;
 
@@ -1227,8 +1138,24 @@ query add_knows($from: String, $to: String) {
     .await;
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 1);
-    let storage = db.snapshot();
-    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 4);
+    let edge_count = extract_u64_column(
+        &run_db_query_test_with_params(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { count($f) as edge_count }
+}
+"#,
+            &db,
+            &ParamMap::new(),
+        )
+        .await,
+        "edge_count",
+    );
+    assert_eq!(edge_count, vec![4]);
 }
 
 #[tokio::test]
@@ -1241,23 +1168,14 @@ async fn test_update_mutation_query_preserves_id_and_edges() {
     db.load(keyed_mutation_data()).await.unwrap();
     let manifest_before = GraphManifest::read(&db_path).unwrap();
 
-    let before_storage = db.snapshot();
-    let before = before_storage.get_all_nodes("Person").unwrap().unwrap();
-    let before_ids = before
-        .column_by_name("id")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<arrow_array::UInt64Array>()
-        .unwrap();
-    let before_names = before
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let alice_id_before = (0..before.num_rows())
-        .find(|&row| before_names.value(row) == "Alice")
-        .map(|row| before_ids.value(row))
+    let before_rows = export_rows_for_db(&db).await;
+    let alice_id_before = before_rows
+        .iter()
+        .find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .and_then(|row| row["id"].as_u64())
         .unwrap();
 
     let mut params = ParamMap::new();
@@ -1281,32 +1199,34 @@ query update_person($name: String, $age: I32) {
     .await;
     assert_eq!(result.affected_nodes, 1);
 
-    let after_storage = db.snapshot();
-    let after = after_storage.get_all_nodes("Person").unwrap().unwrap();
-    let after_ids = after
-        .column_by_name("id")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<arrow_array::UInt64Array>()
+    let after_rows = export_rows_for_db(&db).await;
+    let alice_after = after_rows
+        .iter()
+        .find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
         .unwrap();
-    let after_names = after
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let after_ages = after
-        .column_by_name("age")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    let alice_after = (0..after.num_rows())
-        .find(|&row| after_names.value(row) == "Alice")
-        .unwrap();
-    assert_eq!(after_ids.value(alice_after), alice_id_before);
-    assert_eq!(after_ages.value(alice_after), 31);
-    assert_eq!(after_storage.edge_segments["Knows"].edge_ids.len(), 1);
+    assert_eq!(alice_after["id"].as_u64(), Some(alice_id_before));
+    assert_eq!(alice_after["data"]["age"].as_i64(), Some(31));
+    let edge_count = extract_u64_column(
+        &run_db_query_test_with_params(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { count($f) as edge_count }
+}
+"#,
+            &db,
+            &ParamMap::new(),
+        )
+        .await,
+        "edge_count",
+    );
+    assert_eq!(edge_count, vec![1]);
     let manifest_after = GraphManifest::read(&db_path).unwrap();
     assert!(
         manifest_dataset_version(&manifest_after, "node", "Person")
@@ -1353,8 +1273,24 @@ query delete_knows($from: String) {
     .await;
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 2);
-    let storage = db.snapshot();
-    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 1);
+    let edge_count = extract_u64_column(
+        &run_db_query_test_with_params(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { count($f) as edge_count }
+}
+"#,
+            &db,
+            &ParamMap::new(),
+        )
+        .await,
+        "edge_count",
+    );
+    assert_eq!(edge_count, vec![1]);
 }
 
 #[tokio::test]
@@ -1382,17 +1318,60 @@ query delete_person($name: String) {
     assert_eq!(result.affected_nodes, 1);
     assert_eq!(result.affected_edges, 3);
 
-    let storage = db.snapshot();
-    let people = storage.get_all_nodes("Person").unwrap().unwrap();
-    assert_eq!(people.num_rows(), 3);
-    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 1);
-    assert_eq!(storage.edge_segments["WorksAt"].edge_ids.len(), 1);
+    let people = run_db_query_test_with_params(
+        r#"
+query q() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+    assert_eq!(extract_string_column(&people, "name").len(), 3);
+    let knows_count = extract_u64_column(
+        &run_db_query_test_with_params(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { count($f) as edge_count }
+}
+"#,
+            &db,
+            &ParamMap::new(),
+        )
+        .await,
+        "edge_count",
+    );
+    assert_eq!(knows_count, vec![1]);
+    let works_at_count = extract_u64_column(
+        &run_db_query_test_with_params(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p worksAt $c
+    }
+    return { count($c) as edge_count }
+}
+"#,
+            &db,
+            &ParamMap::new(),
+        )
+        .await,
+        "edge_count",
+    );
+    assert_eq!(works_at_count, vec![1]);
 }
 
 #[tokio::test]
 async fn test_type_error_unknown_type() {
-    let storage = setup_storage();
-    let catalog = &storage.catalog;
+    let storage = setup_storage().await;
+    let catalog = storage.catalog();
     let qf = parse_query(
         r#"
 query q() {
@@ -1408,8 +1387,8 @@ query q() {
 
 #[tokio::test]
 async fn test_type_error_bad_endpoints() {
-    let storage = setup_storage();
-    let catalog = &storage.catalog;
+    let storage = setup_storage().await;
+    let catalog = storage.catalog();
     let qf = parse_query(
         r#"
 query q() {

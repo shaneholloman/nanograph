@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
     Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
@@ -21,10 +21,10 @@ use crate::error::{NanoError, Result};
 use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
 use crate::query::ast::{CompOp, Literal};
 use crate::store::csr::CsrIndex;
-use crate::store::database::{
-    Database, DatabaseWriteGuard, DeleteOp, DeletePredicate, EdgeIndexCache, EdgeIndexPair,
-};
-use crate::store::graph::GraphStorage;
+use crate::store::database::persist::{read_sparse_node_batch, resolve_sparse_node_id_by_name};
+use crate::store::database::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate};
+use crate::store::metadata::DatabaseMetadata;
+use crate::store::runtime::{DatabaseRuntime, EdgeIndexPair, NodeLookup};
 use crate::types::Direction;
 
 /// Physical execution plan that expands from source nodes along an edge type,
@@ -40,8 +40,7 @@ pub(crate) struct ExpandExec {
     min_hops: u32,
     max_hops: Option<u32>,
     output_schema: SchemaRef,
-    storage: Arc<GraphStorage>,
-    edge_index_cache: Arc<EdgeIndexCache>,
+    runtime: Arc<DatabaseRuntime>,
     properties: PlanProperties,
 }
 
@@ -60,8 +59,7 @@ impl ExpandExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         spec: ExpandSpec,
-        storage: Arc<GraphStorage>,
-        edge_index_cache: Arc<EdgeIndexCache>,
+        runtime: Arc<DatabaseRuntime>,
     ) -> Self {
         let input_schema = input.schema();
         let ExpandSpec {
@@ -75,7 +73,7 @@ impl ExpandExec {
         } = spec;
 
         // Build output schema: input fields + new struct column for dst
-        let dst_node_type = &storage.catalog.node_types[&dst_type];
+        let dst_node_type = &runtime.catalog().node_types[&dst_type];
         let dst_struct_fields: Vec<Field> = dst_node_type
             .arrow_schema
             .fields()
@@ -109,8 +107,7 @@ impl ExpandExec {
             min_hops,
             max_hops,
             output_schema,
-            storage,
-            edge_index_cache,
+            runtime,
             properties,
         }
     }
@@ -167,8 +164,7 @@ impl ExecutionPlan for ExpandExec {
                 min_hops: self.min_hops,
                 max_hops: self.max_hops,
             },
-            self.storage.clone(),
-            self.edge_index_cache.clone(),
+            self.runtime.clone(),
         )))
     }
 
@@ -186,8 +182,7 @@ impl ExecutionPlan for ExpandExec {
         let dst_type = self.dst_type.clone();
         let min_hops = self.min_hops;
         let max_hops = self.max_hops;
-        let storage = self.storage.clone();
-        let edge_index_cache = self.edge_index_cache.clone();
+        let runtime = self.runtime.clone();
 
         let stream = futures::stream::once(async move {
             use datafusion_physical_plan::common::collect;
@@ -206,8 +201,7 @@ impl ExecutionPlan for ExpandExec {
                 min_hops,
                 max_hops,
                 output_schema: schema.clone(),
-                storage,
-                edge_index_cache,
+                runtime,
                 properties: PlanProperties::new(
                     EquivalenceProperties::new(schema.clone()),
                     datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
@@ -216,12 +210,14 @@ impl ExecutionPlan for ExpandExec {
                 ),
             };
             let edge_indices = expand.resolve_edge_indices().await?;
+            let dst_lookup = expand.resolve_destination_lookup().await?;
 
             let mut result_columns: Vec<Vec<ArrayRef>> = Vec::new();
             let mut total_rows = 0usize;
 
             for batch in &batches {
-                let expanded = expand.expand_batch(batch, edge_indices.as_ref())?;
+                let expanded =
+                    expand.expand_batch(batch, edge_indices.as_ref(), dst_lookup.as_deref())?;
                 if expanded.num_rows() > 0 {
                     if result_columns.is_empty() {
                         result_columns.resize(expanded.num_columns(), Vec::new());
@@ -260,43 +256,33 @@ impl ExecutionPlan for ExpandExec {
 
 impl ExpandExec {
     async fn resolve_edge_indices(&self) -> DFResult<Arc<EdgeIndexPair>> {
-        let edge_seg = self
-            .storage
-            .edge_segments
-            .get(&self.edge_type)
-            .ok_or_else(|| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "edge type {} not found",
-                    self.edge_type
-                ))
-            })?;
-
         if let (Some(dataset_path), Some(dataset_version)) = (
-            self.storage.edge_dataset_path(&self.edge_type),
-            self.storage.edge_dataset_version(&self.edge_type),
+            self.runtime.edge_dataset_path(&self.edge_type),
+            self.runtime.edge_dataset_version(&self.edge_type),
         ) {
             return self
-                .edge_index_cache
+                .runtime
+                .edge_index_cache()
                 .get_or_build(
                     &self.edge_type,
                     dataset_path,
                     dataset_version,
-                    self.storage.next_node_id(),
+                    self.runtime.next_node_id(),
                 )
                 .await
                 .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()));
         }
+        Err(datafusion_common::DataFusionError::Execution(format!(
+            "edge type {} has no dataset locator",
+            self.edge_type
+        )))
+    }
 
-        let csr = edge_seg.csr.clone().ok_or_else(|| {
-            datafusion_common::DataFusionError::Execution("CSR not built".to_string())
-        })?;
-        let csc = edge_seg.csc.clone().ok_or_else(|| {
-            datafusion_common::DataFusionError::Execution("CSC not built".to_string())
-        })?;
-        Ok(Arc::new(EdgeIndexPair {
-            csr: Arc::new(csr),
-            csc: Arc::new(csc),
-        }))
+    async fn resolve_destination_lookup(&self) -> DFResult<Option<Arc<NodeLookup>>> {
+        self.runtime
+            .load_node_lookup(&self.dst_type)
+            .await
+            .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))
     }
 
     fn output_struct_fields(output_schema: &SchemaRef, struct_name: &str) -> DFResult<Vec<Field>> {
@@ -371,6 +357,7 @@ impl ExpandExec {
         &self,
         input: &RecordBatch,
         edge_indices: &EdgeIndexPair,
+        dst_lookup: Option<&NodeLookup>,
     ) -> DFResult<RecordBatch> {
         let csr = match self.direction {
             Direction::Out => edge_indices.csr.as_ref(),
@@ -405,32 +392,13 @@ impl ExpandExec {
             })?;
 
         // Get destination node data
-        let dst_all_nodes = self
-            .storage
-            .get_all_nodes(&self.dst_type)
-            .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
-        let dst_batch = match &dst_all_nodes {
-            Some(b) => b,
+        let dst_lookup = match dst_lookup {
+            Some(lookup) => lookup,
             None => {
                 return Ok(RecordBatch::new_empty(self.output_schema.clone()));
             }
         };
-
-        // Build id -> row mapping from the concatenated dst batch
-        // (can't use segment.id_to_row because it points at original multi-batch indices)
-        let dst_id_col = dst_batch
-            .column(0) // id is always the first column
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                datafusion_common::DataFusionError::Execution(
-                    "dst id column is not UInt64".to_string(),
-                )
-            })?;
-        let mut dst_id_to_row: AHashMap<u64, usize> = AHashMap::new();
-        for row in 0..dst_id_col.len() {
-            dst_id_to_row.insert(dst_id_col.value(row), row);
-        }
+        let dst_batch = &dst_lookup.batch;
 
         // For each input row, perform bounded/unbounded expansion.
         let mut output_row_indices: Vec<(usize, u64)> = Vec::new(); // (input_row, dst_node_id)
@@ -450,7 +418,7 @@ impl ExpandExec {
         // Resolve destination rows and fail fast if edge references a missing destination.
         let mut valid_indices: Vec<(usize, usize)> = Vec::with_capacity(output_row_indices.len());
         for (src_idx, dst_id) in &output_row_indices {
-            let dst_row = dst_id_to_row.get(dst_id).copied().ok_or_else(|| {
+            let dst_row = dst_lookup.id_to_row.get(dst_id).copied().ok_or_else(|| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "edge {} references missing destination node id {}",
                     self.edge_type, dst_id
@@ -769,8 +737,8 @@ async fn execute_update_mutation(
         )));
     }
 
-    let storage = db.snapshot();
-    let target_batch = match storage.get_all_nodes(type_name)? {
+    let metadata = DatabaseMetadata::open(db.path())?;
+    let target_batch = match read_sparse_node_batch(&metadata, type_name).await? {
         Some(batch) => batch,
         None => return Ok(MutationExecResult::default()),
     };
@@ -882,7 +850,9 @@ async fn execute_delete_edge_mutation(
         "from" => {
             let endpoint = resolve_mutation_literal(&predicate.value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
-            let src_id = resolve_node_id_by_name(db, &src_type, &endpoint_name)?;
+            let metadata = DatabaseMetadata::open(db.path())?;
+            let src_id =
+                resolve_sparse_node_id_by_name(&metadata, &src_type, &endpoint_name).await?;
             DeletePredicate {
                 property: "src".to_string(),
                 op: delete_pred.op,
@@ -892,7 +862,9 @@ async fn execute_delete_edge_mutation(
         "to" => {
             let endpoint = resolve_mutation_literal(&predicate.value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
-            let dst_id = resolve_node_id_by_name(db, &dst_type, &endpoint_name)?;
+            let metadata = DatabaseMetadata::open(db.path())?;
+            let dst_id =
+                resolve_sparse_node_id_by_name(&metadata, &dst_type, &endpoint_name).await?;
             DeletePredicate {
                 property: "dst".to_string(),
                 op: delete_pred.op,
@@ -1004,51 +976,6 @@ fn find_key_property(db: &Database, type_name: &str) -> Option<String> {
         .node_types()
         .find(|n| n.name == type_name)
         .and_then(|n| n.properties.iter().find(|p| p.key).map(|p| p.name.clone()))
-}
-
-fn resolve_node_id_by_name(db: &Database, node_type: &str, node_name: &str) -> Result<u64> {
-    let storage = db.snapshot();
-    let batch = storage.get_all_nodes(node_type)?.ok_or_else(|| {
-        NanoError::Execution(format!(
-            "edge endpoint lookup failed: node type `{}` has no rows",
-            node_type
-        ))
-    })?;
-
-    let id_col = batch
-        .column_by_name("id")
-        .ok_or_else(|| NanoError::Execution("node batch missing id column".to_string()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| NanoError::Execution("node id column is not UInt64".to_string()))?;
-
-    let name_col = batch
-        .column_by_name("name")
-        .ok_or_else(|| {
-            NanoError::Execution(format!(
-                "edge endpoint lookup requires node type `{}` to have `name` property",
-                node_type
-            ))
-        })?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            NanoError::Execution(format!(
-                "edge endpoint lookup requires `{}`.name to be String",
-                node_type
-            ))
-        })?;
-
-    for row in 0..batch.num_rows() {
-        if !name_col.is_null(row) && name_col.value(row) == node_name {
-            return Ok(id_col.value(row));
-        }
-    }
-
-    Err(NanoError::Execution(format!(
-        "edge endpoint node not found: {}:{}",
-        node_type, node_name
-    )))
 }
 
 fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {

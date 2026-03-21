@@ -16,7 +16,6 @@ pub use catalog::schema_ir;
 pub use ir::ParamMap;
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use plan::physical::MutationExecResult;
-pub use plan::planner::execute_query;
 pub use query::ast::Literal;
 pub use query_input::{
     JsonParamMode, RunInputError, RunInputResult, ToParam, find_named_query,

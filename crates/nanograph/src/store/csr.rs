@@ -6,8 +6,6 @@ pub struct CsrIndex {
     pub offsets: Vec<u64>,
     /// neighbor node IDs, sorted by source
     pub neighbors: Vec<u64>,
-    /// edge IDs corresponding to each neighbor entry
-    pub edge_ids: Vec<u64>,
 }
 
 impl CsrIndex {
@@ -20,14 +18,12 @@ impl CsrIndex {
 
         let mut offsets = vec![0u64; num_nodes + 1];
         let mut neighbors = Vec::with_capacity(edges.len());
-        let mut edge_ids = Vec::with_capacity(edges.len());
-
         for &(src, dst, eid) in edges.iter() {
             if (src as usize) < num_nodes {
                 offsets[src as usize + 1] += 1;
             }
             neighbors.push(dst);
-            edge_ids.push(eid);
+            let _ = eid;
         }
 
         // Prefix sum to get offsets
@@ -38,7 +34,6 @@ impl CsrIndex {
         CsrIndex {
             offsets,
             neighbors,
-            edge_ids,
         }
     }
 
@@ -51,17 +46,6 @@ impl CsrIndex {
         let start = self.offsets[idx] as usize;
         let end = self.offsets[idx + 1] as usize;
         &self.neighbors[start..end]
-    }
-
-    /// Get the edge IDs for a given source node.
-    pub fn edge_ids(&self, src: u64) -> &[u64] {
-        let idx = src as usize;
-        if idx >= self.offsets.len() - 1 {
-            return &[] as &[u64];
-        }
-        let start = self.offsets[idx] as usize;
-        let end = self.offsets[idx + 1] as usize;
-        &self.edge_ids[start..end]
     }
 }
 
@@ -77,7 +61,6 @@ mod tests {
         let csr = CsrIndex::build(4, &mut edges);
 
         assert_eq!(csr.neighbors(0), &[1, 2]);
-        assert_eq!(csr.edge_ids(0), &[0, 1]);
         assert_eq!(csr.neighbors(1), &[3]);
         assert_eq!(csr.neighbors(2), &[3]);
         assert_eq!(csr.neighbors(3), &[] as &[u64]);

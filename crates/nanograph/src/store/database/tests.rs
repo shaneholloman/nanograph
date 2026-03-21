@@ -3,12 +3,12 @@ use super::*;
 use crate::store::lance_io::LANCE_INTERNAL_ID_FIELD;
 use crate::store::lance_io::write_lance_batch_with_mode_and_storage_version;
 use crate::store::manifest::DatasetEntry;
+use crate::store::metadata::DatabaseMetadata;
 use crate::store::migration::{MigrationStatus, execute_schema_migration};
 use crate::store::txlog::{
     append_tx_catalog_entry, read_tx_catalog_entries, read_visible_cdc_entries,
 };
 use arrow_array::{Array, StringArray, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::WriteMode;
 use lance_file::version::LanceFileVersion;
@@ -421,6 +421,20 @@ async fn dataset_storage_version(dataset_path: &std::path::Path) -> LanceFileVer
         .unwrap()
 }
 
+async fn read_node_batch_for_db(db: &Database, type_name: &str) -> Option<RecordBatch> {
+    let metadata = DatabaseMetadata::open(db.path()).unwrap();
+    super::persist::read_sparse_node_batch(&metadata, type_name)
+        .await
+        .unwrap()
+}
+
+async fn read_edge_batch_for_db(db: &Database, type_name: &str) -> Option<RecordBatch> {
+    let metadata = DatabaseMetadata::open(db.path()).unwrap();
+    super::persist::read_sparse_edge_batch(&metadata, type_name)
+        .await
+        .unwrap()
+}
+
 async fn write_fixture_database_with_storage_version(
     db_path: &std::path::Path,
     schema_source: &str,
@@ -432,8 +446,9 @@ async fn write_fixture_database_with_storage_version(
         .load_with_mode(data_source, LoadMode::Overwrite)
         .await
         .unwrap();
-    let storage = source_db.snapshot();
     let schema_ir = source_db.schema_ir.clone();
+    let source_manifest = GraphManifest::read(source_db.path()).unwrap();
+    let source_metadata = DatabaseMetadata::open(source_db.path()).unwrap();
 
     let fixture_db = Database::init(db_path, schema_source).await.unwrap();
     drop(fixture_db);
@@ -441,12 +456,16 @@ async fn write_fixture_database_with_storage_version(
     let mut manifest = GraphManifest::read(db_path).unwrap();
     manifest.committed_at = now_unix_seconds_string();
     manifest.last_tx_id = format!("fixture-{}", storage_version);
-    manifest.next_node_id = storage.next_node_id();
-    manifest.next_edge_id = storage.next_edge_id();
+    manifest.next_node_id = source_manifest.next_node_id;
+    manifest.next_edge_id = source_manifest.next_edge_id;
 
     let mut datasets = Vec::new();
     for node_def in schema_ir.node_types() {
-        if let Some(batch) = storage.get_all_nodes(&node_def.name).unwrap() {
+        if let Some(batch) =
+            super::persist::read_sparse_node_batch(&source_metadata, &node_def.name)
+                .await
+                .unwrap()
+        {
             let row_count = batch.num_rows() as u64;
             let dataset_rel_path = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
             let dataset_path = db_path.join(&dataset_rel_path);
@@ -470,7 +489,11 @@ async fn write_fixture_database_with_storage_version(
     }
 
     for edge_def in schema_ir.edge_types() {
-        if let Some(batch) = storage.edge_batch_for_save(&edge_def.name).unwrap() {
+        if let Some(batch) =
+            super::persist::read_sparse_edge_batch(&source_metadata, &edge_def.name)
+                .await
+                .unwrap()
+        {
             let row_count = batch.num_rows() as u64;
             let dataset_rel_path = format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
             let dataset_path = db_path.join(&dataset_rel_path);
@@ -560,7 +583,7 @@ async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
     }
 
     let db = Database::open(path).await.unwrap();
-    let people = db.snapshot().get_all_nodes("Person").unwrap().unwrap();
+    let people = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(people.num_rows(), 3);
 
     db.load_with_mode(test_data_src(), LoadMode::Overwrite)
@@ -596,11 +619,7 @@ async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
     }
 
     let reopened = Database::open(path).await.unwrap();
-    let people = reopened
-        .snapshot()
-        .get_all_nodes("Person")
-        .unwrap()
-        .unwrap();
+    let people = read_node_batch_for_db(&reopened, "Person").await.unwrap();
     assert_eq!(people.num_rows(), 3);
 }
 
@@ -626,16 +645,14 @@ async fn test_open_in_memory_loads_and_cleans_up_on_last_drop() {
     assert!(db_path.join("schema.pg").exists());
 
     db.load(test_data_src()).await.unwrap();
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
 
     let clone = db.clone();
     drop(db);
     assert!(db_path.exists());
 
-    let clone_storage = clone.snapshot();
-    let clone_persons = clone_storage.get_all_nodes("Person").unwrap().unwrap();
+    let clone_persons = read_node_batch_for_db(&clone, "Person").await.unwrap();
     assert_eq!(clone_persons.num_rows(), 3);
 
     drop(clone);
@@ -650,23 +667,21 @@ async fn test_load_and_reopen_preserves_data() {
     let db = Database::init(path, test_schema_src()).await.unwrap();
     db.load(test_data_src()).await.unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
 
     let db2 = Database::open(path).await.unwrap();
-    let storage2 = db2.snapshot();
-    let persons2 = storage2.get_all_nodes("Person").unwrap().unwrap();
+    let persons2 = read_node_batch_for_db(&db2, "Person").await.unwrap();
     assert_eq!(persons2.num_rows(), 3);
 
-    let companies = storage2.get_all_nodes("Company").unwrap().unwrap();
+    let companies = read_node_batch_for_db(&db2, "Company").await.unwrap();
     assert_eq!(companies.num_rows(), 1);
 
-    let knows_seg = &storage2.edge_segments["Knows"];
-    assert_eq!(knows_seg.edge_ids.len(), 2);
-    assert!(knows_seg.csr.is_none());
-    assert!(storage2.edge_dataset_path("Knows").is_some());
-    assert!(storage2.edge_dataset_version("Knows").is_some());
+    let knows = read_edge_batch_for_db(&db2, "Knows").await.unwrap();
+    assert_eq!(knows.num_rows(), 2);
+    let runtime2 = db2.current_runtime();
+    assert!(runtime2.edge_dataset_path("Knows").is_some());
+    assert!(runtime2.edge_dataset_version("Knows").is_some());
 }
 
 #[tokio::test]
@@ -692,33 +707,20 @@ async fn test_load_file_matches_string_load() {
         .await
         .unwrap();
 
-    let string_storage = string_db.snapshot();
-    let file_storage = file_db.snapshot();
-
-    let string_persons = string_storage.get_all_nodes("Person").unwrap().unwrap();
-    let file_persons = file_storage.get_all_nodes("Person").unwrap().unwrap();
+    let string_persons = read_node_batch_for_db(&string_db, "Person").await.unwrap();
+    let file_persons = read_node_batch_for_db(&file_db, "Person").await.unwrap();
     assert_eq!(string_persons, file_persons);
 
-    let string_companies = string_storage.get_all_nodes("Company").unwrap().unwrap();
-    let file_companies = file_storage.get_all_nodes("Company").unwrap().unwrap();
+    let string_companies = read_node_batch_for_db(&string_db, "Company").await.unwrap();
+    let file_companies = read_node_batch_for_db(&file_db, "Company").await.unwrap();
     assert_eq!(string_companies, file_companies);
 
-    assert_eq!(
-        string_storage.edge_segments["Knows"].src_ids,
-        file_storage.edge_segments["Knows"].src_ids
-    );
-    assert_eq!(
-        string_storage.edge_segments["Knows"].dst_ids,
-        file_storage.edge_segments["Knows"].dst_ids
-    );
-    assert_eq!(
-        string_storage.edge_segments["WorksAt"].src_ids,
-        file_storage.edge_segments["WorksAt"].src_ids
-    );
-    assert_eq!(
-        string_storage.edge_segments["WorksAt"].dst_ids,
-        file_storage.edge_segments["WorksAt"].dst_ids
-    );
+    let string_knows = read_edge_batch_for_db(&string_db, "Knows").await.unwrap();
+    let file_knows = read_edge_batch_for_db(&file_db, "Knows").await.unwrap();
+    assert_eq!(string_knows, file_knows);
+    let string_works_at = read_edge_batch_for_db(&string_db, "WorksAt").await.unwrap();
+    let file_works_at = read_edge_batch_for_db(&file_db, "WorksAt").await.unwrap();
+    assert_eq!(string_works_at, file_works_at);
 }
 
 #[tokio::test]
@@ -737,11 +739,10 @@ async fn test_load_file_handles_forward_reference_edges() {
         .await
         .unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 2);
-    let knows = &storage.edge_segments["Knows"];
-    assert_eq!(knows.edge_ids.len(), 1);
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
+    assert_eq!(knows.num_rows(), 1);
 }
 
 #[tokio::test]
@@ -867,8 +868,7 @@ async fn test_open_repairs_trailing_partial_tx_catalog_row() {
     file.sync_all().unwrap();
 
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    let persons = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&reopened, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
 
     let rows = read_tx_catalog_entries(path).unwrap();
@@ -897,8 +897,7 @@ async fn test_open_truncates_tx_catalog_rows_beyond_manifest_version() {
     assert_eq!(rows_before.len(), 2);
 
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    let persons = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&reopened, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
 
     let rows_after = read_tx_catalog_entries(path).unwrap();
@@ -914,9 +913,8 @@ async fn test_load_deduplicates_edges() {
     let db = Database::init(path, test_schema_src()).await.unwrap();
     db.load(duplicate_edge_data_src()).await.unwrap();
 
-    let storage = db.snapshot();
-    let knows_seg = &storage.edge_segments["Knows"];
-    assert_eq!(knows_seg.edge_ids.len(), 1);
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
+    assert_eq!(knows.num_rows(), 1);
 }
 
 #[tokio::test]
@@ -935,8 +933,7 @@ async fn test_load_mode_overwrite_replaces_existing_data() {
     .await
     .unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 1);
     let names = persons
         .column_by_name("name")
@@ -959,8 +956,7 @@ async fn test_load_mode_overwrite_supports_user_property_named_id_key() {
         .await
         .unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 2);
     let user_ids = persons
         .column(1)
@@ -972,7 +968,7 @@ async fn test_load_mode_overwrite_supports_user_property_named_id_key() {
 
     let alice_id = person_internal_id_by_user_id(&persons, "usr_alice");
     let bob_id = person_internal_id_by_user_id(&persons, "usr_bob");
-    let knows = storage.edge_batch_for_save("Knows").unwrap().unwrap();
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
     let src = knows
         .column_by_name("src")
         .unwrap()
@@ -1006,12 +1002,11 @@ async fn test_load_mode_append_adds_rows_and_can_reference_existing_nodes() {
     .await
     .unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 4);
     let alice_id = person_id_by_name(&persons, "Alice");
     let diana_id = person_id_by_name(&persons, "Diana");
-    let knows = storage.edge_batch_for_save("Knows").unwrap().unwrap();
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
     let src = knows
         .column_by_name("src")
         .unwrap()
@@ -1044,15 +1039,14 @@ async fn test_load_mode_append_supports_user_property_named_id_key() {
         .await
         .unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
 
     let alice_id = person_internal_id_by_user_id(&persons, "usr_alice");
     let charlie_id = person_internal_id_by_user_id(&persons, "usr_charlie");
     assert_eq!(person_age_by_user_id(&persons, "usr_charlie"), Some(40));
 
-    let knows = storage.edge_batch_for_save("Knows").unwrap().unwrap();
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
     let src = knows
         .column_by_name("src")
         .unwrap()
@@ -1100,16 +1094,14 @@ async fn test_load_mode_merge_updates_and_preserves_existing_ids() {
         .await
         .unwrap();
 
-    let before_storage = db.snapshot();
-    let persons_before = before_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_before = read_node_batch_for_db(&db, "Person").await.unwrap();
     let alice_before = person_id_by_name(&persons_before, "Alice");
 
     db.load_with_mode(keyed_data_upsert(), LoadMode::Merge)
         .await
         .unwrap();
 
-    let after_storage = db.snapshot();
-    let persons_after = after_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_after = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons_after.num_rows(), 3);
     assert_eq!(person_id_by_name(&persons_after, "Alice"), alice_before);
     assert_eq!(person_age_by_name(&persons_after, "Alice"), Some(31));
@@ -1128,16 +1120,14 @@ async fn test_load_mode_merge_supports_user_property_named_id_key() {
         .await
         .unwrap();
 
-    let before_storage = db.snapshot();
-    let persons_before = before_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_before = read_node_batch_for_db(&db, "Person").await.unwrap();
     let alice_before = person_internal_id_by_user_id(&persons_before, "usr_alice");
 
     db.load_with_mode(id_named_key_merge_data_src(), LoadMode::Merge)
         .await
         .unwrap();
 
-    let after_storage = db.snapshot();
-    let persons_after = after_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_after = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons_after.num_rows(), 3);
     assert_eq!(
         person_internal_id_by_user_id(&persons_after, "usr_alice"),
@@ -1151,7 +1141,7 @@ async fn test_load_mode_merge_supports_user_property_named_id_key() {
 
     let alice_id = person_internal_id_by_user_id(&persons_after, "usr_alice");
     let charlie_id = person_internal_id_by_user_id(&persons_after, "usr_charlie");
-    let knows = after_storage.edge_batch_for_save("Knows").unwrap().unwrap();
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
     let src = knows
         .column_by_name("src")
         .unwrap()
@@ -1418,8 +1408,7 @@ async fn test_merge_preserves_vector_values_after_reopen() {
         .unwrap();
 
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    let docs = reopened_storage.get_all_nodes("Doc").unwrap().unwrap();
+    let docs = read_node_batch_for_db(&reopened, "Doc").await.unwrap();
     assert_eq!(docs.num_rows(), 2);
     assert_eq!(doc_title_by_slug(&docs, "a").as_deref(), Some("A2"));
     assert_eq!(doc_title_by_slug(&docs, "b").as_deref(), Some("B"));
@@ -1444,8 +1433,7 @@ async fn test_append_preserves_vector_values_after_reopen() {
         .unwrap();
 
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    let docs = reopened_storage.get_all_nodes("Doc").unwrap().unwrap();
+    let docs = read_node_batch_for_db(&reopened, "Doc").await.unwrap();
     assert_eq!(docs.num_rows(), 2);
     assert_eq!(doc_title_by_slug(&docs, "a").as_deref(), Some("A"));
     assert_eq!(doc_title_by_slug(&docs, "b").as_deref(), Some("B"));
@@ -1580,8 +1568,7 @@ async fn test_cleanup_prunes_old_dataset_versions_but_keeps_manifest_visible_sta
     assert_eq!(manifest_after.db_version, manifest_before.db_version);
 
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    let persons = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&reopened, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
 }
 
@@ -1725,8 +1712,7 @@ async fn test_delete_nodes_cascades_edges() {
     assert_eq!(result.deleted_nodes, 1);
     assert_eq!(result.deleted_edges, 3);
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 2);
     let name_col = persons
         .column(1)
@@ -1739,8 +1725,8 @@ async fn test_delete_nodes_cascades_edges() {
     names.sort();
     assert_eq!(names, vec!["Bob".to_string(), "Charlie".to_string()]);
 
-    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 0);
-    assert_eq!(storage.edge_segments["WorksAt"].edge_ids.len(), 0);
+    assert!(read_edge_batch_for_db(&db, "Knows").await.is_none());
+    assert!(read_edge_batch_for_db(&db, "WorksAt").await.is_none());
 
     let tx_rows = read_tx_catalog_entries(path).unwrap();
     assert_eq!(tx_rows.len(), 2);
@@ -1761,11 +1747,10 @@ async fn test_delete_nodes_cascades_edges() {
 
     drop(db);
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    let persons2 = reopened_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons2 = read_node_batch_for_db(&reopened, "Person").await.unwrap();
     assert_eq!(persons2.num_rows(), 2);
-    assert_eq!(reopened_storage.edge_segments["Knows"].edge_ids.len(), 0);
-    assert_eq!(reopened_storage.edge_segments["WorksAt"].edge_ids.len(), 0);
+    assert!(read_edge_batch_for_db(&reopened, "Knows").await.is_none());
+    assert!(read_edge_batch_for_db(&reopened, "WorksAt").await.is_none());
 }
 
 #[tokio::test]
@@ -1776,8 +1761,7 @@ async fn test_delete_edges_commits_through_mutation_pipeline() {
     let db = Database::init(path, test_schema_src()).await.unwrap();
     db.load(test_data_src()).await.unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     let alice_id = person_id_by_name(&persons, "Alice");
     let result = db
         .delete_edges(
@@ -1793,9 +1777,9 @@ async fn test_delete_edges_commits_through_mutation_pipeline() {
 
     assert_eq!(result.deleted_nodes, 0);
     assert_eq!(result.deleted_edges, 2);
-    let storage = db.snapshot();
-    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 0);
-    assert_eq!(storage.edge_segments["WorksAt"].edge_ids.len(), 1);
+    assert!(read_edge_batch_for_db(&db, "Knows").await.is_none());
+    let works_at = read_edge_batch_for_db(&db, "WorksAt").await.unwrap();
+    assert_eq!(works_at.num_rows(), 1);
 
     let tx_rows = read_tx_catalog_entries(path).unwrap();
     assert_eq!(tx_rows.len(), 2);
@@ -1811,9 +1795,9 @@ async fn test_delete_edges_commits_through_mutation_pipeline() {
 
     drop(db);
     let reopened = Database::open(path).await.unwrap();
-    let reopened_storage = reopened.snapshot();
-    assert_eq!(reopened_storage.edge_segments["Knows"].edge_ids.len(), 0);
-    assert_eq!(reopened_storage.edge_segments["WorksAt"].edge_ids.len(), 1);
+    assert!(read_edge_batch_for_db(&reopened, "Knows").await.is_none());
+    let works_at = read_edge_batch_for_db(&reopened, "WorksAt").await.unwrap();
+    assert_eq!(works_at.num_rows(), 1);
 }
 
 #[tokio::test]
@@ -1827,8 +1811,7 @@ async fn test_delete_edges_uses_lance_native_delete_path() {
     let knows_path_before = dataset_rel_path_for(&manifest_before, "edge", "Knows");
     let works_at_version_before = dataset_version_for(&manifest_before, "edge", "WorksAt");
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     let bob_id = person_id_by_name(&persons, "Bob");
     let result = db
         .delete_edges(
@@ -1869,7 +1852,56 @@ async fn test_load_reopen_query() {
     drop(db);
 
     let db2 = Database::open(path).await.unwrap();
-    assert!(db2.snapshot().edge_segments["Knows"].csr.is_none());
+    assert!(
+        db2.current_runtime()
+            .edge_dataset_locator("Knows")
+            .is_some()
+    );
+
+    let query = parse_query(
+        r#"
+query alice_friends() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+    }
+    return { $f.name }
+}
+"#,
+    )
+    .unwrap()
+    .queries
+    .into_iter()
+    .next()
+    .unwrap();
+
+    let rows = match db2.run_query(&query, &ParamMap::new()).await.unwrap() {
+        RunResult::Query(rows) => rows.to_rust_json(),
+        RunResult::Mutation(_) => panic!("expected query result"),
+    };
+    let mut names: Vec<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Bob".to_string(), "Charlie".to_string()]);
+}
+
+#[tokio::test]
+async fn test_traversal_query_works_with_locator_only_storage() {
+    let dir = test_dir("locator_only_traversal");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let db2 = Database::open(path).await.unwrap();
+    let runtime = db2.current_runtime();
+    assert!(runtime.node_dataset_locator("Person").is_some());
+    assert!(runtime.edge_dataset_locator("Knows").is_some());
 
     let query = parse_query(
         r#"
@@ -1914,12 +1946,12 @@ async fn test_cloned_handles_observe_committed_storage_swaps() {
         .await
         .unwrap();
 
-    let storage = db2.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
-    let companies = storage.get_all_nodes("Company").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db2, "Person").await.unwrap();
+    let companies = read_node_batch_for_db(&db2, "Company").await.unwrap();
     assert_eq!(persons.num_rows(), 3);
     assert_eq!(companies.num_rows(), 1);
-    assert_eq!(storage.edge_segments["Knows"].edge_ids.len(), 2);
+    let knows = read_edge_batch_for_db(&db2, "Knows").await.unwrap();
+    assert_eq!(knows.num_rows(), 2);
 }
 
 #[tokio::test]
@@ -1941,8 +1973,7 @@ async fn test_concurrent_mutations_on_cloned_handles_do_not_lose_updates() {
     left.unwrap();
     right.unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     let names = persons
         .column_by_name("name")
         .unwrap()
@@ -1990,23 +2021,35 @@ query people() {
     let fresh_rows = db.prepare_read_query(&query).unwrap();
     let after_rows = fresh_rows.execute(&ParamMap::new()).await.unwrap();
 
-    let before_json = before_rows.to_rust_json();
-    let after_json = after_rows.to_rust_json();
+    let mut before_json = before_rows.to_rust_json().as_array().unwrap().clone();
+    before_json.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap()
+            .cmp(right["name"].as_str().unwrap())
+    });
+    let mut after_json = after_rows.to_rust_json().as_array().unwrap().clone();
+    after_json.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap()
+            .cmp(right["name"].as_str().unwrap())
+    });
 
     assert_eq!(
         before_json,
-        serde_json::json!([
-            { "name": "Alice", "age": 30 },
-            { "name": "Bob", "age": 25 }
-        ])
+        vec![
+            serde_json::json!({ "name": "Alice", "age": 30 }),
+            serde_json::json!({ "name": "Bob", "age": 25 })
+        ]
     );
     assert_eq!(
         after_json,
-        serde_json::json!([
-            { "name": "Alice", "age": 31 },
-            { "name": "Bob", "age": 25 },
-            { "name": "Charlie", "age": 40 }
-        ])
+        vec![
+            serde_json::json!({ "name": "Alice", "age": 31 }),
+            serde_json::json!({ "name": "Bob", "age": 25 }),
+            serde_json::json!({ "name": "Charlie", "age": 40 })
+        ]
     );
 }
 
@@ -2158,15 +2201,13 @@ async fn test_keyed_load_upsert_preserves_ids_and_remaps_edges() {
     let db = Database::init(path, keyed_schema_src()).await.unwrap();
     db.load(keyed_data_initial()).await.unwrap();
 
-    let before_storage = db.snapshot();
-    let persons_before = before_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_before = read_node_batch_for_db(&db, "Person").await.unwrap();
     let alice_id_before = person_id_by_name(&persons_before, "Alice");
     let bob_id_before = person_id_by_name(&persons_before, "Bob");
 
     db.load(keyed_data_upsert()).await.unwrap();
 
-    let after_storage = db.snapshot();
-    let persons_after = after_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_after = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons_after.num_rows(), 3);
     let alice_id_after = person_id_by_name(&persons_after, "Alice");
     let bob_id_after = person_id_by_name(&persons_after, "Bob");
@@ -2176,24 +2217,34 @@ async fn test_keyed_load_upsert_preserves_ids_and_remaps_edges() {
     assert_eq!(bob_id_after, bob_id_before);
     assert_eq!(person_age_by_name(&persons_after, "Alice"), Some(31));
 
-    let knows_seg = &after_storage.edge_segments["Knows"];
-    assert_eq!(knows_seg.edge_ids.len(), 2);
+    let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
+    let src_col = knows
+        .column_by_name("src")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let dst_col = knows
+        .column_by_name("dst")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(knows.num_rows(), 2);
     assert!(
-        knows_seg
-            .src_ids
+        src_col
             .iter()
-            .zip(knows_seg.dst_ids.iter())
-            .any(|(&src, &dst)| src == alice_id_after && dst == bob_id_after)
+            .zip(dst_col.iter())
+            .any(|(src, dst)| src == Some(alice_id_after) && dst == Some(bob_id_after))
     );
     assert!(
-        knows_seg
-            .src_ids
+        src_col
             .iter()
-            .zip(knows_seg.dst_ids.iter())
-            .any(|(&src, &dst)| src == alice_id_after && dst == charlie_id_after)
+            .zip(dst_col.iter())
+            .any(|(src, dst)| src == Some(alice_id_after) && dst == Some(charlie_id_after))
     );
 
-    let companies_after = after_storage.get_all_nodes("Company").unwrap().unwrap();
+    let companies_after = read_node_batch_for_db(&db, "Company").await.unwrap();
     assert_eq!(companies_after.num_rows(), 1);
     let company_name_col = companies_after
         .column(1)
@@ -2201,51 +2252,6 @@ async fn test_keyed_load_upsert_preserves_ids_and_remaps_edges() {
         .downcast_ref::<arrow_array::StringArray>()
         .unwrap();
     assert_eq!(company_name_col.value(0), "Acme");
-}
-
-#[tokio::test]
-async fn test_unique_rejects_existing_existing_conflict() {
-    let dir = test_dir("unique_existing_existing");
-    let path = dir.path();
-
-    let db = Database::init(path, unique_schema_src()).await.unwrap();
-
-    let person_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("email", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        person_schema,
-        vec![
-            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
-            Arc::new(StringArray::from(vec![
-                "dupe@example.com",
-                "dupe@example.com",
-            ])),
-        ],
-    )
-    .unwrap();
-    let mut storage = db.snapshot().as_ref().clone();
-    storage.insert_nodes("Person", batch).unwrap();
-    db.replace_storage(storage);
-
-    let err = db.load("").await.unwrap_err();
-    match err {
-        NanoError::UniqueConstraint {
-            type_name,
-            property,
-            value,
-            first_row,
-            second_row,
-        } => {
-            assert_eq!(type_name, "Person");
-            assert_eq!(property, "email");
-            assert_eq!(value, "dupe@example.com");
-            assert_eq!(first_row, 0);
-            assert_eq!(second_row, 1);
-        }
-        other => panic!("expected UniqueConstraint, got {}", other),
-    }
 }
 
 #[tokio::test]
@@ -2274,8 +2280,7 @@ async fn test_unique_rejects_existing_incoming_conflict() {
         other => panic!("expected UniqueConstraint, got {}", other),
     }
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 2);
     assert_eq!(person_email_by_name(&persons, "Bob"), "bob@example.com");
 }
@@ -2304,8 +2309,7 @@ async fn test_unique_rejects_incoming_incoming_conflict() {
         other => panic!("expected UniqueConstraint, got {}", other),
     }
 
-    let storage = db.snapshot();
-    assert!(storage.get_all_nodes("Person").unwrap().is_none());
+    assert!(read_node_batch_for_db(&db, "Person").await.is_none());
 }
 
 #[tokio::test]
@@ -2345,8 +2349,7 @@ async fn test_nullable_unique_allows_nulls_and_rejects_duplicate_non_null() {
         .unwrap();
     db.load(nullable_unique_ok_data()).await.unwrap();
 
-    let storage = db.snapshot();
-    let persons = storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons.num_rows(), 2);
     let nick_col = persons
         .column(2)
@@ -2371,8 +2374,7 @@ async fn test_nullable_unique_allows_nulls_and_rejects_duplicate_non_null() {
         other => panic!("expected UniqueConstraint, got {}", other),
     }
 
-    let after_err_storage = db.snapshot();
-    let persons_after_err = after_err_storage.get_all_nodes("Person").unwrap().unwrap();
+    let persons_after_err = read_node_batch_for_db(&db, "Person").await.unwrap();
     assert_eq!(persons_after_err.num_rows(), 2);
 }
 

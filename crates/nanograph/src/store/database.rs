@@ -3,19 +3,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ahash::AHashMap;
 use arrow_array::{BooleanArray, RecordBatch};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use crate::catalog::Catalog;
 use crate::catalog::schema_ir::{SchemaIR, build_catalog_from_ir, build_schema_ir};
 use crate::error::{NanoError, Result};
 use crate::ir::{ParamMap, QueryIR};
 use crate::plan::physical::execute_mutation;
-use crate::plan::planner::execute_query_with_edge_index_cache;
+use crate::plan::planner::execute_query_with_runtime;
 use crate::query::ast::{Literal, NOW_PARAM_NAME, QueryDecl};
 use crate::query::parser::parse_query;
 use crate::query::typecheck::{
@@ -26,11 +25,9 @@ use crate::query_input::{
 };
 use crate::result::{MutationResult, QueryResult, RunResult};
 use crate::schema::parser::parse_schema;
-use crate::store::csr::CsrIndex;
-use crate::store::graph::GraphStorage;
-use crate::store::lance_io::{read_lance_batches, read_lance_projected_batches};
 use crate::store::manifest::{GraphManifest, hash_string};
 use crate::store::metadata::{DatabaseMetadata, SCHEMA_IR_FILENAME};
+use crate::store::runtime::DatabaseRuntime;
 use crate::{lower_mutation_query, lower_query};
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
@@ -40,7 +37,7 @@ const CDC_ANALYTICS_STATE_FILE: &str = "__cdc_analytics.state.json";
 pub(crate) mod cdc;
 mod maintenance;
 pub(crate) mod mutation;
-mod persist;
+pub(crate) mod persist;
 
 pub use maintenance::{cleanup_database, compact_database};
 pub(crate) use mutation::DatasetMutationPlan;
@@ -263,9 +260,8 @@ pub struct DatabaseShared {
     tempdir: Option<TempDir>,
     pub schema_ir: SchemaIR,
     pub catalog: Catalog,
-    storage: RwLock<Arc<GraphStorage>>,
+    runtime: RwLock<Arc<DatabaseRuntime>>,
     writer: Mutex<()>,
-    edge_index_cache: Arc<EdgeIndexCache>,
 }
 
 #[derive(Clone)]
@@ -277,106 +273,30 @@ pub(crate) struct DatabaseWriteGuard<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
-#[derive(Debug)]
-pub(crate) struct EdgeIndexPair {
-    pub(crate) csr: Arc<CsrIndex>,
-    pub(crate) csc: Arc<CsrIndex>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct EdgeIndexCache {
-    inner: Mutex<AHashMap<(String, u64), Arc<EdgeIndexPair>>>,
-}
-
-impl EdgeIndexCache {
-    pub(crate) async fn get_or_build(
-        &self,
-        edge_type: &str,
-        dataset_path: &Path,
-        dataset_version: u64,
-        max_node_id: u64,
-    ) -> Result<Arc<EdgeIndexPair>> {
-        let key = (edge_type.to_string(), dataset_version);
-        let mut guard = self.inner.lock().await;
-        if let Some(pair) = guard.get(&key) {
-            return Ok(pair.clone());
-        }
-
-        let batches =
-            read_lance_projected_batches(dataset_path, dataset_version, &["id", "src", "dst"])
-                .await?;
-        let mut out_edges = Vec::new();
-        let mut in_edges = Vec::new();
-        for batch in batches {
-            let id_arr = batch
-                .column_by_name("id")
-                .ok_or_else(|| NanoError::Storage("edge batch missing id column".to_string()))?
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .ok_or_else(|| NanoError::Storage("edge id column is not UInt64".to_string()))?;
-            let src_arr = batch
-                .column_by_name("src")
-                .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .ok_or_else(|| NanoError::Storage("edge src column is not UInt64".to_string()))?;
-            let dst_arr = batch
-                .column_by_name("dst")
-                .ok_or_else(|| NanoError::Storage("edge batch missing dst column".to_string()))?
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .ok_or_else(|| NanoError::Storage("edge dst column is not UInt64".to_string()))?;
-
-            for row in 0..batch.num_rows() {
-                let edge_id = id_arr.value(row);
-                let src = src_arr.value(row);
-                let dst = dst_arr.value(row);
-                out_edges.push((src, dst, edge_id));
-                in_edges.push((dst, src, edge_id));
-            }
-        }
-
-        let pair = Arc::new(EdgeIndexPair {
-            csr: Arc::new(CsrIndex::build(max_node_id as usize, &mut out_edges)),
-            csc: Arc::new(CsrIndex::build(max_node_id as usize, &mut in_edges)),
-        });
-        guard.insert(key, pair.clone());
-        Ok(pair)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PreparedReadQuery {
     ir: QueryIR,
     output_schema: arrow_schema::SchemaRef,
-    storage: Arc<GraphStorage>,
-    edge_index_cache: Arc<EdgeIndexCache>,
+    runtime: Arc<DatabaseRuntime>,
 }
 
 impl PreparedReadQuery {
     fn new(
         ir: QueryIR,
         output_schema: arrow_schema::SchemaRef,
-        storage: Arc<GraphStorage>,
-        edge_index_cache: Arc<EdgeIndexCache>,
+        runtime: Arc<DatabaseRuntime>,
     ) -> Self {
         Self {
             ir,
             output_schema,
-            storage,
-            edge_index_cache,
+            runtime,
         }
     }
 
     pub async fn execute(&self, params: &ParamMap) -> Result<QueryResult> {
         let runtime_params = params_with_runtime_now(params)?;
-        let batches = execute_query_with_edge_index_cache(
-            &self.ir,
-            self.storage.clone(),
-            &runtime_params,
-            self.edge_index_cache.clone(),
-        )
-        .await?;
+        let batches =
+            execute_query_with_runtime(&self.ir, self.runtime.clone(), &runtime_params).await?;
         Ok(QueryResult::new(self.output_schema.clone(), batches))
     }
 
@@ -446,14 +366,14 @@ impl Database {
         manifest.committed_at = now_unix_seconds_string();
         manifest.write_atomic(db_path)?;
 
-        let storage = GraphStorage::new(catalog.clone());
+        let runtime = Arc::new(DatabaseRuntime::empty(catalog.clone()));
         info!("database initialized");
 
         Ok(Self::from_parts(
             db_path.to_path_buf(),
             schema_ir,
             catalog,
-            storage,
+            runtime,
             tempdir,
         ))
     }
@@ -465,53 +385,11 @@ impl Database {
         let metadata = DatabaseMetadata::open(db_path)?;
         let schema_ir = metadata.schema_ir().clone();
         let catalog = metadata.catalog().clone();
-        let manifest = metadata.manifest().clone();
-
-        // Create storage and set ID counters
-        let mut storage = GraphStorage::new(catalog.clone());
-        storage.set_next_node_id(manifest.next_node_id);
-        storage.set_next_edge_id(manifest.next_edge_id);
-
-        // Load only datasets listed in the manifest (authoritative source)
-        for entry in &manifest.datasets {
-            let dataset_path = db_path.join(&entry.dataset_path);
-            debug!(
-                kind = %entry.kind,
-                type_name = %entry.type_name,
-                dataset_path = %dataset_path.display(),
-                dataset_version = entry.dataset_version,
-                row_count = entry.row_count,
-                "restoring dataset from manifest"
-            );
-            match entry.kind.as_str() {
-                "node" => {
-                    let batches = read_lance_batches(&dataset_path, entry.dataset_version).await?;
-                    for batch in batches {
-                        storage.load_node_batch(&entry.type_name, batch)?;
-                    }
-                    storage.set_node_dataset_path(&entry.type_name, dataset_path);
-                    storage.set_node_dataset_version(&entry.type_name, entry.dataset_version);
-                }
-                "edge" => {
-                    let batches = read_lance_batches(&dataset_path, entry.dataset_version).await?;
-                    for batch in batches {
-                        storage.load_edge_batch(&entry.type_name, batch)?;
-                    }
-                    storage.set_edge_dataset_path(&entry.type_name, dataset_path);
-                    storage.set_edge_dataset_version(&entry.type_name, entry.dataset_version);
-                }
-                other => {
-                    return Err(NanoError::Manifest(format!(
-                        "unknown dataset kind `{}` for type `{}`",
-                        other, entry.type_name
-                    )));
-                }
-            }
-        }
+        let runtime = Arc::new(DatabaseRuntime::from_metadata(&metadata));
 
         info!(
-            node_types = storage.node_segments.len(),
-            edge_types = storage.edge_segments.len(),
+            node_types = runtime.node_dataset_count(),
+            edge_types = runtime.edge_dataset_count(),
             "database open complete"
         );
 
@@ -519,7 +397,7 @@ impl Database {
             db_path.to_path_buf(),
             schema_ir,
             catalog,
-            storage,
+            runtime,
             None,
         ))
     }
@@ -528,7 +406,7 @@ impl Database {
         path: PathBuf,
         schema_ir: SchemaIR,
         catalog: Catalog,
-        storage: GraphStorage,
+        runtime: Arc<DatabaseRuntime>,
         tempdir: Option<TempDir>,
     ) -> Self {
         Database {
@@ -537,9 +415,8 @@ impl Database {
                 tempdir,
                 schema_ir,
                 catalog,
-                storage: RwLock::new(Arc::new(storage)),
+                runtime: RwLock::new(runtime),
                 writer: Mutex::new(()),
-                edge_index_cache: Arc::new(EdgeIndexCache::default()),
             }),
         }
     }
@@ -567,46 +444,34 @@ impl Database {
         }
     }
 
-    fn snapshot_storage(&self) -> Arc<GraphStorage> {
-        self.storage
+    pub(crate) fn current_runtime(&self) -> Arc<DatabaseRuntime> {
+        self.runtime
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    fn replace_storage(&self, storage: GraphStorage) {
+    pub(crate) fn replace_runtime(&self, runtime: Arc<DatabaseRuntime>) {
         *self
-            .storage
+            .runtime
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(storage);
-    }
-
-    /// Clone the current storage snapshot for query execution.
-    pub fn snapshot(&self) -> Arc<GraphStorage> {
-        self.snapshot_storage()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime;
     }
 
     fn prepare_read_query_with_storage(
         &self,
         query: &QueryDecl,
-        storage: Arc<GraphStorage>,
+        runtime: Arc<DatabaseRuntime>,
     ) -> Result<PreparedReadQuery> {
         let catalog = self.catalog().clone();
         let type_ctx = typecheck_query(&catalog, query)?;
         let output_schema = infer_query_result_schema(&catalog, query, &type_ctx)?;
         let ir = lower_query(&catalog, query, &type_ctx)?;
-        Ok(PreparedReadQuery::new(
-            ir,
-            output_schema,
-            storage,
-            self.edge_index_cache.clone(),
-        ))
+        Ok(PreparedReadQuery::new(ir, output_schema, runtime))
     }
 
     pub fn prepare_read_query(&self, query: &QueryDecl) -> Result<PreparedReadQuery> {
-        let mut prepared_storage = self.snapshot().as_ref().clone();
-        prepared_storage.clear_node_dataset_paths();
-        self.prepare_read_query_with_storage(query, Arc::new(prepared_storage))
+        self.prepare_read_query_with_storage(query, self.current_runtime())
     }
 
     pub async fn run_query(&self, query: &QueryDecl, params: &ParamMap) -> Result<RunResult> {
@@ -623,7 +488,7 @@ impl Database {
             return Ok(RunResult::Mutation(MutationResult::from(result)));
         }
 
-        let prepared = self.prepare_read_query_with_storage(query, self.snapshot())?;
+        let prepared = self.prepare_read_query_with_storage(query, self.current_runtime())?;
         let result = prepared.execute(params).await?;
         Ok(RunResult::Query(result))
     }

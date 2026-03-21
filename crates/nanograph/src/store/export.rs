@@ -28,14 +28,18 @@ async fn build_export_rows_from_metadata(
     let mut node_key_tokens: HashMap<String, HashMap<u64, String>> = HashMap::new();
 
     for node in metadata.schema_ir().node_types() {
-        let Some(batch) = read_dataset_batch(metadata.node_dataset_locator(&node.name)).await? else {
+        let Some(batch) = read_dataset_batch(metadata.node_dataset_locator(&node.name)).await?
+        else {
             continue;
         };
         let id_arr = batch
             .column_by_name("id")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                NanoError::Storage(format!("node batch '{}' missing UInt64 id column", node.name))
+                NanoError::Storage(format!(
+                    "node batch '{}' missing UInt64 id column",
+                    node.name
+                ))
             })?;
         let key_prop = node
             .properties
@@ -91,26 +95,36 @@ async fn build_export_rows_from_metadata(
     }
 
     for edge in metadata.schema_ir().edge_types() {
-        let Some(batch) = read_dataset_batch(metadata.edge_dataset_locator(&edge.name)).await? else {
+        let Some(batch) = read_dataset_batch(metadata.edge_dataset_locator(&edge.name)).await?
+        else {
             continue;
         };
         let id_arr = batch
             .column_by_name("id")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                NanoError::Storage(format!("edge batch '{}' missing UInt64 id column", edge.name))
+                NanoError::Storage(format!(
+                    "edge batch '{}' missing UInt64 id column",
+                    edge.name
+                ))
             })?;
         let src_arr = batch
             .column_by_name("src")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                NanoError::Storage(format!("edge batch '{}' missing UInt64 src column", edge.name))
+                NanoError::Storage(format!(
+                    "edge batch '{}' missing UInt64 src column",
+                    edge.name
+                ))
             })?;
         let dst_arr = batch
             .column_by_name("dst")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                NanoError::Storage(format!("edge batch '{}' missing UInt64 dst column", edge.name))
+                NanoError::Storage(format!(
+                    "edge batch '{}' missing UInt64 dst column",
+                    edge.name
+                ))
             })?;
 
         for row_idx in 0..batch.num_rows() {

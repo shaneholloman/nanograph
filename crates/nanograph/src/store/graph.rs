@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::builder::UInt64Builder;
@@ -16,25 +16,21 @@ use crate::types::NodeId;
 use super::csr::CsrIndex;
 
 #[derive(Debug, Clone)]
-pub struct GraphStorage {
+pub struct DatasetAccumulator {
     pub catalog: Catalog,
     pub node_segments: HashMap<String, NodeSegment>,
     pub edge_segments: HashMap<String, EdgeSegment>,
     node_dataset_paths: HashMap<String, PathBuf>,
     node_dataset_versions: HashMap<String, u64>,
-    edge_dataset_paths: HashMap<String, PathBuf>,
-    edge_dataset_versions: HashMap<String, u64>,
     next_node_id: u64,
     next_edge_id: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeSegment {
-    pub type_name: String,
     pub schema: SchemaRef,
     pub batches: Vec<RecordBatch>,
     pub id_to_row: HashMap<u64, (usize, usize)>, // id -> (batch_idx, row_idx)
-    pub next_local_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +45,7 @@ pub struct EdgeSegment {
     pub csc: Option<CsrIndex>,
 }
 
-impl GraphStorage {
+impl DatasetAccumulator {
     pub fn new(catalog: Catalog) -> Self {
         let mut node_segments = HashMap::new();
         let mut edge_segments = HashMap::new();
@@ -58,11 +54,9 @@ impl GraphStorage {
             node_segments.insert(
                 name.clone(),
                 NodeSegment {
-                    type_name: name.clone(),
                     schema: node_type.arrow_schema.clone(),
                     batches: Vec::new(),
                     id_to_row: HashMap::new(),
-                    next_local_id: 0,
                 },
             );
         }
@@ -83,14 +77,12 @@ impl GraphStorage {
             );
         }
 
-        GraphStorage {
+        DatasetAccumulator {
             catalog,
             node_segments,
             edge_segments,
             node_dataset_paths: HashMap::new(),
             node_dataset_versions: HashMap::new(),
-            edge_dataset_paths: HashMap::new(),
-            edge_dataset_versions: HashMap::new(),
             next_node_id: 0,
             next_edge_id: 0,
         }
@@ -212,22 +204,6 @@ impl GraphStorage {
         Ok(())
     }
 
-    /// Get a node's data by ID and type. Returns the row as a slice of the RecordBatch.
-    pub fn get_node_batch_and_row(
-        &self,
-        type_name: &str,
-        node_id: u64,
-    ) -> Option<(&RecordBatch, usize)> {
-        let segment = self.node_segments.get(type_name)?;
-        let &(batch_idx, row_idx) = segment.id_to_row.get(&node_id)?;
-        Some((&segment.batches[batch_idx], row_idx))
-    }
-
-    /// Get a struct schema for a node type (wraps all fields in a Struct).
-    pub fn node_struct_schema(&self, type_name: &str) -> Option<SchemaRef> {
-        self.node_segments.get(type_name).map(|s| s.schema.clone())
-    }
-
     /// Get the full RecordBatch for all nodes of a type.
     /// Concatenates all batches.
     pub fn get_all_nodes(&self, type_name: &str) -> Result<Option<RecordBatch>> {
@@ -272,31 +248,6 @@ impl GraphStorage {
         }
         segment.batches.push(batch);
 
-        Ok(())
-    }
-
-    /// Replace all node batches for a type with the provided batch.
-    pub fn replace_node_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
-        let segment = self
-            .node_segments
-            .get_mut(type_name)
-            .ok_or_else(|| NanoError::Storage(format!("unknown node type: {}", type_name)))?;
-        segment.batches.clear();
-        segment.id_to_row.clear();
-        segment.next_local_id = 0;
-        self.load_node_batch(type_name, batch)
-    }
-
-    pub fn clear_node_type(&mut self, type_name: &str) -> Result<()> {
-        let segment = self
-            .node_segments
-            .get_mut(type_name)
-            .ok_or_else(|| NanoError::Storage(format!("unknown node type: {}", type_name)))?;
-        segment.batches.clear();
-        segment.id_to_row.clear();
-        segment.next_local_id = 0;
-        self.node_dataset_paths.remove(type_name);
-        self.node_dataset_versions.remove(type_name);
         Ok(())
     }
 
@@ -411,27 +362,6 @@ impl GraphStorage {
         Ok(Some(batch))
     }
 
-    pub fn replace_edge_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
-        self.clear_edge_type(type_name)?;
-        self.load_edge_batch(type_name, batch)
-    }
-
-    pub fn clear_edge_type(&mut self, type_name: &str) -> Result<()> {
-        let segment = self
-            .edge_segments
-            .get_mut(type_name)
-            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", type_name)))?;
-        segment.src_ids.clear();
-        segment.dst_ids.clear();
-        segment.edge_ids.clear();
-        segment.batches.clear();
-        segment.csr = None;
-        segment.csc = None;
-        self.edge_dataset_paths.remove(type_name);
-        self.edge_dataset_versions.remove(type_name);
-        Ok(())
-    }
-
     pub fn set_next_node_id(&mut self, id: u64) {
         self.next_node_id = id;
     }
@@ -456,41 +386,6 @@ impl GraphStorage {
         self.node_dataset_versions
             .insert(type_name.to_string(), version);
     }
-
-    pub fn clear_node_dataset_paths(&mut self) {
-        self.node_dataset_paths.clear();
-        self.node_dataset_versions.clear();
-    }
-
-    pub fn clear_edge_dataset_paths(&mut self) {
-        self.edge_dataset_paths.clear();
-        self.edge_dataset_versions.clear();
-    }
-
-    pub fn node_dataset_path(&self, type_name: &str) -> Option<&Path> {
-        self.node_dataset_paths.get(type_name).map(|p| p.as_path())
-    }
-
-    pub fn node_dataset_version(&self, type_name: &str) -> Option<u64> {
-        self.node_dataset_versions.get(type_name).copied()
-    }
-
-    pub fn set_edge_dataset_path(&mut self, type_name: &str, path: PathBuf) {
-        self.edge_dataset_paths.insert(type_name.to_string(), path);
-    }
-
-    pub fn set_edge_dataset_version(&mut self, type_name: &str, version: u64) {
-        self.edge_dataset_versions
-            .insert(type_name.to_string(), version);
-    }
-
-    pub fn edge_dataset_path(&self, type_name: &str) -> Option<&Path> {
-        self.edge_dataset_paths.get(type_name).map(|p| p.as_path())
-    }
-
-    pub fn edge_dataset_version(&self, type_name: &str) -> Option<u64> {
-        self.edge_dataset_versions.get(type_name).copied()
-    }
 }
 
 #[cfg(test)]
@@ -500,7 +395,7 @@ mod tests {
     use crate::schema::parser::parse_schema;
     use arrow_array::StringArray;
 
-    fn test_storage() -> GraphStorage {
+    fn test_storage() -> DatasetAccumulator {
         let schema = parse_schema(
             r#"
 node Person {
@@ -518,7 +413,7 @@ edge WorksAt: Person -> Company
         )
         .unwrap();
         let catalog = build_catalog(&schema).unwrap();
-        GraphStorage::new(catalog)
+        DatasetAccumulator::new(catalog)
     }
 
     #[test]
@@ -542,10 +437,8 @@ edge WorksAt: Person -> Company
         let ids = storage.insert_nodes("Person", batch).unwrap();
         assert_eq!(ids, vec![0, 1]);
 
-        // Verify we can look up nodes
-        let (batch, row) = storage.get_node_batch_and_row("Person", 0).unwrap();
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(row, 0);
+        let all = storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(all.num_rows(), 2);
     }
 
     #[test]

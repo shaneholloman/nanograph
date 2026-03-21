@@ -10,32 +10,24 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 
-use crate::catalog::schema_ir::SchemaIR;
-use crate::error::{NanoError, Result};
-use crate::store::database::cdc::{
-    build_delete_cdc_events_from_batch, build_insert_cdc_events_from_batch, build_update_cdc_event,
-    record_batch_row_to_json_map,
-};
-use crate::store::txlog::CdcLogEntry;
-
-use super::super::graph::GraphStorage;
+use super::super::graph::DatasetAccumulator;
 use super::constraints::{key_value_string, node_property_index};
 use super::jsonl::json_values_to_array;
+use crate::catalog::schema_ir::SchemaIR;
+use crate::error::{NanoError, Result};
 
 pub(crate) struct MergeStorageResult {
-    pub(crate) storage: GraphStorage,
-    pub(crate) cdc_events: Vec<CdcLogEntry>,
+    pub(crate) storage: DatasetAccumulator,
 }
 
 pub(crate) async fn merge_storage_with_node_keys(
     _db_path: &Path,
-    existing: &GraphStorage,
-    incoming: &GraphStorage,
+    existing: &DatasetAccumulator,
+    incoming: &DatasetAccumulator,
     schema_ir: &SchemaIR,
     key_props: &HashMap<String, String>,
 ) -> Result<MergeStorageResult> {
-    let mut merged = GraphStorage::new(existing.catalog.clone());
-    let mut cdc_events = Vec::new();
+    let mut merged = DatasetAccumulator::new(existing.catalog.clone());
     let mut next_node_id = existing.next_node_id();
     let mut next_edge_id = existing.next_edge_id();
     let mut id_remap_by_type: HashMap<String, HashMap<u64, u64>> = HashMap::new();
@@ -46,14 +38,12 @@ pub(crate) async fn merge_storage_with_node_keys(
         let incoming_batch = incoming.get_all_nodes(&node_def.name)?;
 
         if let Some(key_prop) = key_props.get(&node_def.name) {
-            let (merged_batch, remap, mut node_events) = merge_keyed_node_batches_storage_native(
+            let (merged_batch, remap) = merge_keyed_node_batches_storage_native(
                 existing_batch.as_ref(),
                 incoming_batch.as_ref(),
                 key_prop,
-                &node_def.name,
                 &mut next_node_id,
             )?;
-            cdc_events.append(&mut node_events);
             id_remap_by_type.insert(node_def.name.clone(), remap);
             if let Some(batch) = merged_batch {
                 merged.load_node_batch(&node_def.name, batch)?;
@@ -61,21 +51,9 @@ pub(crate) async fn merge_storage_with_node_keys(
         } else {
             match (existing_batch.as_ref(), incoming_batch.as_ref()) {
                 (_, Some(incoming_batch)) => {
-                    if let Some(existing_batch) = existing_batch.as_ref() {
-                        cdc_events.extend(build_delete_cdc_events_from_batch(
-                            existing_batch,
-                            "node",
-                            &node_def.name,
-                        )?);
-                    }
                     let (reassigned, remap) = reassign_node_ids(incoming_batch, &mut next_node_id)?;
                     replaced_unkeyed_types.insert(node_def.name.clone());
                     id_remap_by_type.insert(node_def.name.clone(), remap);
-                    cdc_events.extend(build_insert_cdc_events_from_batch(
-                        &reassigned,
-                        "node",
-                        &node_def.name,
-                    )?);
                     merged.load_node_batch(&node_def.name, reassigned)?;
                 }
                 (Some(existing_batch), None) => {
@@ -111,7 +89,7 @@ pub(crate) async fn merge_storage_with_node_keys(
         let preserve_existing = !replaced_unkeyed_types.contains(&edge_def.src_type_name)
             && !replaced_unkeyed_types.contains(&edge_def.dst_type_name);
 
-        let (merged_edge_batch, mut edge_events) = merge_edge_batches(
+        let merged_edge_batch = merge_edge_batches(
             existing_batch.as_ref(),
             incoming_batch.as_ref(),
             src_remap,
@@ -120,25 +98,20 @@ pub(crate) async fn merge_storage_with_node_keys(
             preserve_existing,
             &mut next_edge_id,
         )?;
-        cdc_events.append(&mut edge_events);
         if let Some(batch) = merged_edge_batch {
             merged.load_edge_batch(&edge_def.name, batch)?;
         }
     }
 
-    Ok(MergeStorageResult {
-        storage: merged,
-        cdc_events,
-    })
+    Ok(MergeStorageResult { storage: merged })
 }
 
 pub(crate) fn append_storage(
-    existing: &GraphStorage,
-    incoming: &GraphStorage,
+    existing: &DatasetAccumulator,
+    incoming: &DatasetAccumulator,
     schema_ir: &SchemaIR,
 ) -> Result<MergeStorageResult> {
-    let mut appended = GraphStorage::new(existing.catalog.clone());
-    let mut cdc_events = Vec::new();
+    let mut appended = DatasetAccumulator::new(existing.catalog.clone());
     let mut next_node_id = existing.next_node_id();
     let mut next_edge_id = existing.next_edge_id();
     let mut incoming_node_remap_by_type: HashMap<String, HashMap<u64, u64>> = HashMap::new();
@@ -151,11 +124,6 @@ pub(crate) fn append_storage(
             (Some(existing_batch), Some(incoming_batch)) => {
                 let (incoming_reassigned, remap) =
                     reassign_node_ids(incoming_batch, &mut next_node_id)?;
-                cdc_events.extend(build_insert_cdc_events_from_batch(
-                    &incoming_reassigned,
-                    "node",
-                    &node_def.name,
-                )?);
                 let schema = existing_batch.schema();
                 let combined = arrow_select::concat::concat_batches(
                     &schema,
@@ -178,11 +146,6 @@ pub(crate) fn append_storage(
                 let (incoming_reassigned, remap) =
                     reassign_node_ids(incoming_batch, &mut next_node_id)?;
                 incoming_node_remap_by_type.insert(node_def.name.clone(), remap);
-                cdc_events.extend(build_insert_cdc_events_from_batch(
-                    &incoming_reassigned,
-                    "node",
-                    &node_def.name,
-                )?);
                 appended.load_node_batch(&node_def.name, incoming_reassigned)?;
             }
             (None, None) => {
@@ -218,7 +181,7 @@ pub(crate) fn append_storage(
                             edge_def.dst_type_name
                         ))
                     })?;
-                let (merged_batch, mut edge_events) = merge_edge_batches(
+                let merged_batch = merge_edge_batches(
                     existing_batch.as_ref(),
                     incoming_batch.as_ref(),
                     src_remap,
@@ -227,7 +190,6 @@ pub(crate) fn append_storage(
                     true,
                     &mut next_edge_id,
                 )?;
-                cdc_events.append(&mut edge_events);
                 if let Some(batch) = merged_batch {
                     appended.load_edge_batch(&edge_def.name, batch)?;
                 }
@@ -235,26 +197,21 @@ pub(crate) fn append_storage(
         }
     }
 
-    Ok(MergeStorageResult {
-        storage: appended,
-        cdc_events,
-    })
+    Ok(MergeStorageResult { storage: appended })
 }
 
 fn merge_keyed_node_batches_storage_native(
     existing: Option<&RecordBatch>,
     incoming: Option<&RecordBatch>,
     key_prop: &str,
-    type_name: &str,
     next_node_id: &mut u64,
-) -> Result<(Option<RecordBatch>, HashMap<u64, u64>, Vec<CdcLogEntry>)> {
+) -> Result<(Option<RecordBatch>, HashMap<u64, u64>)> {
     match (existing, incoming) {
-        (None, None) => Ok((None, HashMap::new(), Vec::new())),
-        (Some(existing), None) => Ok((Some(existing.clone()), HashMap::new(), Vec::new())),
+        (None, None) => Ok((None, HashMap::new())),
+        (Some(existing), None) => Ok((Some(existing.clone()), HashMap::new())),
         (None, Some(incoming)) => {
             let (reassigned, remap) = reassign_node_ids(incoming, next_node_id)?;
-            let cdc_events = build_insert_cdc_events_from_batch(&reassigned, "node", type_name)?;
-            Ok((Some(reassigned), remap, cdc_events))
+            Ok((Some(reassigned), remap))
         }
         (Some(existing), Some(incoming)) => {
             if existing.num_columns() != incoming.num_columns() {
@@ -266,46 +223,10 @@ fn merge_keyed_node_batches_storage_native(
 
             let (source_batch, remap) =
                 rewrite_incoming_keyed_ids(existing, incoming, key_prop, next_node_id)?;
-            let cdc_events =
-                build_keyed_node_merge_cdc_events(existing, &source_batch, key_prop, type_name)?;
             let merged_batch = run_keyed_merge_insert_in_memory(existing, source_batch, key_prop)?;
-            Ok((Some(merged_batch), remap, cdc_events))
+            Ok((Some(merged_batch), remap))
         }
     }
-}
-
-fn build_keyed_node_merge_cdc_events(
-    existing: &RecordBatch,
-    source_batch: &RecordBatch,
-    key_prop: &str,
-    type_name: &str,
-) -> Result<Vec<CdcLogEntry>> {
-    let key_idx = node_property_index(existing.schema().as_ref(), key_prop)
-        .ok_or_else(|| NanoError::Storage(format!("missing key property {}", key_prop)))?;
-    let mut existing_rows_by_key = HashMap::new();
-    for row in 0..existing.num_rows() {
-        let key = key_value_string(existing.column(key_idx), row, key_prop)?;
-        existing_rows_by_key.insert(key, record_batch_row_to_json_map(existing, row)?);
-    }
-
-    let mut events = Vec::new();
-    for row in 0..source_batch.num_rows() {
-        let key = key_value_string(source_batch.column(key_idx), row, key_prop)?;
-        let after = record_batch_row_to_json_map(source_batch, row)?;
-        if let Some(before) = existing_rows_by_key.get(&key) {
-            if let Some(event) = build_update_cdc_event("node", type_name, before, &after) {
-                events.push(event);
-            }
-        } else {
-            events.extend(build_insert_cdc_events_from_batch(
-                &source_batch.slice(row, 1),
-                "node",
-                type_name,
-            )?);
-        }
-    }
-
-    Ok(events)
 }
 
 fn rewrite_incoming_keyed_ids(
@@ -489,7 +410,7 @@ fn merge_edge_batches(
     edge_name: &str,
     preserve_existing: bool,
     next_edge_id: &mut u64,
-) -> Result<(Option<RecordBatch>, Vec<CdcLogEntry>)> {
+) -> Result<Option<RecordBatch>> {
     let remapped_existing = if preserve_existing {
         existing.cloned()
     } else {
@@ -500,18 +421,7 @@ fn merge_edge_batches(
         .transpose()?;
 
     if remapped_incoming.is_none() {
-        if !preserve_existing {
-            let mut cdc_events = Vec::new();
-            if let Some(existing_batch) = existing {
-                cdc_events.extend(build_delete_cdc_events_from_batch(
-                    existing_batch,
-                    "edge",
-                    edge_name,
-                )?);
-            }
-            return Ok((remapped_existing, cdc_events));
-        }
-        return Ok((remapped_existing, Vec::new()));
+        return Ok(remapped_existing);
     }
 
     let schema = remapped_incoming
@@ -519,12 +429,13 @@ fn merge_edge_batches(
         .map(|b| b.schema())
         .or_else(|| remapped_existing.as_ref().map(|b| b.schema()));
     let Some(schema) = schema else {
-        return Ok((None, Vec::new()));
+        return Ok(None);
     };
 
     // No multigraph support: keep one row per (src, dst) edge.
     // Existing rows are loaded first and incoming rows overwrite duplicates.
     let mut row_order: Vec<(u64, u64)> = Vec::new();
+    let mut row_ids: HashMap<(u64, u64), u64> = HashMap::new();
     let mut row_props: HashMap<(u64, u64), Vec<serde_json::Value>> = HashMap::new();
     let prop_field_names: Vec<String> = schema
         .fields()
@@ -539,6 +450,12 @@ fn merge_edge_batches(
         .collect();
 
     let mut ingest = |batch: &RecordBatch, overwrite: bool| -> Result<()> {
+        let id_arr = batch
+            .column_by_name("id")
+            .ok_or_else(|| NanoError::Storage("edge batch missing id column".to_string()))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| NanoError::Storage("edge id column is not UInt64".to_string()))?;
         let src_arr = batch
             .column_by_name("src")
             .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
@@ -554,6 +471,7 @@ fn merge_edge_batches(
 
         for row in 0..batch.num_rows() {
             let key = (src_arr.value(row), dst_arr.value(row));
+            let current_id = id_arr.value(row);
             let props = prop_field_names
                 .iter()
                 .map(|name| {
@@ -576,6 +494,14 @@ fn merge_edge_batches(
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     row_order.push(key);
+                    let assigned_id = if overwrite {
+                        let next_id = *next_edge_id;
+                        *next_edge_id = next_edge_id.saturating_add(1);
+                        next_id
+                    } else {
+                        current_id
+                    };
+                    row_ids.insert(key, assigned_id);
                     entry.insert(props);
                 }
             }
@@ -591,17 +517,7 @@ fn merge_edge_batches(
         ingest(batch, true)?;
     }
     if row_order.is_empty() {
-        let mut cdc_events = Vec::new();
-        if let Some(existing_batch) = existing {
-            if !preserve_existing || incoming.is_some() {
-                cdc_events.extend(build_delete_cdc_events_from_batch(
-                    existing_batch,
-                    "edge",
-                    edge_name,
-                )?);
-            }
-        }
-        return Ok((None, cdc_events));
+        return Ok(None);
     }
 
     let mut id_builder = UInt64Builder::with_capacity(row_order.len());
@@ -612,8 +528,12 @@ fn merge_edge_batches(
         .collect();
 
     for (src, dst) in &row_order {
-        let edge_id = *next_edge_id;
-        *next_edge_id = next_edge_id.saturating_add(1);
+        let edge_id = *row_ids.get(&(*src, *dst)).ok_or_else(|| {
+            NanoError::Storage(format!(
+                "internal edge id assignment error for {} at ({}, {})",
+                edge_name, src, dst
+            ))
+        })?;
         id_builder.append_value(edge_id);
         src_builder.append_value(*src);
         dst_builder.append_value(*dst);
@@ -668,20 +588,7 @@ fn merge_edge_batches(
 
     let batch = RecordBatch::try_new(schema, out_columns)
         .map_err(|e| NanoError::Storage(format!("edge merge batch error: {}", e)))?;
-    let mut cdc_events = Vec::new();
-    if !preserve_existing || incoming.is_some() {
-        if let Some(existing_batch) = existing {
-            cdc_events.extend(build_delete_cdc_events_from_batch(
-                existing_batch,
-                "edge",
-                edge_name,
-            )?);
-        }
-        cdc_events.extend(build_insert_cdc_events_from_batch(
-            &batch, "edge", edge_name,
-        )?);
-    }
-    Ok((Some(batch), cdc_events))
+    Ok(Some(batch))
 }
 
 fn remap_edge_batch_endpoints(
@@ -1211,7 +1118,7 @@ mod tests {
         let dst_remap = HashMap::from([(31_u64, 32_u64)]);
         let mut next_edge_id = 42;
 
-        let (merged, _cdc_events) = merge_edge_batches(
+        let merged = merge_edge_batches(
             Some(&existing),
             Some(&incoming),
             &src_remap,
@@ -1224,7 +1131,7 @@ mod tests {
         let merged = merged.unwrap();
 
         assert_eq!(merged.num_rows(), 3);
-        assert_eq!(next_edge_id, 45);
+        assert_eq!(next_edge_id, 43);
 
         let src = merged
             .column_by_name("src")
@@ -1275,7 +1182,7 @@ mod tests {
         );
 
         let mut next_edge_id = 100;
-        let (merged, _cdc_events) = merge_edge_batches(
+        let merged = merge_edge_batches(
             Some(&existing),
             Some(&incoming),
             &HashMap::new(),
@@ -1340,7 +1247,7 @@ edge Knows: Person -> Person"#;
         let schema_ir = build_schema_ir(&schema).unwrap();
         let catalog = build_catalog_from_ir(&schema_ir).unwrap();
 
-        let mut existing = GraphStorage::new(catalog.clone());
+        let mut existing = DatasetAccumulator::new(catalog.clone());
         let person_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
         let existing_people = RecordBatch::try_new(
             person_schema.clone(),
@@ -1352,7 +1259,7 @@ edge Knows: Person -> Person"#;
             .insert_edges("Knows", &[existing_ids[0]], &[existing_ids[0]], None)
             .unwrap();
 
-        let mut incoming = GraphStorage::new(catalog);
+        let mut incoming = DatasetAccumulator::new(catalog);
         let incoming_people = RecordBatch::try_new(
             person_schema,
             vec![Arc::new(StringArray::from(vec!["Bob"])) as ArrayRef],

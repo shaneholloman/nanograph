@@ -55,7 +55,8 @@ impl Database {
             return Ok(DeleteResult::default());
         }
         let deleted_node_set: HashSet<u64> = deleted_node_ids.into_iter().collect();
-        let filtered_target = filter_record_batch_by_delete_mask(&target_batch, &delete_mask, "node")?;
+        let filtered_target =
+            filter_record_batch_by_delete_mask(&target_batch, &delete_mask, "node")?;
         let mut mutation_plan = DatasetMutationPlan::new(
             "mutation:delete_nodes",
             metadata.manifest().next_node_id,
@@ -162,7 +163,8 @@ impl Database {
         };
 
         let delete_mask = build_delete_mask_for_mutation(&target_batch, predicate)?;
-        let filtered_target = filter_record_batch_by_delete_mask(&target_batch, &delete_mask, "edge")?;
+        let filtered_target =
+            filter_record_batch_by_delete_mask(&target_batch, &delete_mask, "edge")?;
         let deleted_edges = target_batch
             .num_rows()
             .saturating_sub(filtered_target.num_rows());
@@ -627,38 +629,6 @@ fn cdc_entity_key(
         }
     }
     format!("id={}", id)
-}
-
-pub(super) fn deleted_ids_from_cdc_events(events: &[&CdcLogEntry]) -> Result<Vec<u64>> {
-    let mut ids = Vec::with_capacity(events.len());
-    for event in events {
-        let id = cdc_deleted_entity_id(event).ok_or_else(|| {
-            NanoError::Storage(format!(
-                "CDC delete payload missing id for {} {}",
-                event.entity_kind, event.type_name
-            ))
-        })?;
-        ids.push(id);
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    Ok(ids)
-}
-
-fn cdc_deleted_entity_id(event: &CdcLogEntry) -> Option<u64> {
-    if let Some(id) = event
-        .payload
-        .as_object()
-        .and_then(cdc_internal_entity_id_from_row)
-    {
-        return Some(id);
-    }
-
-    event
-        .entity_key
-        .strip_prefix("id=")
-        .and_then(|raw| raw.split(',').next())
-        .and_then(|value| value.parse::<u64>().ok())
 }
 
 fn cdc_internal_entity_id_from_row(

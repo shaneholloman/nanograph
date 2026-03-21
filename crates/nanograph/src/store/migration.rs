@@ -15,7 +15,7 @@ use crate::catalog::schema_ir::{
 use crate::error::{NanoError, Result};
 use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
-use crate::store::graph::GraphStorage;
+use crate::store::graph::DatasetAccumulator;
 use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
 use crate::store::lance_io::{read_lance_batches, write_lance_batch};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
@@ -50,7 +50,8 @@ impl MigrationDataView {
             return Ok(batch.clone());
         }
         let batch = read_dataset_batch(self.metadata.node_dataset_locator(type_name)).await?;
-        self.node_batches.insert(type_name.to_string(), batch.clone());
+        self.node_batches
+            .insert(type_name.to_string(), batch.clone());
         Ok(batch)
     }
 
@@ -59,7 +60,8 @@ impl MigrationDataView {
             return Ok(batch.clone());
         }
         let batch = read_dataset_batch(self.metadata.edge_dataset_locator(type_name)).await?;
-        self.edge_batches.insert(type_name.to_string(), batch.clone());
+        self.edge_batches
+            .insert(type_name.to_string(), batch.clone());
         Ok(batch)
     }
 }
@@ -447,7 +449,7 @@ async fn plan_schema_migration(
     manifest.next_prop_id = next_prop_id;
 
     // Open metadata and manifest-pinned datasets so planner can validate cast/nullability
-    // and endpoint rebind against existing data without restoring a full GraphStorage snapshot.
+    // and endpoint rebind against existing data without restoring a full DatasetAccumulator snapshot.
     let mut data_view = MigrationDataView::open(db_path)?;
     let mut steps = Vec::new();
     diff_schema(&old_ir, &new_ir, &mut data_view, &mut steps, &mut blocked).await?;
@@ -2084,7 +2086,10 @@ async fn classify_endpoint_rebind(
     else {
         return (
             MigrationSafety::Blocked,
-            format!("edge batch for `{}` is missing UInt64 src column", old_edge.name),
+            format!(
+                "edge batch for `{}` is missing UInt64 src column",
+                old_edge.name
+            ),
         );
     };
     let Some(dst_ids) = edge_batch
@@ -2093,7 +2098,10 @@ async fn classify_endpoint_rebind(
     else {
         return (
             MigrationSafety::Blocked,
-            format!("edge batch for `{}` is missing UInt64 dst column", old_edge.name),
+            format!(
+                "edge batch for `{}` is missing UInt64 dst column",
+                old_edge.name
+            ),
         );
     };
 
@@ -2337,8 +2345,8 @@ async fn transform_storage_for_new_schema(
     data_view: &mut MigrationDataView,
     new_ir: &SchemaIR,
     new_catalog: &Catalog,
-) -> Result<GraphStorage> {
-    let mut out = GraphStorage::new(new_catalog.clone());
+) -> Result<DatasetAccumulator> {
+    let mut out = DatasetAccumulator::new(new_catalog.clone());
     let old_ir = data_view.metadata().schema_ir().clone();
 
     let old_nodes_by_id = old_ir
@@ -2516,7 +2524,7 @@ async fn transform_storage_for_new_schema(
 }
 
 fn validate_edge_endpoints_during_apply(
-    storage: &GraphStorage,
+    storage: &DatasetAccumulator,
     ir: &SchemaIR,
     src_type_id: u32,
     dst_type_id: u32,
@@ -2561,7 +2569,7 @@ fn validate_edge_endpoints_during_apply(
     Ok(())
 }
 
-fn collect_node_ids(storage: &GraphStorage, type_name: &str) -> Result<HashSet<u64>> {
+fn collect_node_ids(storage: &DatasetAccumulator, type_name: &str) -> Result<HashSet<u64>> {
     let mut set = HashSet::new();
     if let Some(batch) = storage.get_all_nodes(type_name)? {
         let ids = batch
@@ -2625,7 +2633,7 @@ async fn write_staged_db(
     path: &Path,
     schema_source: &str,
     schema_ir: &SchemaIR,
-    storage: &GraphStorage,
+    storage: &DatasetAccumulator,
     manifest_seed: &GraphManifest,
 ) -> Result<()> {
     std::fs::create_dir_all(path)?;

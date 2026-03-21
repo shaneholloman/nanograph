@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema};
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 
-use super::super::graph::GraphStorage;
+use super::super::graph::DatasetAccumulator;
 
 #[derive(Debug, Default)]
 pub(crate) struct NodeConstraintAnnotations {
@@ -59,7 +59,7 @@ pub(crate) fn load_node_constraint_annotations(
 }
 
 pub(crate) fn enforce_node_unique_constraints(
-    storage: &GraphStorage,
+    storage: &DatasetAccumulator,
     unique_props: &HashMap<String, Vec<String>>,
 ) -> Result<()> {
     for (type_name, properties) in unique_props {
@@ -115,7 +115,7 @@ pub(crate) fn collect_incoming_node_types(data_source: &str) -> Result<HashSet<S
 }
 
 pub(crate) fn build_name_seed_for_keyed_load(
-    storage: &GraphStorage,
+    storage: &DatasetAccumulator,
     key_props: &HashMap<String, String>,
 ) -> Result<HashMap<(String, String), u64>> {
     let mut seed = HashMap::new();
@@ -150,7 +150,7 @@ pub(crate) fn build_name_seed_for_keyed_load(
 }
 
 pub(crate) fn build_name_seed_for_append(
-    storage: &GraphStorage,
+    storage: &DatasetAccumulator,
     key_props: &HashMap<String, String>,
 ) -> Result<HashMap<(String, String), u64>> {
     build_name_seed_for_keyed_load(storage, key_props)
@@ -272,11 +272,11 @@ mod tests {
     use super::super::jsonl::load_jsonl_data;
     use super::*;
 
-    fn build_schema_ir_and_storage(schema_src: &str) -> (SchemaIR, GraphStorage) {
+    fn build_schema_ir_and_storage(schema_src: &str) -> (SchemaIR, DatasetAccumulator) {
         let schema = parse_schema(schema_src).unwrap();
         let ir = build_schema_ir(&schema).unwrap();
         let catalog = build_catalog_from_ir(&ir).unwrap();
-        (ir, GraphStorage::new(catalog))
+        (ir, DatasetAccumulator::new(catalog))
     }
 
     #[test]

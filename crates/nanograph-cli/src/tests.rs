@@ -571,32 +571,20 @@ async fn load_mode_append_and_merge_behave_as_expected() {
         .await
         .unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
-    let storage = db.snapshot();
-    let batch = storage.get_all_nodes("Person").unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 2);
-    let names = batch
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let ages = batch
-        .column_by_name("age")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    let mut alice_age = None;
-    let mut has_bob = false;
-    for row in 0..batch.num_rows() {
-        if names.value(row) == "Alice" {
-            alice_age = Some(ages.value(row));
-        }
-        if names.value(row) == "Bob" {
-            has_bob = true;
-        }
-    }
+    let rows = build_export_rows(&db_path, false, true).await.unwrap();
+    let people: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some("Person"))
+        .collect();
+    assert_eq!(people.len(), 2);
+    let alice_age = people.iter().find_map(|row| {
+        (row["data"]["name"].as_str() == Some("Alice"))
+            .then_some(row["data"]["age"].as_i64())
+            .flatten()
+    });
+    let has_bob = people
+        .iter()
+        .any(|row| row["data"]["name"].as_str() == Some("Bob"));
     assert_eq!(alice_age, Some(31));
     assert!(has_bob);
 }
@@ -1084,16 +1072,11 @@ query add_person($name: String, $age: I32) {
     .await
     .unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
-    let storage = db.snapshot();
-    let people = storage.get_all_nodes("Person").unwrap().unwrap();
-    let names = people
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert!((0..people.num_rows()).any(|row| names.value(row) == "Eve"));
+    let rows = build_export_rows(&db_path, false, true).await.unwrap();
+    assert!(rows.iter().any(|row| {
+        row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+            && row["data"]["name"].as_str() == Some("Eve")
+    }));
 
     let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
     assert_eq!(cdc_rows.len(), 1);

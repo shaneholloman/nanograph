@@ -18,8 +18,8 @@ use tracing::debug;
 
 use crate::plan::literal_utils;
 use crate::query::ast::{CompOp, Literal};
-use crate::store::graph::GraphStorage;
 use crate::store::lance_io::logical_node_field_to_lance;
+use crate::store::runtime::DatabaseRuntime;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NodeScanPredicate {
@@ -37,7 +37,7 @@ pub(crate) struct NodeScanExec {
     output_schema: SchemaRef,
     pushdown_filters: Vec<NodeScanPredicate>,
     limit: Option<usize>,
-    storage: Arc<GraphStorage>,
+    runtime: Arc<DatabaseRuntime>,
     properties: PlanProperties,
 }
 
@@ -48,7 +48,7 @@ impl NodeScanExec {
         output_schema: SchemaRef,
         pushdown_filters: Vec<NodeScanPredicate>,
         limit: Option<usize>,
-        storage: Arc<GraphStorage>,
+        runtime: Arc<DatabaseRuntime>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -63,7 +63,7 @@ impl NodeScanExec {
             output_schema,
             pushdown_filters,
             limit,
-            storage,
+            runtime,
             properties,
         }
     }
@@ -92,13 +92,16 @@ impl NodeScanExec {
         .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))
     }
 
-    fn apply_pushdown_filters(&self, input: &RecordBatch) -> Result<RecordBatch> {
-        if self.pushdown_filters.is_empty() {
+    fn apply_pushdown_filters_with_predicates(
+        pushdown_filters: &[NodeScanPredicate],
+        input: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        if pushdown_filters.is_empty() {
             return Ok(input.clone());
         }
 
         let mut current = input.clone();
-        for predicate in &self.pushdown_filters {
+        for predicate in pushdown_filters {
             let left = current
                 .column_by_name(&predicate.property)
                 .ok_or_else(|| {
@@ -217,10 +220,6 @@ impl NodeScanExec {
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
-    fn wrap_struct_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        Self::wrap_struct_batch_for_schema(&self.output_schema, batch)
-    }
-
     fn projected_column_names(&self) -> Result<Vec<String>> {
         Ok(Self::output_struct_fields(&self.output_schema)?
             .into_iter()
@@ -271,7 +270,7 @@ impl NodeScanExec {
     }
 
     fn maybe_lance_dataset_path(&self) -> Option<PathBuf> {
-        self.storage
+        self.runtime
             .node_dataset_path(&self.type_name)
             .map(|p| p.to_path_buf())
             .filter(|p| p.exists())
@@ -331,20 +330,26 @@ impl ExecutionPlan for NodeScanExec {
         if let Some(dataset_path) = self.maybe_lance_dataset_path() {
             let output_schema = self.output_schema.clone();
             let projected_columns = self.projected_column_names()?;
-            let filter_sql = match self.lance_filter_sql() {
-                Ok(sql) => sql,
+            let pushdown_filters = self.pushdown_filters.clone();
+            let (filter_sql, apply_filters_after_scan) = match self.lance_filter_sql() {
+                Ok(sql) => (sql, false),
                 Err(err) => {
                     debug!(
                         node_type = %self.type_name,
                         reason = %err,
-                        "falling back to in-memory path: cannot convert predicate to Lance SQL"
+                        "using Lance scan with in-process filtering: cannot convert predicate to Lance SQL"
                     );
-                    return self.execute_in_memory_scan();
+                    (None, true)
                 }
             };
             let filter_sql_for_debug = filter_sql.clone();
-            let limit = self.limit.and_then(|v| i64::try_from(v).ok());
-            let dataset_version = self.storage.node_dataset_version(&self.type_name);
+            let limit = self.limit;
+            let pushdown_limit = if apply_filters_after_scan {
+                None
+            } else {
+                limit.and_then(|v| i64::try_from(v).ok())
+            };
+            let dataset_version = self.runtime.node_dataset_version(&self.type_name);
             let stream = futures::stream::once(async move {
                 let uri = dataset_path.to_string_lossy().to_string();
                 let dataset = Dataset::open(&uri).await.map_err(|e| {
@@ -369,7 +374,7 @@ impl ExecutionPlan for NodeScanExec {
                         DataFusionError::Execution(format!("lance predicate pushdown error: {}", e))
                     })?;
                 }
-                if let Some(lim) = limit {
+                if let Some(lim) = pushdown_limit {
                     scanner.limit(Some(lim), None).map_err(|e| {
                         DataFusionError::Execution(format!("lance limit pushdown error: {}", e))
                     })?;
@@ -403,7 +408,31 @@ impl ExecutionPlan for NodeScanExec {
                     )?
                 };
 
-                NodeScanExec::wrap_struct_batch_for_schema(&output_schema, &merged)
+                let filtered = if apply_filters_after_scan {
+                    NodeScanExec::apply_pushdown_filters_with_predicates(
+                        &pushdown_filters,
+                        &merged,
+                    )?
+                } else {
+                    merged
+                };
+
+                if filtered.num_rows() == 0 {
+                    return Ok(RecordBatch::new_empty(output_schema.clone()));
+                }
+
+                let filtered = if let Some(limit) = limit {
+                    let rows_to_emit = filtered.num_rows().min(limit);
+                    if rows_to_emit < filtered.num_rows() {
+                        filtered.slice(0, rows_to_emit)
+                    } else {
+                        filtered
+                    }
+                } else {
+                    filtered
+                };
+
+                NodeScanExec::wrap_struct_batch_for_schema(&output_schema, &filtered)
             });
 
             debug!(
@@ -412,6 +441,7 @@ impl ExecutionPlan for NodeScanExec {
                 limit = ?self.limit,
                 dataset_version = ?dataset_version,
                 index_eligible = self.has_index_eligible_pushdown(),
+                apply_filters_after_scan,
                 "using Lance-native node scan pushdown path"
             );
 
@@ -423,48 +453,8 @@ impl ExecutionPlan for NodeScanExec {
             ));
         }
 
-        self.execute_in_memory_scan()
-    }
-}
-
-impl NodeScanExec {
-    fn execute_in_memory_scan(&self) -> Result<SendableRecordBatchStream> {
-        debug!(
-            node_type = %self.type_name,
-            "using in-memory node scan fallback path"
-        );
-        let mut output_batches = Vec::new();
-        let mut remaining = self.limit.unwrap_or(usize::MAX);
-
-        if let Some(segment) = self.storage.node_segments.get(&self.type_name) {
-            for batch in &segment.batches {
-                if remaining == 0 {
-                    break;
-                }
-
-                let filtered = self.apply_pushdown_filters(batch)?;
-                if filtered.num_rows() == 0 {
-                    continue;
-                }
-
-                let rows_to_emit = filtered.num_rows().min(remaining);
-                let filtered = if rows_to_emit < filtered.num_rows() {
-                    filtered.slice(0, rows_to_emit)
-                } else {
-                    filtered
-                };
-
-                remaining = remaining.saturating_sub(rows_to_emit);
-                output_batches.push(self.wrap_struct_batch(&filtered)?);
-            }
-        }
-
-        if output_batches.is_empty() {
-            output_batches.push(RecordBatch::new_empty(self.output_schema.clone()));
-        }
-
         Ok(Box::pin(MemoryStream::try_new(
-            output_batches,
+            vec![RecordBatch::new_empty(self.output_schema.clone())],
             self.output_schema.clone(),
             None,
         )?))

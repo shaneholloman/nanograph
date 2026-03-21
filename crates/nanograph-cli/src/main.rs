@@ -35,7 +35,6 @@ use nanograph::query::ast::{Clause, CompOp, Expr, Literal, MatchValue, QueryDecl
 use nanograph::query::parser::parse_query_diagnostic;
 use nanograph::query::typecheck::{BindingKind, CheckedQuery, TypeContext, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema_diagnostic;
-use nanograph::store::GraphStorage;
 use nanograph::store::database::{
     CdcAnalyticsMaterializeOptions, CleanupOptions, CompactOptions, Database, DeleteOp,
     DeletePredicate, EmbedOptions, LoadMode, cleanup_database, compact_database,
@@ -44,7 +43,7 @@ use nanograph::store::database::{
 use nanograph::store::metadata::DatabaseMetadata;
 use nanograph::store::migration::{SchemaDiffReport, analyze_schema_diff};
 use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
-use nanograph::{ParamMap, execute_query, lower_query};
+use nanograph::{ParamMap, lower_query};
 use schema_ops::{cmd_migrate, cmd_schema_diff, schema_compatibility_label};
 use ui::{
     StatusTone, format_status_line, stderr_supports_color, stdout_supports_color, style_key,
@@ -1927,14 +1926,13 @@ async fn execute_lance_first_query(
     query: &QueryDecl,
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
-    let mut storage = GraphStorage::new(metadata.catalog().clone());
-    if let Some(locator) = metadata.node_dataset_locator(&plan.node_type) {
-        storage.set_node_dataset_path(&plan.node_type, locator.dataset_path);
-        storage.set_node_dataset_version(&plan.node_type, locator.dataset_version);
-    }
-    let ir = lower_query(metadata.catalog(), query, &plan.type_ctx)?;
+    let _ = lower_query(metadata.catalog(), query, &plan.type_ctx)?;
+    let db = Database::open(metadata.path()).await?;
     let runtime_params = params_with_runtime_now(params)?;
-    Ok(execute_query(&ir, std::sync::Arc::new(storage), &runtime_params).await?)
+    match db.run_query(query, &runtime_params).await? {
+        nanograph::RunResult::Query(result) => Ok(result.into_batches()),
+        nanograph::RunResult::Mutation(_) => Err(eyre!("expected query result")),
+    }
 }
 
 async fn execute_run_query_batches(

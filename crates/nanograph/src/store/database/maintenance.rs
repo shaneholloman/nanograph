@@ -8,6 +8,7 @@ use lance::Dataset;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{CompactionOptions as LanceCompactionOptions, compact_files};
 
+use super::persist::{read_sparse_edge_batch, read_sparse_node_batch};
 use super::{
     CDC_ANALYTICS_DATASET_DIR, CDC_ANALYTICS_STATE_FILE, CdcAnalyticsMaterializeOptions,
     CdcAnalyticsMaterializeResult, CdcAnalyticsState, CleanupOptions, CleanupResult,
@@ -17,6 +18,7 @@ use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 use crate::store::lance_io::write_lance_batch;
 use crate::store::manifest::GraphManifest;
+use crate::store::metadata::DatabaseMetadata;
 use crate::store::txlog::{
     CdcLogEntry, commit_manifest_and_logs, prune_logs_for_replay_window, read_cdc_log_entries,
     read_tx_catalog_entries, read_visible_cdc_entries, reconcile_logs_to_manifest,
@@ -241,9 +243,9 @@ impl Database {
     pub async fn doctor(&self) -> Result<DoctorReport> {
         let manifest = GraphManifest::read(&self.path)?;
         reconcile_logs_to_manifest(&self.path, manifest.db_version)?;
+        let metadata = DatabaseMetadata::open(&self.path)?;
         let mut issues = Vec::new();
         let mut warnings = Vec::new();
-        let storage = self.snapshot();
         let mut datasets = Vec::new();
 
         let tx_rows = read_tx_catalog_entries(&self.path)?;
@@ -313,9 +315,13 @@ impl Database {
         }
 
         for edge_def in self.schema_ir.edge_types() {
-            let src_nodes = collect_existing_ids(storage.get_all_nodes(&edge_def.src_type_name)?)?;
-            let dst_nodes = collect_existing_ids(storage.get_all_nodes(&edge_def.dst_type_name)?)?;
-            if let Some(edge_batch) = storage.edge_batch_for_save(&edge_def.name)? {
+            let src_nodes = collect_existing_ids(
+                read_sparse_node_batch(&metadata, &edge_def.src_type_name).await?,
+            )?;
+            let dst_nodes = collect_existing_ids(
+                read_sparse_node_batch(&metadata, &edge_def.dst_type_name).await?,
+            )?;
+            if let Some(edge_batch) = read_sparse_edge_batch(&metadata, &edge_def.name).await? {
                 let src_arr = edge_batch
                     .column_by_name("src")
                     .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?

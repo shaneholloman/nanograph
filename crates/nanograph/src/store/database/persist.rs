@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow_array::builder::BooleanBuilder;
 use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt64Array};
@@ -8,17 +9,17 @@ use lance::dataset::WriteMode;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::{debug, info};
 
+use super::mutation::{DatasetMutationPlan, EdgeDelta, MutationDelta, NodeDelta};
 use super::{
     Database, DatabaseWriteGuard, DeletePredicate, EmbedOptions, EmbedResult, LoadMode,
-    MutationPlan, MutationSource, load_mode_op_summary,
+    MutationPlan, MutationSource,
 };
-use super::mutation::{DatasetMutationPlan, EdgeDelta, MutationDelta, NodeDelta};
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 use crate::json_output::array_value_to_json;
 use crate::query::ast::{CompOp, Literal, MatchValue, Mutation, QueryDecl};
 use crate::result::MutationResult;
-use crate::store::graph::GraphStorage;
+use crate::store::graph::DatasetAccumulator;
 use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
 use crate::store::lance_io::{
     read_lance_batches, run_lance_delete_by_ids, run_lance_merge_insert_with_key,
@@ -26,17 +27,18 @@ use crate::store::lance_io::{
 };
 use crate::store::loader::{
     EmbedValueRequest, build_next_storage_for_load, build_next_storage_for_load_reader,
-    build_next_storage_for_load_reader_with_options, collect_embed_specs, json_values_to_array,
-    resolve_embedding_requests,
+    build_next_storage_for_load_reader_internal, build_next_storage_for_load_reader_with_options,
+    collect_embed_specs, json_values_to_array, resolve_embedding_requests,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::DatabaseMetadata;
+use crate::store::runtime::DatabaseRuntime;
 use crate::store::txlog::{CdcLogEntry, commit_manifest_and_logs};
 use crate::types::ScalarType;
 
 use super::cdc::{
     build_delete_cdc_events_from_batch, build_insert_cdc_events_from_batch, build_update_cdc_event,
-    deleted_ids_from_cdc_events, record_batch_row_to_json_map,
+    record_batch_row_to_json_map,
 };
 
 #[derive(Debug, Clone)]
@@ -101,11 +103,23 @@ impl Database {
         info!("starting database load");
         self.apply_mutation_plan_locked(MutationPlan::for_load(data_source, mode), writer)
             .await?;
-        let storage = self.snapshot();
+        let metadata = DatabaseMetadata::open(self.path())?;
+        let node_types = metadata
+            .manifest()
+            .datasets
+            .iter()
+            .filter(|entry| entry.kind == "node")
+            .count();
+        let edge_types = metadata
+            .manifest()
+            .datasets
+            .iter()
+            .filter(|entry| entry.kind == "edge")
+            .count();
         info!(
             mode = ?mode,
-            node_types = storage.node_segments.len(),
-            edge_types = storage.edge_segments.len(),
+            node_types,
+            edge_types,
             "database load complete"
         );
 
@@ -121,11 +135,23 @@ impl Database {
         info!(data_path = %data_path.display(), "starting database file load");
         self.apply_mutation_plan_locked(MutationPlan::for_load_file(data_path, mode), writer)
             .await?;
-        let storage = self.snapshot();
+        let metadata = DatabaseMetadata::open(self.path())?;
+        let node_types = metadata
+            .manifest()
+            .datasets
+            .iter()
+            .filter(|entry| entry.kind == "node")
+            .count();
+        let edge_types = metadata
+            .manifest()
+            .datasets
+            .iter()
+            .filter(|entry| entry.kind == "edge")
+            .count();
         info!(
             mode = ?mode,
-            node_types = storage.node_segments.len(),
-            edge_types = storage.edge_segments.len(),
+            node_types,
+            edge_types,
             "database file load complete"
         );
 
@@ -278,7 +304,10 @@ impl Database {
             mutation_plan.delta.node_changes.insert(
                 node_def.name.clone(),
                 NodeDelta {
-                    upserts: Some(json_rows_to_record_batch(batch.schema().as_ref(), &after_rows)?),
+                    upserts: Some(json_rows_to_record_batch(
+                        batch.schema().as_ref(),
+                        &after_rows,
+                    )?),
                     before_for_updates: Some(json_rows_to_record_batch(
                         batch.schema().as_ref(),
                         &before_rows,
@@ -358,9 +387,16 @@ impl Database {
         _writer: &mut DatabaseWriteGuard<'_>,
     ) -> Result<()> {
         let MutationPlan { source, op_summary } = plan;
-        let previous_storage = self.snapshot();
-        let (mut next_storage, effective_cdc_events) = match source {
+        match source {
             MutationSource::LoadString { mode, data_source } => {
+                if mode != LoadMode::Overwrite {
+                    persist_sparse_load_string_at_path(&self.path, &data_source, mode, &op_summary)
+                        .await?;
+                    self.refresh_runtime_storage_from_manifest()?;
+                    return Ok(());
+                }
+                let metadata = DatabaseMetadata::open(self.path())?;
+                let previous_storage = Arc::new(restore_full_existing_storage(&metadata).await?);
                 let load_result = build_next_storage_for_load(
                     &self.path,
                     previous_storage.as_ref(),
@@ -369,9 +405,24 @@ impl Database {
                     mode,
                 )
                 .await?;
-                (load_result.next_storage, load_result.cdc_events)
+                persist_dataset_mutation_plan_at_path(
+                    &self.path,
+                    &self.schema_ir,
+                    &load_result.plan,
+                )
+                .await?;
+                self.refresh_runtime_storage_from_manifest()?;
+                Ok(())
             }
             MutationSource::LoadFile { mode, data_path } => {
+                if mode != LoadMode::Overwrite {
+                    persist_sparse_load_file_at_path(&self.path, &data_path, mode, &op_summary)
+                        .await?;
+                    self.refresh_runtime_storage_from_manifest()?;
+                    return Ok(());
+                }
+                let metadata = DatabaseMetadata::open(self.path())?;
+                let previous_storage = Arc::new(restore_full_existing_storage(&metadata).await?);
                 let file = std::fs::File::open(&data_path)?;
                 let reader = BufReader::new(file);
                 let load_result = build_next_storage_for_load_reader(
@@ -382,75 +433,28 @@ impl Database {
                     mode,
                 )
                 .await?;
-                (load_result.next_storage, load_result.cdc_events)
+                persist_dataset_mutation_plan_at_path(
+                    &self.path,
+                    &self.schema_ir,
+                    &load_result.plan,
+                )
+                .await?;
+                self.refresh_runtime_storage_from_manifest()?;
+                Ok(())
             }
             MutationSource::PreparedDatasets(dataset_plan) => {
                 persist_dataset_mutation_plan_at_path(&self.path, &self.schema_ir, &dataset_plan)
                     .await?;
-                self.apply_dataset_mutation_plan_to_runtime(&dataset_plan)?;
-                return Ok(());
+                self.refresh_runtime_storage_from_manifest()?;
+                Ok(())
             }
-        };
-        self.persist_storage_with_cdc(&mut next_storage, &op_summary, &effective_cdc_events)
-            .await?;
-        self.replace_storage(next_storage);
-        Ok(())
+        }
     }
 
-    fn apply_dataset_mutation_plan_to_runtime(&self, plan: &DatasetMutationPlan) -> Result<()> {
+    fn refresh_runtime_storage_from_manifest(&self) -> Result<()> {
         let refreshed = DatabaseMetadata::open(self.path())?;
-        let mut runtime_storage = self.snapshot().as_ref().clone();
-        runtime_storage.set_next_node_id(plan.next_node_id);
-        runtime_storage.set_next_edge_id(plan.next_edge_id);
-
-        for (type_name, replacement) in &plan.node_replacements {
-            match replacement {
-                Some(batch) => {
-                    runtime_storage.replace_node_batch(type_name, batch.clone())?;
-                    if let Some(locator) = refreshed.node_dataset_locator(type_name) {
-                        runtime_storage.set_node_dataset_path(type_name, locator.dataset_path);
-                        runtime_storage.set_node_dataset_version(type_name, locator.dataset_version);
-                    }
-                }
-                None => {
-                    runtime_storage.clear_node_type(type_name)?;
-                }
-            }
-        }
-
-        for (type_name, replacement) in &plan.edge_replacements {
-            match replacement {
-                Some(batch) => {
-                    runtime_storage.replace_edge_batch(type_name, batch.clone())?;
-                    if let Some(locator) = refreshed.edge_dataset_locator(type_name) {
-                        runtime_storage.set_edge_dataset_path(type_name, locator.dataset_path);
-                        runtime_storage.set_edge_dataset_version(type_name, locator.dataset_version);
-                    }
-                }
-                None => {
-                    runtime_storage.clear_edge_type(type_name)?;
-                }
-            }
-        }
-
-        self.replace_storage(runtime_storage);
+        self.replace_runtime(Arc::new(DatabaseRuntime::from_metadata(&refreshed)));
         Ok(())
-    }
-
-    async fn persist_storage_with_cdc(
-        &self,
-        storage: &mut GraphStorage,
-        op_summary: &str,
-        cdc_events: &[CdcLogEntry],
-    ) -> Result<()> {
-        persist_storage_with_cdc_at_path(
-            &self.path,
-            &self.schema_ir,
-            storage,
-            op_summary,
-            cdc_events,
-        )
-        .await
     }
 
     async fn rebuild_vector_indexes_for_types(
@@ -461,13 +465,13 @@ impl Database {
             return Ok(0);
         }
 
-        let storage = self.snapshot();
+        let runtime = self.current_runtime();
         let mut rebuilt = 0usize;
         for node_def in self.schema_ir.node_types() {
             if !type_names.contains(&node_def.name) {
                 continue;
             }
-            let Some(dataset_path) = storage.node_dataset_path(&node_def.name) else {
+            let Some(dataset_path) = runtime.node_dataset_path(&node_def.name) else {
                 continue;
             };
             rebuild_node_vector_indexes(dataset_path, node_def).await?;
@@ -493,7 +497,7 @@ pub async fn load_database_file_sparse(
         build_sparse_existing_storage_for_load(&metadata, data_path, mode).await?;
     let file = std::fs::File::open(data_path)?;
     let reader = BufReader::new(file);
-    let mut load_result = build_next_storage_for_load_reader_with_options(
+    let load_result = build_next_storage_for_load_reader_with_options(
         db_path,
         &existing_storage,
         metadata.schema_ir(),
@@ -502,14 +506,71 @@ pub async fn load_database_file_sparse(
         false,
     )
     .await?;
-    persist_storage_with_cdc_at_path(
-        db_path,
-        metadata.schema_ir(),
-        &mut load_result.next_storage,
-        load_mode_op_summary(mode),
-        &load_result.cdc_events,
+    persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &load_result.plan).await
+}
+
+async fn persist_sparse_load_string_at_path(
+    db_path: &Path,
+    data_source: &str,
+    mode: LoadMode,
+    op_summary: &str,
+) -> Result<()> {
+    if matches!(mode, LoadMode::Overwrite) {
+        return Err(NanoError::Storage(
+            "sparse string load only supports append and merge".to_string(),
+        ));
+    }
+
+    let metadata = DatabaseMetadata::open(db_path)?;
+    let existing_storage = build_sparse_existing_storage_for_load_reader(
+        &metadata,
+        Cursor::new(data_source.as_bytes()),
+        mode,
     )
-    .await
+    .await?;
+    let load_result = build_next_storage_for_load_reader_with_options(
+        db_path,
+        &existing_storage,
+        metadata.schema_ir(),
+        Cursor::new(data_source.as_bytes()),
+        mode,
+        false,
+    )
+    .await?;
+    let mut plan = load_result.plan;
+    plan.op_summary = op_summary.to_string();
+    persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &plan).await
+}
+
+async fn persist_sparse_load_file_at_path(
+    db_path: &Path,
+    data_path: &Path,
+    mode: LoadMode,
+    op_summary: &str,
+) -> Result<()> {
+    if matches!(mode, LoadMode::Overwrite) {
+        return Err(NanoError::Storage(
+            "sparse file load only supports append and merge".to_string(),
+        ));
+    }
+
+    let metadata = DatabaseMetadata::open(db_path)?;
+    let existing_storage =
+        build_sparse_existing_storage_for_load(&metadata, data_path, mode).await?;
+    let file = std::fs::File::open(data_path)?;
+    let reader = BufReader::new(file);
+    let load_result = build_next_storage_for_load_reader_with_options(
+        db_path,
+        &existing_storage,
+        metadata.schema_ir(),
+        reader,
+        mode,
+        false,
+    )
+    .await?;
+    let mut plan = load_result.plan;
+    plan.op_summary = op_summary.to_string();
+    persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &plan).await
 }
 
 pub async fn run_mutation_query_sparse(
@@ -540,13 +601,12 @@ pub async fn run_mutation_query_sparse(
                     "data": data
                 })
                 .to_string();
-                let (existing_storage, next_storage) =
-                    build_sparse_storage_transition_from_string(
-                        &metadata,
-                        &payload,
-                        LoadMode::Append,
-                    )
-                    .await?;
+                let (existing_storage, next_storage) = build_sparse_storage_transition_from_string(
+                    &metadata,
+                    &payload,
+                    LoadMode::Append,
+                )
+                .await?;
                 let Some(inserted_batch) = extract_appended_node_batch(
                     &existing_storage,
                     &next_storage,
@@ -572,8 +632,12 @@ pub async fn run_mutation_query_sparse(
                         ..Default::default()
                     },
                 );
-                persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &mutation_plan)
-                    .await?;
+                persist_dataset_mutation_plan_at_path(
+                    db_path,
+                    metadata.schema_ir(),
+                    &mutation_plan,
+                )
+                .await?;
                 return Ok(MutationResult {
                     affected_nodes,
                     affected_edges: 0,
@@ -621,13 +685,12 @@ pub async fn run_mutation_query_sparse(
                     "data": data
                 })
                 .to_string();
-                let (existing_storage, next_storage) =
-                    build_sparse_storage_transition_from_string(
-                        &metadata,
-                        &payload,
-                        LoadMode::Append,
-                    )
-                    .await?;
+                let (existing_storage, next_storage) = build_sparse_storage_transition_from_string(
+                    &metadata,
+                    &payload,
+                    LoadMode::Append,
+                )
+                .await?;
                 let Some(inserted_batch) = extract_appended_edge_batch(
                     &existing_storage,
                     &next_storage,
@@ -653,8 +716,12 @@ pub async fn run_mutation_query_sparse(
                         ..Default::default()
                     },
                 );
-                persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &mutation_plan)
-                    .await?;
+                persist_dataset_mutation_plan_at_path(
+                    db_path,
+                    metadata.schema_ir(),
+                    &mutation_plan,
+                )
+                .await?;
                 return Ok(MutationResult {
                     affected_nodes: 0,
                     affected_edges,
@@ -783,13 +850,12 @@ pub async fn run_mutation_query_sparse(
 
             let before_batch = json_rows_to_record_batch(schema.as_ref(), &before_rows)?;
             let after_batch = json_rows_to_record_batch(schema.as_ref(), &after_rows)?;
-            let (_existing_storage, next_storage) =
-                build_sparse_storage_transition_from_string(
-                    &metadata,
-                    &payload_lines.join("\n"),
-                    LoadMode::Merge,
-                )
-                .await?;
+            let (_existing_storage, next_storage) = build_sparse_storage_transition_from_string(
+                &metadata,
+                &payload_lines.join("\n"),
+                LoadMode::Merge,
+            )
+            .await?;
             let affected_nodes = after_batch.num_rows();
             let mut mutation_plan = DatasetMutationPlan::new(
                 "mutation:update_node",
@@ -873,8 +939,12 @@ pub async fn run_mutation_query_sparse(
                         ..Default::default()
                     },
                 );
-                persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &mutation_plan)
-                    .await?;
+                persist_dataset_mutation_plan_at_path(
+                    db_path,
+                    metadata.schema_ir(),
+                    &mutation_plan,
+                )
+                .await?;
                 return Ok(MutationResult {
                     affected_nodes: delete_ids.len(),
                     affected_edges: 0,
@@ -931,8 +1001,12 @@ pub async fn run_mutation_query_sparse(
                         ..Default::default()
                     },
                 );
-                persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &mutation_plan)
-                    .await?;
+                persist_dataset_mutation_plan_at_path(
+                    db_path,
+                    metadata.schema_ir(),
+                    &mutation_plan,
+                )
+                .await?;
                 return Ok(MutationResult {
                     affected_nodes: 0,
                     affected_edges: delete_ids.len(),
@@ -950,14 +1024,14 @@ async fn build_sparse_storage_transition_from_string(
     metadata: &DatabaseMetadata,
     data_source: &str,
     mode: LoadMode,
-) -> Result<(GraphStorage, GraphStorage)> {
+) -> Result<(DatasetAccumulator, DatasetAccumulator)> {
     let existing_storage = build_sparse_existing_storage_for_load_reader(
         metadata,
         Cursor::new(data_source.as_bytes()),
         mode,
     )
     .await?;
-    let load_result = build_next_storage_for_load_reader_with_options(
+    let load_result = build_next_storage_for_load_reader_internal(
         metadata.path(),
         &existing_storage,
         metadata.schema_ir(),
@@ -970,8 +1044,8 @@ async fn build_sparse_storage_transition_from_string(
 }
 
 fn extract_appended_node_batch(
-    existing_storage: &GraphStorage,
-    next_storage: &GraphStorage,
+    existing_storage: &DatasetAccumulator,
+    next_storage: &DatasetAccumulator,
     type_name: &str,
 ) -> Result<Option<RecordBatch>> {
     extract_appended_batch(
@@ -983,8 +1057,8 @@ fn extract_appended_node_batch(
 }
 
 fn extract_appended_edge_batch(
-    existing_storage: &GraphStorage,
-    next_storage: &GraphStorage,
+    existing_storage: &DatasetAccumulator,
+    next_storage: &DatasetAccumulator,
     type_name: &str,
 ) -> Result<Option<RecordBatch>> {
     extract_appended_batch(
@@ -1267,312 +1341,11 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
     manifest.schema_identity_version = previous_manifest.schema_identity_version.max(1);
     manifest.datasets = dataset_entries;
 
-    let committed_cdc_events =
-        finalize_cdc_entries_for_manifest(&build_pending_cdc_entries_from_delta(&plan.delta)?, &manifest);
+    let committed_cdc_events = finalize_cdc_entries_for_manifest(
+        &build_pending_cdc_entries_from_delta(&plan.delta)?,
+        &manifest,
+    );
     commit_manifest_and_logs(db_path, &manifest, &committed_cdc_events, &plan.op_summary)?;
-
-    super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
-    Ok(())
-}
-
-async fn persist_storage_with_cdc_at_path(
-    db_path: &Path,
-    schema_ir: &SchemaIR,
-    storage: &mut GraphStorage,
-    op_summary: &str,
-    cdc_events: &[CdcLogEntry],
-) -> Result<()> {
-    let previous_manifest = GraphManifest::read(db_path)?;
-    storage.clear_node_dataset_paths();
-    let mut dataset_entries = Vec::new();
-    let mut previous_entries_by_key: HashMap<String, DatasetEntry> = HashMap::new();
-    for entry in &previous_manifest.datasets {
-        previous_entries_by_key.insert(
-            dataset_entity_key(&entry.kind, &entry.type_name),
-            entry.clone(),
-        );
-    }
-
-    let mut changed_entities: HashSet<String> = HashSet::new();
-    let mut non_insert_entities: HashSet<String> = HashSet::new();
-    let mut non_upsert_entities: HashSet<String> = HashSet::new();
-    let mut non_delete_entities: HashSet<String> = HashSet::new();
-    let mut insert_events_by_entity: HashMap<String, Vec<&CdcLogEntry>> = HashMap::new();
-    let mut upsert_events_by_entity: HashMap<String, Vec<&CdcLogEntry>> = HashMap::new();
-    let mut delete_events_by_entity: HashMap<String, Vec<&CdcLogEntry>> = HashMap::new();
-    for event in cdc_events {
-        let key = dataset_entity_key(&event.entity_kind, &event.type_name);
-        changed_entities.insert(key.clone());
-        if event.op == "insert" {
-            insert_events_by_entity
-                .entry(key.clone())
-                .or_default()
-                .push(event);
-            upsert_events_by_entity.entry(key).or_default().push(event);
-            non_delete_entities.insert(dataset_entity_key(&event.entity_kind, &event.type_name));
-        } else if event.op == "update" {
-            non_insert_entities.insert(key.clone());
-            upsert_events_by_entity.entry(key).or_default().push(event);
-            non_delete_entities.insert(dataset_entity_key(&event.entity_kind, &event.type_name));
-        } else if event.op == "delete" {
-            non_insert_entities.insert(key.clone());
-            non_upsert_entities.insert(key.clone());
-            delete_events_by_entity.entry(key).or_default().push(event);
-        } else {
-            non_insert_entities.insert(key.clone());
-            non_upsert_entities.insert(key);
-            non_delete_entities.insert(dataset_entity_key(&event.entity_kind, &event.type_name));
-        }
-    }
-    let append_only_commit = op_summary == "load:append";
-    let merge_commit = op_summary == "load:merge" || op_summary == "mutation:update_node";
-
-    for node_def in schema_ir.node_types() {
-        let entity_key = dataset_entity_key("node", &node_def.name);
-        let previous_entry = previous_entries_by_key.get(&entity_key).cloned();
-        let batch = storage.get_all_nodes(&node_def.name)?;
-
-        if !changed_entities.contains(&entity_key) {
-            if let Some(prev) = previous_entry {
-                if batch.is_some() {
-                    storage.set_node_dataset_path(&node_def.name, db_path.join(&prev.dataset_path));
-                }
-                dataset_entries.push(prev);
-            }
-            continue;
-        }
-
-        let Some(batch) = batch else {
-            continue;
-        };
-
-        let row_count = batch.num_rows() as u64;
-        let dataset_rel_path = previous_entry
-            .as_ref()
-            .map(|entry| entry.dataset_path.clone())
-            .unwrap_or_else(|| format!("nodes/{}", SchemaIR::dir_name(node_def.type_id)));
-        let dataset_path = db_path.join(&dataset_rel_path);
-        let duplicate_field_names = schema_has_duplicate_field_names(batch.schema().as_ref());
-        let key_prop = node_def
-            .properties
-            .iter()
-            .find(|prop| prop.key)
-            .map(|prop| prop.name.as_str());
-        let can_merge_upsert = merge_commit
-            && !duplicate_field_names
-            && previous_entry.is_some()
-            && key_prop.is_some()
-            && !non_upsert_entities.contains(&entity_key);
-        let can_append = append_only_commit
-            && !duplicate_field_names
-            && previous_entry.is_some()
-            && !non_insert_entities.contains(&entity_key);
-        let can_native_delete =
-            previous_entry.is_some() && !non_delete_entities.contains(&entity_key);
-        let dataset_version = if can_merge_upsert {
-            let upsert_events = upsert_events_by_entity
-                .get(&entity_key)
-                .map(|rows| rows.as_slice())
-                .unwrap_or(&[]);
-            match build_upsert_batch_from_cdc(batch.schema(), upsert_events)? {
-                Some(source_batch) if source_batch.num_rows() > 0 => {
-                    let key_prop = key_prop.unwrap_or_default();
-                    let pinned_version = previous_entry
-                        .as_ref()
-                        .map(|entry| entry.dataset_version)
-                        .ok_or_else(|| {
-                            NanoError::Storage(format!(
-                                "missing previous dataset version for {}",
-                                node_def.name
-                            ))
-                        })?;
-                    debug!(
-                        node_type = %node_def.name,
-                        rows = source_batch.num_rows(),
-                        key_prop = key_prop,
-                        "merging node rows into existing Lance dataset"
-                    );
-                    run_lance_merge_insert_with_key(
-                        &dataset_path,
-                        pinned_version,
-                        source_batch,
-                        key_prop,
-                    )
-                    .await?
-                }
-                _ => previous_entry
-                    .as_ref()
-                    .map(|entry| entry.dataset_version)
-                    .unwrap_or(0),
-            }
-        } else if can_append {
-            let insert_events = insert_events_by_entity
-                .get(&entity_key)
-                .map(|rows| rows.as_slice())
-                .unwrap_or(&[]);
-            match build_append_batch_from_cdc(batch.schema(), insert_events)? {
-                Some(delta_batch) if delta_batch.num_rows() > 0 => {
-                    debug!(
-                        node_type = %node_def.name,
-                        rows = delta_batch.num_rows(),
-                        "appending node rows to existing Lance dataset"
-                    );
-                    write_lance_batch_with_mode(&dataset_path, delta_batch, WriteMode::Append)
-                        .await?
-                }
-                _ => previous_entry
-                    .as_ref()
-                    .map(|entry| entry.dataset_version)
-                    .unwrap_or(0),
-            }
-        } else if can_native_delete {
-            let delete_events = delete_events_by_entity
-                .get(&entity_key)
-                .map(|rows| rows.as_slice())
-                .unwrap_or(&[]);
-            let delete_ids = deleted_ids_from_cdc_events(delete_events)?;
-            let pinned_version = previous_entry
-                .as_ref()
-                .map(|entry| entry.dataset_version)
-                .ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "missing previous dataset version for {}",
-                        node_def.name
-                    ))
-                })?;
-            debug!(
-                node_type = %node_def.name,
-                rows = delete_ids.len(),
-                "deleting node rows from existing Lance dataset"
-            );
-            run_lance_delete_by_ids(&dataset_path, pinned_version, &delete_ids).await?
-        } else {
-            debug!(
-                node_type = %node_def.name,
-                rows = row_count,
-                "writing node dataset"
-            );
-            write_lance_batch(&dataset_path, batch).await?
-        };
-        rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
-        rebuild_node_vector_indexes(&dataset_path, node_def).await?;
-        storage.set_node_dataset_path(&node_def.name, dataset_path.clone());
-        dataset_entries.push(DatasetEntry {
-            type_id: node_def.type_id,
-            type_name: node_def.name.clone(),
-            kind: "node".to_string(),
-            dataset_path: dataset_rel_path,
-            dataset_version,
-            row_count,
-        });
-    }
-
-    for edge_def in schema_ir.edge_types() {
-        let entity_key = dataset_entity_key("edge", &edge_def.name);
-        let previous_entry = previous_entries_by_key.get(&entity_key).cloned();
-        let batch = storage.edge_batch_for_save(&edge_def.name)?;
-
-        if !changed_entities.contains(&entity_key) {
-            if let Some(prev) = previous_entry {
-                dataset_entries.push(prev);
-            }
-            continue;
-        }
-
-        let Some(batch) = batch else {
-            continue;
-        };
-
-        let row_count = batch.num_rows() as u64;
-        let dataset_rel_path = previous_entry
-            .as_ref()
-            .map(|entry| entry.dataset_path.clone())
-            .unwrap_or_else(|| format!("edges/{}", SchemaIR::dir_name(edge_def.type_id)));
-        let dataset_path = db_path.join(&dataset_rel_path);
-        let duplicate_field_names = schema_has_duplicate_field_names(batch.schema().as_ref());
-        let can_append = append_only_commit
-            && !duplicate_field_names
-            && previous_entry.is_some()
-            && !non_insert_entities.contains(&entity_key);
-        let can_native_delete =
-            previous_entry.is_some() && !non_delete_entities.contains(&entity_key);
-        let dataset_version = if can_append {
-            let insert_events = insert_events_by_entity
-                .get(&entity_key)
-                .map(|rows| rows.as_slice())
-                .unwrap_or(&[]);
-            match build_append_batch_from_cdc(batch.schema(), insert_events)? {
-                Some(delta_batch) if delta_batch.num_rows() > 0 => {
-                    debug!(
-                        edge_type = %edge_def.name,
-                        rows = delta_batch.num_rows(),
-                        "appending edge rows to existing Lance dataset"
-                    );
-                    write_lance_batch_with_mode(&dataset_path, delta_batch, WriteMode::Append)
-                        .await?
-                }
-                _ => previous_entry
-                    .as_ref()
-                    .map(|entry| entry.dataset_version)
-                    .unwrap_or(0),
-            }
-        } else if can_native_delete {
-            let delete_events = delete_events_by_entity
-                .get(&entity_key)
-                .map(|rows| rows.as_slice())
-                .unwrap_or(&[]);
-            let delete_ids = deleted_ids_from_cdc_events(delete_events)?;
-            let pinned_version = previous_entry
-                .as_ref()
-                .map(|entry| entry.dataset_version)
-                .ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "missing previous dataset version for {}",
-                        edge_def.name
-                    ))
-                })?;
-            debug!(
-                edge_type = %edge_def.name,
-                rows = delete_ids.len(),
-                "deleting edge rows from existing Lance dataset"
-            );
-            run_lance_delete_by_ids(&dataset_path, pinned_version, &delete_ids).await?
-        } else {
-            debug!(
-                edge_type = %edge_def.name,
-                rows = row_count,
-                "writing edge dataset"
-            );
-            write_lance_batch(&dataset_path, batch).await?
-        };
-        dataset_entries.push(DatasetEntry {
-            type_id: edge_def.type_id,
-            type_name: edge_def.name.clone(),
-            kind: "edge".to_string(),
-            dataset_path: dataset_rel_path,
-            dataset_version,
-            row_count,
-        });
-    }
-
-    let ir_json = serde_json::to_string_pretty(schema_ir)
-        .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
-    let ir_hash = hash_string(&ir_json);
-
-    let mut manifest = GraphManifest::new(ir_hash);
-    manifest.db_version = previous_manifest.db_version.saturating_add(1);
-    manifest.last_tx_id = format!("manifest-{}", manifest.db_version);
-    manifest.committed_at = super::now_unix_seconds_string();
-    manifest.next_node_id = storage.next_node_id();
-    manifest.next_edge_id = storage.next_edge_id();
-    let (next_type_id, next_prop_id) = super::next_schema_identity_counters(schema_ir);
-    manifest.next_type_id = next_type_id;
-    manifest.next_prop_id = next_prop_id;
-    manifest.schema_identity_version = previous_manifest.schema_identity_version.max(1);
-    manifest.datasets = dataset_entries;
-
-    let committed_cdc_events = finalize_cdc_entries_for_manifest(cdc_events, &manifest);
-    commit_manifest_and_logs(db_path, &manifest, &committed_cdc_events, op_summary)?;
 
     super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
     Ok(())
@@ -1588,7 +1361,7 @@ async fn build_sparse_existing_storage_for_load(
     metadata: &DatabaseMetadata,
     data_path: &Path,
     mode: LoadMode,
-) -> Result<GraphStorage> {
+) -> Result<DatasetAccumulator> {
     let file = std::fs::File::open(data_path)?;
     build_sparse_existing_storage_for_load_reader(metadata, BufReader::new(file), mode).await
 }
@@ -1597,11 +1370,27 @@ async fn build_sparse_existing_storage_for_load_reader<R: BufRead>(
     metadata: &DatabaseMetadata,
     reader: R,
     mode: LoadMode,
-) -> Result<GraphStorage> {
+) -> Result<DatasetAccumulator> {
     let incoming_types = collect_incoming_load_types(metadata, reader)?;
     let (required_node_types, required_edge_types) =
         sparse_load_restore_scope(metadata.schema_ir(), &incoming_types, mode)?;
     restore_sparse_existing_storage(metadata, &required_node_types, &required_edge_types).await
+}
+
+async fn restore_full_existing_storage(metadata: &DatabaseMetadata) -> Result<DatasetAccumulator> {
+    let node_types = metadata
+        .catalog()
+        .node_types
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let edge_types = metadata
+        .catalog()
+        .edge_types
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    restore_sparse_existing_storage(metadata, &node_types, &edge_types).await
 }
 
 fn collect_incoming_load_types<R: BufRead>(
@@ -1684,8 +1473,8 @@ async fn restore_sparse_existing_storage(
     metadata: &DatabaseMetadata,
     node_types: &HashSet<String>,
     edge_types: &HashSet<String>,
-) -> Result<GraphStorage> {
-    let mut storage = GraphStorage::new(metadata.catalog().clone());
+) -> Result<DatasetAccumulator> {
+    let mut storage = DatasetAccumulator::new(metadata.catalog().clone());
     storage.set_next_node_id(metadata.manifest().next_node_id);
     storage.set_next_edge_id(metadata.manifest().next_edge_id);
 
@@ -1839,7 +1628,7 @@ async fn map_sparse_edge_delete_predicate(
     }
 }
 
-async fn resolve_sparse_node_id_by_name(
+pub(crate) async fn resolve_sparse_node_id_by_name(
     metadata: &DatabaseMetadata,
     node_type: &str,
     node_name: &str,
@@ -2071,111 +1860,6 @@ fn json_rows_to_record_batch(
 
 fn dataset_entity_key(kind: &str, type_name: &str) -> String {
     format!("{}:{}", kind, type_name)
-}
-
-fn build_append_batch_from_cdc(
-    schema: std::sync::Arc<arrow_schema::Schema>,
-    insert_events: &[&CdcLogEntry],
-) -> Result<Option<RecordBatch>> {
-    if insert_events.is_empty() {
-        return Ok(None);
-    }
-
-    let mut values_by_column: Vec<Vec<serde_json::Value>> = schema
-        .fields()
-        .iter()
-        .map(|_| Vec::with_capacity(insert_events.len()))
-        .collect();
-
-    for event in insert_events {
-        let payload = event.payload.as_object().ok_or_else(|| {
-            NanoError::Storage(format!(
-                "CDC insert payload must be object for {} {}",
-                event.entity_kind, event.type_name
-            ))
-        })?;
-        for (idx, field) in schema.fields().iter().enumerate() {
-            values_by_column[idx].push(
-                payload
-                    .get(field.name())
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let arr = json_values_to_array(
-            &values_by_column[idx],
-            field.data_type(),
-            field.is_nullable(),
-        )?;
-        columns.push(arr);
-    }
-
-    let batch = RecordBatch::try_new(schema, columns)
-        .map_err(|e| NanoError::Storage(format!("append CDC batch build error: {}", e)))?;
-    Ok(Some(batch))
-}
-
-fn build_upsert_batch_from_cdc(
-    schema: std::sync::Arc<arrow_schema::Schema>,
-    upsert_events: &[&CdcLogEntry],
-) -> Result<Option<RecordBatch>> {
-    if upsert_events.is_empty() {
-        return Ok(None);
-    }
-
-    let mut values_by_column: Vec<Vec<serde_json::Value>> = schema
-        .fields()
-        .iter()
-        .map(|_| Vec::with_capacity(upsert_events.len()))
-        .collect();
-
-    for event in upsert_events {
-        let row = match event.op.as_str() {
-            "insert" => event.payload.as_object(),
-            "update" => event
-                .payload
-                .get("after")
-                .and_then(|value| value.as_object()),
-            op => {
-                return Err(NanoError::Storage(format!(
-                    "unsupported CDC op '{}' for upsert source",
-                    op
-                )));
-            }
-        }
-        .ok_or_else(|| {
-            NanoError::Storage(format!(
-                "CDC {} payload missing object row for {} {}",
-                event.op, event.entity_kind, event.type_name
-            ))
-        })?;
-
-        for (idx, field) in schema.fields().iter().enumerate() {
-            values_by_column[idx].push(
-                row.get(field.name())
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let arr = json_values_to_array(
-            &values_by_column[idx],
-            field.data_type(),
-            field.is_nullable(),
-        )?;
-        columns.push(arr);
-    }
-
-    let batch = RecordBatch::try_new(schema, columns)
-        .map_err(|e| NanoError::Storage(format!("upsert CDC batch build error: {}", e)))?;
-    Ok(Some(batch))
 }
 
 fn build_pending_cdc_entries_from_delta(delta: &MutationDelta) -> Result<Vec<CdcLogEntry>> {

@@ -18,14 +18,14 @@ use arrow_schema::{DataType, Field, Schema};
 
 use crate::error::{NanoError, Result};
 
-use super::super::graph::GraphStorage;
+use super::super::graph::DatasetAccumulator;
 use super::constraints::{key_value_string, node_property_field};
 
 #[cfg_attr(not(test), allow(dead_code))]
-/// Load JSONL-formatted data into a GraphStorage.
+/// Load JSONL-formatted data into a DatasetAccumulator.
 /// Each line is either a node `{"type": "...", "data": {...}}` or edge `{"edge": "...", "from": "...", "to": "..."}`.
 pub(crate) fn load_jsonl_data(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     data: &str,
     key_props: &HashMap<String, String>,
 ) -> Result<()> {
@@ -33,10 +33,10 @@ pub(crate) fn load_jsonl_data(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-/// Load JSONL-formatted data into a GraphStorage with an optional pre-populated
+/// Load JSONL-formatted data into a DatasetAccumulator with an optional pre-populated
 /// @key-value-to-id mapping for resolving edges that reference existing nodes.
 pub(crate) fn load_jsonl_data_with_name_seed(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     data: &str,
     key_props: &HashMap<String, String>,
     name_seed: Option<&HashMap<(String, String), u64>>,
@@ -47,7 +47,7 @@ pub(crate) fn load_jsonl_data_with_name_seed(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn load_jsonl_reader<R: BufRead>(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     reader: R,
     key_props: &HashMap<String, String>,
 ) -> Result<()> {
@@ -56,7 +56,7 @@ pub(crate) fn load_jsonl_reader<R: BufRead>(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn load_jsonl_reader_with_name_seed<R: BufRead>(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     reader: R,
     key_props: &HashMap<String, String>,
     name_seed: Option<&HashMap<(String, String), u64>>,
@@ -66,7 +66,7 @@ pub(crate) fn load_jsonl_reader_with_name_seed<R: BufRead>(
 }
 
 pub(crate) fn load_jsonl_reader_with_name_seed_at_path<R: BufRead>(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     spool_dir: &Path,
     reader: R,
     key_props: &HashMap<String, String>,
@@ -186,7 +186,7 @@ impl Drop for TempSpoolPaths {
 }
 
 fn load_spooled_nodes(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     type_name: &str,
     path: &Path,
     key_props: &HashMap<String, String>,
@@ -240,7 +240,7 @@ fn load_spooled_nodes(
 }
 
 fn flush_node_rows(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     type_name: &str,
     rows: &mut Vec<PendingNodeRow>,
     key_props: &HashMap<String, String>,
@@ -331,7 +331,7 @@ fn flush_node_rows(
 }
 
 fn load_spooled_edges(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     edge_name: &str,
     path: &Path,
     key_props: &HashMap<String, String>,
@@ -373,7 +373,7 @@ fn load_spooled_edges(
 }
 
 fn insert_resolved_edge_chunk(
-    storage: &mut GraphStorage,
+    storage: &mut DatasetAccumulator,
     edge_name: &str,
     edges: &[&ResolvedEdge],
 ) -> Result<()> {
@@ -434,7 +434,7 @@ fn insert_resolved_edge_chunk(
 }
 
 fn resolve_edge_object(
-    storage: &GraphStorage,
+    storage: &DatasetAccumulator,
     edge_obj: &serde_json::Value,
     key_props: &HashMap<String, String>,
     key_to_id: &HashMap<(String, String), u64>,
@@ -533,12 +533,12 @@ fn resolve_edge_object(
     })
 }
 
-fn resolve_edge_name(storage: &GraphStorage, edge_type: &str) -> Result<String> {
+fn resolve_edge_name(storage: &DatasetAccumulator, edge_type: &str) -> Result<String> {
     Ok(resolve_edge_type(storage, edge_type)?.name.clone())
 }
 
 fn resolve_edge_type<'a>(
-    storage: &'a GraphStorage,
+    storage: &'a DatasetAccumulator,
     edge_type: &str,
 ) -> Result<&'a crate::catalog::EdgeType> {
     storage
@@ -1214,18 +1214,18 @@ edge Knows: Person -> Person
 "#
     }
 
-    fn build_storage(schema_src: &str) -> GraphStorage {
+    fn build_storage(schema_src: &str) -> DatasetAccumulator {
         let schema = parse_schema(schema_src).unwrap();
         let ir = build_schema_ir(&schema).unwrap();
         let catalog = build_catalog_from_ir(&ir).unwrap();
-        GraphStorage::new(catalog)
+        DatasetAccumulator::new(catalog)
     }
 
     fn person_key_props() -> HashMap<String, String> {
         HashMap::from([("Person".to_string(), "name".to_string())])
     }
 
-    fn person_id_by_name(storage: &GraphStorage, name: &str) -> u64 {
+    fn person_id_by_name(storage: &DatasetAccumulator, name: &str) -> u64 {
         let batch = storage.get_all_nodes("Person").unwrap().unwrap();
         let id_col = batch
             .column(0)

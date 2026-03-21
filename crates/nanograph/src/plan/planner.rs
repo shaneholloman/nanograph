@@ -20,9 +20,8 @@ use crate::embedding::EmbeddingClient;
 use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
-use crate::store::database::EdgeIndexCache;
-use crate::store::graph::GraphStorage;
 use crate::store::lance_io::logical_node_field_to_lance;
+use crate::store::runtime::DatabaseRuntime;
 use crate::types::ScalarType;
 use tracing::{debug, info, instrument};
 
@@ -32,25 +31,13 @@ use super::physical::{ExpandExec, ExpandSpec};
 
 type ScanProjectionMap = AHashMap<String, Option<AHashSet<String>>>;
 
-/// Execute a query IR against a graph storage, returning a RecordBatch of results.
-#[instrument(skip(ir, storage, params), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
-pub async fn execute_query(
+#[instrument(skip(ir, runtime, params), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
+pub(crate) async fn execute_query_with_runtime(
     ir: &QueryIR,
-    storage: Arc<GraphStorage>,
+    runtime: Arc<DatabaseRuntime>,
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
-    execute_query_with_edge_index_cache(ir, storage, params, Arc::new(EdgeIndexCache::default()))
-        .await
-}
-
-#[instrument(skip(ir, storage, params, edge_index_cache), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
-pub(crate) async fn execute_query_with_edge_index_cache(
-    ir: &QueryIR,
-    storage: Arc<GraphStorage>,
-    params: &ParamMap,
-    edge_index_cache: Arc<EdgeIndexCache>,
-) -> Result<Vec<RecordBatch>> {
-    let resolved_ir = resolve_nearest_query_embeddings(ir, storage.as_ref(), params).await?;
+    let resolved_ir = resolve_nearest_query_embeddings(ir, runtime.as_ref(), params).await?;
     info!("executing query");
     let has_aggregation = resolved_ir
         .return_exprs
@@ -61,7 +48,7 @@ pub(crate) async fn execute_query_with_edge_index_cache(
         && let Some(candidate) = analyze_single_node_nearest_ann_candidate(&resolved_ir, params)
         && let Some(result) = try_execute_single_node_nearest_ann_fast_path(
             &resolved_ir,
-            storage.clone(),
+            runtime.clone(),
             params,
             &candidate,
         )
@@ -91,8 +78,7 @@ pub(crate) async fn execute_query_with_edge_index_cache(
     // Build the physical plan from IR
     let plan = build_physical_plan(
         &resolved_ir.pipeline,
-        storage.clone(),
-        edge_index_cache,
+        runtime.clone(),
         params,
         scan_limit_pushdown,
         &scan_projections,
@@ -256,14 +242,14 @@ fn analyze_single_node_nearest_ann_candidate(
 
 async fn resolve_nearest_query_embeddings(
     ir: &QueryIR,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     params: &ParamMap,
 ) -> Result<QueryIR> {
     let mut variable_types = AHashMap::<String, String>::new();
     collect_variable_types_from_ops(&ir.pipeline, &mut variable_types);
 
     let mut requests = AHashSet::<(String, usize)>::new();
-    collect_nearest_embedding_requests(ir, storage, &variable_types, params, &mut requests)?;
+    collect_nearest_embedding_requests(ir, runtime, &variable_types, params, &mut requests)?;
     if requests.is_empty() {
         return Ok(ir.clone());
     }
@@ -278,7 +264,7 @@ async fn resolve_nearest_query_embeddings(
     let mut resolved = ir.clone();
     apply_resolved_nearest_embeddings(
         &mut resolved,
-        storage,
+        runtime,
         &variable_types,
         params,
         &resolved_vectors,
@@ -311,18 +297,18 @@ fn collect_variable_types_from_ops(ops: &[IROp], variable_types: &mut AHashMap<S
 
 fn collect_nearest_embedding_requests(
     ir: &QueryIR,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     params: &ParamMap,
     out: &mut AHashSet<(String, usize)>,
 ) -> Result<()> {
     for op in &ir.pipeline {
-        collect_nearest_embedding_requests_from_op(op, storage, variable_types, params, out)?;
+        collect_nearest_embedding_requests_from_op(op, runtime, variable_types, params, out)?;
     }
     for projection in &ir.return_exprs {
         collect_nearest_embedding_requests_from_expr(
             &projection.expr,
-            storage,
+            runtime,
             variable_types,
             params,
             out,
@@ -331,7 +317,7 @@ fn collect_nearest_embedding_requests(
     for ordering in &ir.order_by {
         collect_nearest_embedding_requests_from_expr(
             &ordering.expr,
-            storage,
+            runtime,
             variable_types,
             params,
             out,
@@ -342,7 +328,7 @@ fn collect_nearest_embedding_requests(
 
 fn collect_nearest_embedding_requests_from_op(
     op: &IROp,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     params: &ParamMap,
     out: &mut AHashSet<(String, usize)>,
@@ -352,14 +338,14 @@ fn collect_nearest_embedding_requests_from_op(
             for filter in filters {
                 collect_nearest_embedding_requests_from_expr(
                     &filter.left,
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     out,
                 )?;
                 collect_nearest_embedding_requests_from_expr(
                     &filter.right,
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     out,
@@ -370,14 +356,14 @@ fn collect_nearest_embedding_requests_from_op(
         IROp::Filter(filter) => {
             collect_nearest_embedding_requests_from_expr(
                 &filter.left,
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
             )?;
             collect_nearest_embedding_requests_from_expr(
                 &filter.right,
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
@@ -387,7 +373,7 @@ fn collect_nearest_embedding_requests_from_op(
             for inner_op in inner {
                 collect_nearest_embedding_requests_from_op(
                     inner_op,
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     out,
@@ -400,7 +386,7 @@ fn collect_nearest_embedding_requests_from_op(
 
 fn collect_nearest_embedding_requests_from_expr(
     expr: &IRExpr,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     params: &ParamMap,
     out: &mut AHashSet<(String, usize)>,
@@ -411,7 +397,7 @@ fn collect_nearest_embedding_requests_from_expr(
             property,
             query,
         } => {
-            let dim = lookup_nearest_vector_dim(storage, variable_types, variable, property)?;
+            let dim = lookup_nearest_vector_dim(runtime, variable_types, variable, property)?;
             let query_literal = nearest_query_literal(query.as_ref(), params)?;
             if let Literal::String(text) = query_literal {
                 out.insert((text.clone(), dim));
@@ -422,14 +408,14 @@ fn collect_nearest_embedding_requests_from_expr(
         | IRExpr::Bm25 { field, query } => {
             collect_nearest_embedding_requests_from_expr(
                 field.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
             )?;
             collect_nearest_embedding_requests_from_expr(
                 query.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
@@ -442,14 +428,14 @@ fn collect_nearest_embedding_requests_from_expr(
         } => {
             collect_nearest_embedding_requests_from_expr(
                 field.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
             )?;
             collect_nearest_embedding_requests_from_expr(
                 query.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
@@ -457,7 +443,7 @@ fn collect_nearest_embedding_requests_from_expr(
             if let Some(max_edits) = max_edits {
                 collect_nearest_embedding_requests_from_expr(
                     max_edits.as_ref(),
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     out,
@@ -471,14 +457,14 @@ fn collect_nearest_embedding_requests_from_expr(
         } => {
             collect_nearest_embedding_requests_from_expr(
                 primary.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
             )?;
             collect_nearest_embedding_requests_from_expr(
                 secondary.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
@@ -486,7 +472,7 @@ fn collect_nearest_embedding_requests_from_expr(
             if let Some(k) = k {
                 collect_nearest_embedding_requests_from_expr(
                     k.as_ref(),
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     out,
@@ -496,7 +482,7 @@ fn collect_nearest_embedding_requests_from_expr(
         IRExpr::Aggregate { arg, .. } => {
             collect_nearest_embedding_requests_from_expr(
                 arg.as_ref(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 out,
@@ -513,18 +499,18 @@ fn collect_nearest_embedding_requests_from_expr(
 
 fn apply_resolved_nearest_embeddings(
     ir: &mut QueryIR,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     params: &ParamMap,
     vectors: &AHashMap<(String, usize), Vec<f32>>,
 ) -> Result<()> {
     for op in &mut ir.pipeline {
-        apply_resolved_nearest_embeddings_to_op(op, storage, variable_types, params, vectors)?;
+        apply_resolved_nearest_embeddings_to_op(op, runtime, variable_types, params, vectors)?;
     }
     for projection in &mut ir.return_exprs {
         apply_resolved_nearest_embeddings_to_expr(
             &mut projection.expr,
-            storage,
+            runtime,
             variable_types,
             params,
             vectors,
@@ -533,7 +519,7 @@ fn apply_resolved_nearest_embeddings(
     for ordering in &mut ir.order_by {
         apply_resolved_nearest_embeddings_to_expr(
             &mut ordering.expr,
-            storage,
+            runtime,
             variable_types,
             params,
             vectors,
@@ -544,7 +530,7 @@ fn apply_resolved_nearest_embeddings(
 
 fn apply_resolved_nearest_embeddings_to_op(
     op: &mut IROp,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     params: &ParamMap,
     vectors: &AHashMap<(String, usize), Vec<f32>>,
@@ -554,14 +540,14 @@ fn apply_resolved_nearest_embeddings_to_op(
             for filter in filters {
                 apply_resolved_nearest_embeddings_to_expr(
                     &mut filter.left,
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     vectors,
                 )?;
                 apply_resolved_nearest_embeddings_to_expr(
                     &mut filter.right,
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     vectors,
@@ -572,14 +558,14 @@ fn apply_resolved_nearest_embeddings_to_op(
         IROp::Filter(filter) => {
             apply_resolved_nearest_embeddings_to_expr(
                 &mut filter.left,
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
             )?;
             apply_resolved_nearest_embeddings_to_expr(
                 &mut filter.right,
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
@@ -589,7 +575,7 @@ fn apply_resolved_nearest_embeddings_to_op(
             for inner_op in inner {
                 apply_resolved_nearest_embeddings_to_op(
                     inner_op,
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     vectors,
@@ -602,7 +588,7 @@ fn apply_resolved_nearest_embeddings_to_op(
 
 fn apply_resolved_nearest_embeddings_to_expr(
     expr: &mut IRExpr,
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     params: &ParamMap,
     vectors: &AHashMap<(String, usize), Vec<f32>>,
@@ -613,7 +599,7 @@ fn apply_resolved_nearest_embeddings_to_expr(
             property,
             query,
         } => {
-            let dim = lookup_nearest_vector_dim(storage, variable_types, variable, property)?;
+            let dim = lookup_nearest_vector_dim(runtime, variable_types, variable, property)?;
             let query_literal = nearest_query_literal(query.as_ref(), params)?;
             if let Literal::String(text) = query_literal {
                 let key = (text.clone(), dim);
@@ -631,14 +617,14 @@ fn apply_resolved_nearest_embeddings_to_expr(
         | IRExpr::Bm25 { field, query } => {
             apply_resolved_nearest_embeddings_to_expr(
                 field.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
             )?;
             apply_resolved_nearest_embeddings_to_expr(
                 query.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
@@ -651,14 +637,14 @@ fn apply_resolved_nearest_embeddings_to_expr(
         } => {
             apply_resolved_nearest_embeddings_to_expr(
                 field.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
             )?;
             apply_resolved_nearest_embeddings_to_expr(
                 query.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
@@ -666,7 +652,7 @@ fn apply_resolved_nearest_embeddings_to_expr(
             if let Some(max_edits) = max_edits {
                 apply_resolved_nearest_embeddings_to_expr(
                     max_edits.as_mut(),
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     vectors,
@@ -680,14 +666,14 @@ fn apply_resolved_nearest_embeddings_to_expr(
         } => {
             apply_resolved_nearest_embeddings_to_expr(
                 primary.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
             )?;
             apply_resolved_nearest_embeddings_to_expr(
                 secondary.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
@@ -695,7 +681,7 @@ fn apply_resolved_nearest_embeddings_to_expr(
             if let Some(k) = k {
                 apply_resolved_nearest_embeddings_to_expr(
                     k.as_mut(),
-                    storage,
+                    runtime,
                     variable_types,
                     params,
                     vectors,
@@ -705,7 +691,7 @@ fn apply_resolved_nearest_embeddings_to_expr(
         IRExpr::Aggregate { arg, .. } => {
             apply_resolved_nearest_embeddings_to_expr(
                 arg.as_mut(),
-                storage,
+                runtime,
                 variable_types,
                 params,
                 vectors,
@@ -733,7 +719,7 @@ fn nearest_query_literal<'a>(query: &'a IRExpr, params: &'a ParamMap) -> Result<
 }
 
 fn lookup_nearest_vector_dim(
-    storage: &GraphStorage,
+    runtime: &DatabaseRuntime,
     variable_types: &AHashMap<String, String>,
     variable: &str,
     property: &str,
@@ -744,7 +730,7 @@ fn lookup_nearest_vector_dim(
             variable
         ))
     })?;
-    let node_type = storage.catalog.node_types.get(type_name).ok_or_else(|| {
+    let node_type = runtime.catalog().node_types.get(type_name).ok_or_else(|| {
         NanoError::Execution(format!(
             "nearest() node type `{}` not found in catalog",
             type_name
@@ -782,7 +768,7 @@ fn vector_to_literal(vector: &[f32]) -> Literal {
 
 async fn try_execute_single_node_nearest_ann_fast_path(
     ir: &QueryIR,
-    storage: Arc<GraphStorage>,
+    runtime: Arc<DatabaseRuntime>,
     params: &ParamMap,
     candidate: &SingleNodeNearestAnnCandidate,
 ) -> Result<Option<Vec<RecordBatch>>> {
@@ -794,7 +780,7 @@ async fn try_execute_single_node_nearest_ann_fast_path(
     let lim_i64 = i64::try_from(limit)
         .map_err(|_| NanoError::Execution(format!("limit {} exceeds i64", limit)))?;
 
-    let node_type = match storage.catalog.node_types.get(&candidate.type_name) {
+    let node_type = match runtime.catalog().node_types.get(&candidate.type_name) {
         Some(node_type) => node_type,
         None => return Ok(None),
     };
@@ -806,14 +792,14 @@ async fn try_execute_single_node_nearest_ann_fast_path(
         _ => return Ok(None),
     };
 
-    let dataset_path = match storage
+    let dataset_path = match runtime
         .node_dataset_path(&candidate.type_name)
         .filter(|p| p.exists())
     {
         Some(path) => path.to_path_buf(),
         None => return Ok(None),
     };
-    let dataset_version = storage.node_dataset_version(&candidate.type_name);
+    let dataset_version = runtime.node_dataset_version(&candidate.type_name);
 
     let query_vec = resolve_nearest_query_vector(&candidate.query, params, vector_dim)?;
     let query_array = Float32Array::from(query_vec);
@@ -1067,8 +1053,7 @@ fn wrap_projected_node_batch(
 
 fn build_physical_plan(
     pipeline: &[IROp],
-    storage: Arc<GraphStorage>,
-    edge_index_cache: Arc<EdgeIndexCache>,
+    runtime: Arc<DatabaseRuntime>,
     params: &ParamMap,
     scan_limit_pushdown: Option<usize>,
     scan_projections: &ScanProjectionMap,
@@ -1083,7 +1068,7 @@ fn build_physical_plan(
                 filters,
             } => {
                 let node_schema =
-                    storage.catalog.node_types.get(type_name).ok_or_else(|| {
+                    runtime.catalog().node_types.get(type_name).ok_or_else(|| {
                         NanoError::Plan(format!("unknown node type: {}", type_name))
                     })?;
 
@@ -1135,7 +1120,7 @@ fn build_physical_plan(
                     } else {
                         None
                     },
-                    storage.clone(),
+                    runtime.clone(),
                 );
 
                 if let Some(prev) = current_plan {
@@ -1171,8 +1156,7 @@ fn build_physical_plan(
                         min_hops: *min_hops,
                         max_hops: *max_hops,
                     },
-                    storage.clone(),
-                    edge_index_cache.clone(),
+                    runtime.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
             }
@@ -1187,8 +1171,7 @@ fn build_physical_plan(
                 // so Expand ops have the source rows to work with
                 let inner_plan = build_physical_plan_with_input(
                     inner,
-                    storage.clone(),
-                    edge_index_cache.clone(),
+                    runtime.clone(),
                     outer.clone(),
                     params,
                     scan_projections,
@@ -1200,7 +1183,6 @@ fn build_physical_plan(
                     outer_var.clone(),
                     inner.clone(),
                     params.clone(),
-                    storage.clone(),
                 )));
             }
         }
@@ -1213,8 +1195,7 @@ fn build_physical_plan(
 /// Used for AntiJoin inner pipelines that start with Expand (needing source rows).
 fn build_physical_plan_with_input(
     pipeline: &[IROp],
-    storage: Arc<GraphStorage>,
-    edge_index_cache: Arc<EdgeIndexCache>,
+    runtime: Arc<DatabaseRuntime>,
     input: Arc<dyn ExecutionPlan>,
     params: &ParamMap,
     scan_projections: &ScanProjectionMap,
@@ -1229,7 +1210,7 @@ fn build_physical_plan_with_input(
                 filters,
             } => {
                 let node_schema =
-                    storage.catalog.node_types.get(type_name).ok_or_else(|| {
+                    runtime.catalog().node_types.get(type_name).ok_or_else(|| {
                         NanoError::Plan(format!("unknown node type: {}", type_name))
                     })?;
 
@@ -1275,7 +1256,7 @@ fn build_physical_plan_with_input(
                     ])),
                     pushdown_filters,
                     None,
-                    storage.clone(),
+                    runtime.clone(),
                 );
 
                 if let Some(prev) = current_plan {
@@ -1310,8 +1291,7 @@ fn build_physical_plan_with_input(
                         min_hops: *min_hops,
                         max_hops: *max_hops,
                     },
-                    storage.clone(),
-                    edge_index_cache.clone(),
+                    runtime.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
             }
@@ -1323,8 +1303,7 @@ fn build_physical_plan_with_input(
                     .ok_or_else(|| NanoError::Plan("AntiJoin without outer input".to_string()))?;
                 let inner_plan = build_physical_plan_with_input(
                     inner,
-                    storage.clone(),
-                    edge_index_cache.clone(),
+                    runtime.clone(),
                     outer.clone(),
                     params,
                     scan_projections,
@@ -1335,7 +1314,6 @@ fn build_physical_plan_with_input(
                     outer_var.clone(),
                     inner.clone(),
                     params.clone(),
-                    storage.clone(),
                 )));
             }
         }
@@ -3323,7 +3301,6 @@ struct AntiJoinExec {
     join_var: String,
     inner_pipeline: Vec<IROp>,
     params: ParamMap,
-    storage: Arc<GraphStorage>,
     output_schema: SchemaRef,
     properties: PlanProperties,
 }
@@ -3335,7 +3312,6 @@ impl AntiJoinExec {
         join_var: String,
         inner_pipeline: Vec<IROp>,
         params: ParamMap,
-        storage: Arc<GraphStorage>,
     ) -> Self {
         let output_schema = outer.schema();
         let properties = PlanProperties::new(
@@ -3350,7 +3326,6 @@ impl AntiJoinExec {
             join_var,
             inner_pipeline,
             params,
-            storage,
             output_schema,
             properties,
         }
@@ -3394,7 +3369,6 @@ impl ExecutionPlan for AntiJoinExec {
             self.join_var.clone(),
             self.inner_pipeline.clone(),
             self.params.clone(),
-            self.storage.clone(),
         )))
     }
 

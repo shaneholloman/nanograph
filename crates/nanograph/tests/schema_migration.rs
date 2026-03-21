@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use arrow_array::{Array, Date32Array, StringArray};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 use tempfile::TempDir;
@@ -10,6 +9,7 @@ use tempfile::TempDir;
 use nanograph::schema::parser::parse_schema;
 use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
+use nanograph::store::export::build_export_rows_at_path;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::migration::{
     MigrationStatus, MigrationStep, SchemaCompatibility, analyze_schema_diff,
@@ -394,28 +394,22 @@ async fn migration_apply_rename_preserves_data() {
     assert!(db.schema_ir.node_type_id("User").is_none());
     assert!(db.schema_ir.edge_type_id("ConnectedTo").is_some());
     assert!(db.schema_ir.edge_type_id("Knows").is_none());
-    let storage = db.snapshot();
-
-    let batch = storage
-        .get_all_nodes("Account")
-        .expect("read nodes")
-        .expect("account rows");
-    let names = batch
-        .column_by_name("full_name")
-        .expect("full_name column")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("full_name as StringArray");
-    let values = (0..names.len())
-        .map(|i| names.value(i).to_string())
+    let rows = build_export_rows_at_path(&db_path, false, true)
+        .await
+        .expect("export rows");
+    let mut values = rows
+        .iter()
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some("Account"))
+        .filter_map(|row| row["data"]["full_name"].as_str().map(str::to_string))
         .collect::<Vec<_>>();
+    values.sort();
     assert_eq!(values, vec!["Alice".to_string(), "Bob".to_string()]);
 
-    let edge_batch = storage
-        .edge_batch_for_save("ConnectedTo")
-        .expect("read edges")
-        .expect("connected edge rows");
-    assert_eq!(edge_batch.num_rows(), 1);
+    let edge_count = rows
+        .iter()
+        .filter(|row| row.get("edge").and_then(serde_json::Value::as_str) == Some("ConnectedTo"))
+        .count();
+    assert_eq!(edge_count, 1);
 }
 
 #[tokio::test]
@@ -429,28 +423,15 @@ async fn migration_apply_add_property_preserves_edge_property_order() {
         .expect("apply migration");
     assert_eq!(exec.status, MigrationStatus::Applied);
 
-    let db = Database::open(&db_path).await.expect("re-open migrated db");
-    let storage = db.snapshot();
-    let edge_batch = storage
-        .edge_batch_for_save("WorksOn")
-        .expect("read edges")
-        .expect("worksOn rows");
-
-    let role = edge_batch
-        .column_by_name("role")
-        .expect("role column")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("role as StringArray");
-    assert_eq!(role.value(0), "lead");
-
-    let started_at = edge_batch
-        .column_by_name("startedAt")
-        .expect("startedAt column")
-        .as_any()
-        .downcast_ref::<Date32Array>()
-        .expect("startedAt as Date32Array");
-    assert_eq!(started_at.value(0), 19754);
+    let rows = build_export_rows_at_path(&db_path, false, true)
+        .await
+        .expect("export rows");
+    let edge = rows
+        .iter()
+        .find(|row| row.get("edge").and_then(serde_json::Value::as_str) == Some("WorksOn"))
+        .expect("worksOn row");
+    assert_eq!(edge["data"]["role"].as_str(), Some("lead"));
+    assert_eq!(edge["data"]["startedAt"].as_str(), Some("2024-02-01"));
 }
 
 #[tokio::test]
@@ -512,12 +493,22 @@ async fn migration_requires_confirmation_for_drop_property() {
     assert_eq!(applied.status, MigrationStatus::Applied);
 
     let db = Database::open(&db_path).await.expect("re-open migrated db");
-    let storage = db.snapshot();
-    let batch = storage
-        .get_all_nodes("User")
-        .expect("read user rows")
-        .expect("user rows");
-    assert!(batch.column_by_name("age").is_none());
+    let user = db
+        .schema_ir
+        .node_types()
+        .find(|node| node.name == "User")
+        .expect("user node type");
+    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(user.type_id));
+    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+        .await
+        .expect("open user dataset");
+    assert!(
+        !dataset
+            .schema()
+            .fields
+            .iter()
+            .any(|field| field.name == "age")
+    );
 }
 
 #[tokio::test]

@@ -4,9 +4,8 @@
 use std::time::{Duration, Instant};
 
 use nanograph::query::parser::parse_query;
-use nanograph::query::typecheck::typecheck_query;
 use nanograph::store::database::Database;
-use nanograph::{ParamMap, execute_query, lower_query};
+use nanograph::{ParamMap, RunResult};
 use tempfile::TempDir;
 
 fn schema_source(indexed: bool) -> &'static str {
@@ -72,10 +71,6 @@ async fn average_query_latency(
     let reopened = Database::open(&db_path).await.expect("open db");
     let qf = parse_query(query_source()).expect("parse query");
     let query = &qf.queries[0];
-    let tc = typecheck_query(reopened.catalog(), query).expect("typecheck");
-    let ir = lower_query(reopened.catalog(), query, &tc).expect("lower query");
-    let storage = reopened.snapshot();
-
     let mut params = ParamMap::new();
     params.insert(
         "email".to_string(),
@@ -84,17 +79,27 @@ async fn average_query_latency(
 
     // Warm up scanner, caches, and JIT-like one-time paths.
     for _ in 0..3 {
-        let batches = execute_query(&ir, storage.clone(), &params)
+        let RunResult::Query(result) = reopened
+            .run_query(query, &params)
             .await
-            .expect("warmup query");
+            .expect("warmup query")
+        else {
+            panic!("expected query result");
+        };
+        let batches = result.into_batches();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let batches = execute_query(&ir, storage.clone(), &params)
+        let RunResult::Query(result) = reopened
+            .run_query(query, &params)
             .await
-            .expect("benchmark query");
+            .expect("benchmark query")
+        else {
+            panic!("expected query result");
+        };
+        let batches = result.into_batches();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
     let total = start.elapsed();
