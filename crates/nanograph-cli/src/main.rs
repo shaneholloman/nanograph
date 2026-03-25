@@ -1068,6 +1068,7 @@ const DEFAULT_DOTENV_NANO: &str = "\
 # Local-only nanograph secrets and overrides.\n\
 # Do not commit this file.\n\
 # OPENAI_API_KEY=sk-...\n\
+# GEMINI_API_KEY=...\n\
 # NANOGRAPH_EMBEDDINGS_MOCK=1\n";
 
 #[instrument(skip(data_path), fields(db_path = %db_path.display(), mode = ?mode))]

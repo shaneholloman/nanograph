@@ -340,16 +340,24 @@ impl LoadedConfig {
         FSet: FnMut(&str, &str),
     {
         let embedding = &self.settings.embedding;
-        match trim_nonempty(embedding.provider.as_deref()) {
-            None | Some("openai") => {}
-            Some("mock") => {
+        let provider = trim_nonempty(embedding.provider.as_deref()).unwrap_or("openai");
+        match provider {
+            "openai" | "gemini" => {
+                set_if_missing(
+                    &mut exists,
+                    &mut set,
+                    "NANOGRAPH_EMBED_PROVIDER",
+                    Some(provider),
+                );
+            }
+            "mock" => {
                 if !exists("NANOGRAPH_EMBEDDINGS_MOCK") {
                     set("NANOGRAPH_EMBEDDINGS_MOCK", "1");
                 }
             }
-            Some(other) => {
+            other => {
                 return Err(eyre!(
-                    "unsupported embedding.provider `{}` (supported: openai, mock)",
+                    "unsupported embedding.provider `{}` (supported: openai, gemini, mock)",
                     other
                 ));
             }
@@ -367,7 +375,10 @@ impl LoadedConfig {
         set_if_missing(
             &mut exists,
             &mut set,
-            "OPENAI_BASE_URL",
+            match provider {
+                "gemini" => "GEMINI_BASE_URL",
+                _ => "OPENAI_BASE_URL",
+            },
             embedding.base_url.as_deref(),
         );
         set_if_missing_usize(
@@ -389,12 +400,17 @@ impl LoadedConfig {
             embedding.chunk_overlap_chars,
         );
 
-        if !exists("OPENAI_API_KEY")
+        let api_key_target = match provider {
+            "gemini" => "GEMINI_API_KEY",
+            _ => "OPENAI_API_KEY",
+        };
+
+        if !exists(api_key_target)
             && let Some(api_key_env) = trim_nonempty(embedding.api_key_env.as_deref())
             && let Some(value) = get(api_key_env)
             && let Some(value) = trim_nonempty(Some(value.as_str()))
         {
-            set("OPENAI_API_KEY", value);
+            set(api_key_target, value);
         }
 
         Ok(())
@@ -954,6 +970,52 @@ chunk_size = 512
         assert_eq!(
             env.borrow().get("OPENAI_API_KEY").map(String::as_str),
             Some("env-secret")
+        );
+    }
+
+    #[test]
+    fn embedding_env_resolution_supports_gemini_provider() {
+        let cfg = LoadedConfig {
+            path: Some(PathBuf::from("/tmp/project/nanograph.toml")),
+            base_dir: PathBuf::from("/tmp/project"),
+            settings: NanographConfig {
+                embedding: EmbeddingConfig {
+                    provider: Some("gemini".to_string()),
+                    model: Some("gemini-embedding-2-preview".to_string()),
+                    api_key_env: Some("ALT_GEMINI_KEY".to_string()),
+                    base_url: Some("https://example.invalid/gemini".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+                ..NanographConfig::default()
+            },
+        };
+        let env = std::cell::RefCell::new(std::collections::HashMap::from([(
+            "ALT_GEMINI_KEY".to_string(),
+            "gem-secret".to_string(),
+        )]));
+
+        cfg.apply_embedding_env_with(
+            |key| env.borrow().contains_key(key),
+            |key| env.borrow().get(key).cloned(),
+            |key, value| {
+                env.borrow_mut().insert(key.to_string(), value.to_string());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            env.borrow()
+                .get("NANOGRAPH_EMBED_PROVIDER")
+                .map(String::as_str),
+            Some("gemini")
+        );
+        assert_eq!(
+            env.borrow().get("GEMINI_API_KEY").map(String::as_str),
+            Some("gem-secret")
+        );
+        assert_eq!(
+            env.borrow().get("GEMINI_BASE_URL").map(String::as_str),
+            Some("https://example.invalid/gemini")
         );
     }
 

@@ -6,6 +6,8 @@ use arrow_array::{
 };
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
+use tokio::sync::Mutex;
+use url::Url;
 
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
@@ -15,8 +17,10 @@ use nanograph::store::database::{Database, LoadMode};
 use nanograph::store::export::build_export_rows_at_path;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::txlog::read_visible_cdc_entries;
-use nanograph::store::{scalar_index_name, vector_index_name};
+use nanograph::store::{scalar_index_name, text_index_name, vector_index_name};
 use nanograph::{MutationExecResult, ParamMap, build_catalog};
+
+static EMBED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn test_schema() -> &'static str {
     r#"
@@ -63,6 +67,23 @@ fn list_membership_test_data() -> &'static str {
 fn indexed_test_data() -> &'static str {
     r#"{"type":"Person","data":{"name":"Alice","email":"alice@example.com"}}
 {"type":"Person","data":{"name":"Bob","email":"bob@example.com"}}
+"#
+}
+
+fn text_search_test_schema() -> &'static str {
+    r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String @index
+}
+"#
+}
+
+fn text_search_test_data() -> &'static str {
+    r#"{"type":"Doc","data":{"slug":"a","title":"Alpha","body":"graph database internals"}}
+{"type":"Doc","data":{"slug":"b","title":"Beta","body":"graph storage basics"}}
+{"type":"Doc","data":{"slug":"c","title":"Gamma","body":"distributed systems handbook"}}
 "#
 }
 
@@ -115,6 +136,24 @@ fn keyed_mutation_data() -> &'static str {
     r#"{"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Bob","age":25}}
 {"edge":"Knows","from":"Alice","to":"Bob"}
+"#
+}
+
+fn media_traversal_schema() -> &'static str {
+    r#"
+node PhotoAsset {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String
+    embedding: Vector(16) @embed(uri)
+}
+
+node Product {
+    slug: String @key
+    name: String
+}
+
+edge HasPhoto: Product -> PhotoAsset
 "#
 }
 
@@ -633,6 +672,150 @@ query q($q: Vector(4)) {
 }
 
 #[tokio::test]
+async fn test_native_text_index_created_and_queries_work_after_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let db = Database::init(&db_path, text_search_test_schema())
+        .await
+        .unwrap();
+    db.load(text_search_test_data()).await.unwrap();
+
+    let doc = db.schema_ir.node_types().find(|n| n.name == "Doc").unwrap();
+    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
+    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let index_names: HashSet<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    let expected_text_index = text_index_name(doc.type_id, "body");
+    assert!(index_names.contains(&expected_text_index));
+
+    drop(db);
+    let reopened = Database::open(&db_path).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("graph database".to_string()),
+    );
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: String) {
+    match {
+        $d: Doc
+        search($d.body, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+"#,
+        &reopened,
+        &params,
+    )
+    .await;
+    assert_eq!(extract_string_column(&results, "slug"), vec!["a"]);
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: String) {
+    match {
+        $d: Doc
+        match_text($d.body, $q)
+    }
+    return { $d.slug }
+}
+"#,
+        &reopened,
+        &params,
+    )
+    .await;
+    assert_eq!(extract_string_column(&results, "slug"), vec!["a"]);
+
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("databaze".to_string()),
+    );
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.body, $q, 1)
+    }
+    return { $d.slug }
+}
+"#,
+        &reopened,
+        &params,
+    )
+    .await;
+    assert_eq!(extract_string_column(&results, "slug"), vec!["a"]);
+
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("graph database".to_string()),
+    );
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: String) {
+    match { $d: Doc }
+    return { $d.slug as slug, bm25($d.body, $q) as score }
+    order { bm25($d.body, $q) desc }
+    limit 2
+}
+"#,
+        &reopened,
+        &params,
+    )
+    .await;
+    let slugs = extract_string_column(&results, "slug");
+    assert_eq!(slugs, vec!["a", "b"]);
+    let scores = extract_f64_column(&results, "score");
+    assert_eq!(scores.len(), 2);
+    assert!(scores[0] >= scores[1]);
+}
+
+#[tokio::test]
+async fn test_search_on_unindexed_text_field_falls_back_cleanly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let db = Database::init(&db_path, text_search_test_schema())
+        .await
+        .unwrap();
+    db.load(text_search_test_data()).await.unwrap();
+    drop(db);
+
+    let reopened = Database::open(&db_path).await.unwrap();
+    let mut params = ParamMap::new();
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("alpha".to_string()),
+    );
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug }
+}
+"#,
+        &reopened,
+        &params,
+    )
+    .await;
+    assert_eq!(extract_string_column(&results, "slug"), vec!["a"]);
+}
+
+#[tokio::test]
 async fn test_vector_projection_on_lance_scan_does_not_panic() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
@@ -728,6 +911,77 @@ query q($topic: String, $q: Vector(4)) {
 
     let slugs = extract_string_column(&results, "slug");
     assert_eq!(slugs, vec!["b"]);
+}
+
+#[tokio::test]
+async fn test_text_query_can_rank_media_nodes_and_traverse_from_images() {
+    let _guard = EMBED_ENV_LOCK.lock().await;
+    let prev_mock = std::env::var_os("NANOGRAPH_EMBEDDINGS_MOCK");
+    unsafe {
+        std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", "1");
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let space_path = dir.path().join("space.png");
+    let beach_path = dir.path().join("beach.png");
+    std::fs::write(
+        &space_path,
+        b"\x89PNG\r\n\x1a\nspace-image-for-mock-semantic-test",
+    )
+    .unwrap();
+    std::fs::write(
+        &beach_path,
+        b"\x89PNG\r\n\x1a\nbeach-image-for-mock-semantic-test",
+    )
+    .unwrap();
+    let space_uri = Url::from_file_path(&space_path).unwrap().to_string();
+    let beach_uri = Url::from_file_path(&beach_path).unwrap().to_string();
+
+    let db = Database::init(&db_path, media_traversal_schema())
+        .await
+        .unwrap();
+    db.load(&format!(
+        r#"{{"type":"PhotoAsset","data":{{"slug":"space","uri":"@uri:{space_uri}"}}}}
+{{"type":"PhotoAsset","data":{{"slug":"beach","uri":"@uri:{beach_uri}"}}}}
+{{"type":"Product","data":{{"slug":"rocket","name":"Rocket Poster"}}}}
+{{"type":"Product","data":{{"slug":"sand","name":"Beach Poster"}}}}
+{{"edge":"HasPhoto","from":"rocket","to":"space"}}
+{{"edge":"HasPhoto","from":"sand","to":"beach"}}
+"#,
+    ))
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("space".to_string()),
+    );
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: String) {
+    match {
+        $product: Product
+        $product hasPhoto $img
+    }
+    return { $product.slug as slug, $img.slug as image_slug }
+    order { nearest($img.embedding, $q) }
+    limit 1
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+
+    assert_eq!(extract_string_column(&results, "slug"), vec!["rocket"]);
+    assert_eq!(extract_string_column(&results, "image_slug"), vec!["space"]);
+
+    match prev_mock {
+        Some(value) => unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", value) },
+        None => unsafe { std::env::remove_var("NANOGRAPH_EMBEDDINGS_MOCK") },
+    }
 }
 
 #[tokio::test]

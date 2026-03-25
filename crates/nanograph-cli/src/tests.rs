@@ -120,6 +120,7 @@ fn scaffold_project_files_creates_shared_config_and_env_template() {
 
     let dotenv = std::fs::read_to_string(dir.path().join(".env.nano")).unwrap();
     assert!(dotenv.contains("OPENAI_API_KEY=sk-..."));
+    assert!(dotenv.contains("GEMINI_API_KEY=..."));
     assert!(dotenv.contains("Do not commit this file."));
 
     let generated_again = scaffold_project_files(dir.path(), &db_path, &schema_path).unwrap();
