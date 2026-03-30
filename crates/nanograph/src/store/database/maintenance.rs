@@ -7,6 +7,7 @@ use arrow_schema::DataType;
 use lance::Dataset;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{CompactionOptions as LanceCompactionOptions, compact_files};
+use tracing::warn;
 
 use super::persist::{read_sparse_edge_batch, read_sparse_node_batch};
 use super::{
@@ -16,6 +17,7 @@ use super::{
 };
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
+use crate::store::graph_mirror::{inspect_graph_mirror, rebuild_graph_mirror_from_wal};
 use crate::store::lance_io::write_lance_batch;
 use crate::store::manifest::GraphManifest;
 use crate::store::metadata::DatabaseMetadata;
@@ -78,6 +80,13 @@ pub async fn compact_database(db_path: &Path, options: CompactOptions) -> Result
         next_manifest.last_tx_id = format!("manifest-{}", next_manifest.db_version);
         next_manifest.committed_at = now_unix_seconds_string();
         commit_manifest_and_logs(db_path, &next_manifest, &[], "maintenance:compact")?;
+        if let Err(err) = rebuild_graph_mirror_from_wal(db_path).await {
+            warn!(
+                error = %err,
+                db_path = %db_path.display(),
+                "graph mirror rebuild failed after compaction commit"
+            );
+        }
         result.manifest_committed = true;
     }
 
@@ -150,6 +159,14 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
         }
         result.dataset_old_versions_removed += stats.old_versions;
         result.dataset_bytes_removed += stats.bytes_removed;
+    }
+
+    if let Err(err) = rebuild_graph_mirror_from_wal(db_path).await {
+        warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "graph mirror rebuild failed after cleanup"
+        );
     }
 
     Ok(result)
@@ -353,6 +370,38 @@ impl Database {
                     ));
                 }
             }
+        }
+
+        match inspect_graph_mirror(&self.path).await {
+            Ok(status) => {
+                if manifest.db_version > 0 && (!status.commits_present || !status.changes_present) {
+                    warnings.push(
+                        "graph mirror tables are missing or empty; rebuildable from authoritative WAL"
+                            .to_string(),
+                    );
+                } else {
+                    if let Some(mirrored) = status.latest_commit_version
+                        && mirrored < manifest.db_version
+                    {
+                        warnings.push(format!(
+                            "graph commit mirror is stale at db_version {} while manifest is {}",
+                            mirrored, manifest.db_version
+                        ));
+                    }
+                    if let Some(mirrored) = status.latest_change_version
+                        && mirrored < manifest.db_version
+                    {
+                        warnings.push(format!(
+                            "graph change mirror is stale at db_version {} while manifest is {}",
+                            mirrored, manifest.db_version
+                        ));
+                    }
+                }
+            }
+            Err(err) => warnings.push(format!(
+                "graph mirror tables are unreadable and should be rebuilt from WAL: {}",
+                err
+            )),
         }
 
         let cdc_rows = read_cdc_log_entries(&self.path)?;

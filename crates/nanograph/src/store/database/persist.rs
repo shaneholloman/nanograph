@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use arrow_array::builder::BooleanBuilder;
 use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt64Array};
-use lance::dataset::WriteMode;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::mutation::{DatasetMutationPlan, EdgeDelta, MutationDelta, NodeDelta};
 use super::{
@@ -20,13 +19,12 @@ use crate::json_output::array_value_to_json;
 use crate::query::ast::{CompOp, Literal, MatchValue, Mutation, QueryDecl};
 use crate::result::MutationResult;
 use crate::store::graph::DatasetAccumulator;
+use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
+use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphTableVersion};
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
-use crate::store::lance_io::{
-    latest_lance_dataset_version, read_lance_batches, run_lance_delete_by_ids,
-    run_lance_merge_insert_with_key, write_lance_batch, write_lance_batch_with_mode,
-};
+use crate::store::lance_io::{TableStore, V3TableStore, read_lance_batches};
 use crate::store::loader::{
     EmbedInput, EmbedSourceKind, EmbedValueRequest, build_next_storage_for_load,
     build_next_storage_for_load_reader, build_next_storage_for_load_reader_internal,
@@ -36,7 +34,7 @@ use crate::store::loader::{
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::runtime::DatabaseRuntime;
-use crate::store::txlog::{CdcLogEntry, commit_manifest_and_logs};
+use crate::store::txlog::{CdcLogEntry, commit_graph_records_and_manifest};
 use crate::types::ScalarType;
 
 use super::cdc::{
@@ -1154,6 +1152,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
     schema_ir: &SchemaIR,
     plan: &DatasetMutationPlan,
 ) -> Result<()> {
+    let table_store = V3TableStore::new();
     let previous_manifest = GraphManifest::read(db_path)?;
     let mut dataset_entries = Vec::new();
     let mut previous_entries_by_key: HashMap<String, DatasetEntry> = HashMap::new();
@@ -1224,7 +1223,9 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             let key_prop = key_prop.unwrap_or_default();
             let pinned_version = previous_entry
                 .as_ref()
-                .map(|entry| entry.dataset_version)
+                .map(|entry| {
+                    GraphTableVersion::new(dataset_rel_path.clone(), entry.dataset_version)
+                })
                 .ok_or_else(|| {
                     NanoError::Storage(format!(
                         "missing previous dataset version for {}",
@@ -1237,7 +1238,8 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 key_prop = key_prop,
                 "merging node delta into existing Lance dataset"
             );
-            run_lance_merge_insert_with_key(&dataset_path, pinned_version, source_batch, key_prop)
+            table_store
+                .merge_insert_with_key(&dataset_path, &pinned_version, source_batch, key_prop)
                 .await?;
         } else if can_append {
             let delta_batch = node_delta.inserts.clone().ok_or_else(|| {
@@ -1248,11 +1250,13 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = delta_batch.num_rows(),
                 "appending node delta to existing Lance dataset"
             );
-            write_lance_batch_with_mode(&dataset_path, delta_batch, WriteMode::Append).await?;
+            table_store.append(&dataset_path, delta_batch).await?;
         } else if can_native_delete {
             let pinned_version = previous_entry
                 .as_ref()
-                .map(|entry| entry.dataset_version)
+                .map(|entry| {
+                    GraphTableVersion::new(dataset_rel_path.clone(), entry.dataset_version)
+                })
                 .ok_or_else(|| {
                     NanoError::Storage(format!(
                         "missing previous dataset version for {}",
@@ -1264,19 +1268,21 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = node_delta.delete_ids.len(),
                 "deleting node delta from existing Lance dataset"
             );
-            run_lance_delete_by_ids(&dataset_path, pinned_version, &node_delta.delete_ids).await?;
+            table_store
+                .delete_by_ids(&dataset_path, &pinned_version, &node_delta.delete_ids)
+                .await?;
         } else {
             debug!(
                 node_type = %node_def.name,
                 rows = row_count,
                 "writing full node dataset from dataset mutation plan"
             );
-            write_lance_batch(&dataset_path, batch).await?;
+            table_store.overwrite(&dataset_path, batch).await?;
         }
         rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
         rebuild_node_text_indexes(&dataset_path, node_def).await?;
         rebuild_node_vector_indexes(&dataset_path, node_def).await?;
-        let dataset_version = latest_lance_dataset_version(&dataset_path).await?;
+        let dataset_version = table_store.latest_version(&dataset_path).await?.version;
         dataset_entries.push(DatasetEntry {
             type_id: node_def.type_id,
             type_name: node_def.name.clone(),
@@ -1332,11 +1338,16 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = delta_batch.num_rows(),
                 "appending edge delta to existing Lance dataset"
             );
-            write_lance_batch_with_mode(&dataset_path, delta_batch, WriteMode::Append).await?
+            table_store
+                .append(&dataset_path, delta_batch)
+                .await?
+                .version
         } else if can_native_delete {
             let pinned_version = previous_entry
                 .as_ref()
-                .map(|entry| entry.dataset_version)
+                .map(|entry| {
+                    GraphTableVersion::new(dataset_rel_path.clone(), entry.dataset_version)
+                })
                 .ok_or_else(|| {
                     NanoError::Storage(format!(
                         "missing previous dataset version for {}",
@@ -1348,14 +1359,17 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = edge_delta.delete_ids.len(),
                 "deleting edge delta from existing Lance dataset"
             );
-            run_lance_delete_by_ids(&dataset_path, pinned_version, &edge_delta.delete_ids).await?
+            table_store
+                .delete_by_ids(&dataset_path, &pinned_version, &edge_delta.delete_ids)
+                .await?
+                .version
         } else {
             debug!(
                 edge_type = %edge_def.name,
                 rows = row_count,
                 "writing full edge dataset from dataset mutation plan"
             );
-            write_lance_batch(&dataset_path, batch).await?
+            table_store.overwrite(&dataset_path, batch).await?.version
         };
         dataset_entries.push(DatasetEntry {
             type_id: edge_def.type_id,
@@ -1387,7 +1401,40 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         &build_pending_cdc_entries_from_delta(&plan.delta)?,
         &manifest,
     );
-    commit_manifest_and_logs(db_path, &manifest, &committed_cdc_events, &plan.op_summary)?;
+    let graph_commit = GraphCommitRecord {
+        tx_id: manifest.last_tx_id.clone().into(),
+        graph_version: manifest.db_version.into(),
+        table_versions: manifest
+            .datasets
+            .iter()
+            .map(|entry| GraphTableVersion::new(entry.dataset_path.clone(), entry.dataset_version))
+            .collect(),
+        committed_at: manifest.committed_at.clone(),
+        op_summary: plan.op_summary.clone(),
+    };
+    let graph_changes: Vec<GraphChangeRecord> = committed_cdc_events
+        .iter()
+        .cloned()
+        .map(|entry| GraphChangeRecord {
+            tx_id: entry.tx_id.into(),
+            graph_version: entry.db_version.into(),
+            seq_in_tx: entry.seq_in_tx,
+            op: entry.op,
+            entity_kind: entry.entity_kind,
+            type_name: entry.type_name,
+            entity_key: entry.entity_key,
+            payload: entry.payload,
+            committed_at: entry.committed_at,
+        })
+        .collect();
+    commit_graph_records_and_manifest(db_path, &graph_commit, &graph_changes, &manifest)?;
+    if let Err(err) = rebuild_graph_mirror_from_wal(db_path).await {
+        warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "graph mirror rebuild failed after commit; authoritative WAL remains intact"
+        );
+    }
 
     super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
     Ok(())

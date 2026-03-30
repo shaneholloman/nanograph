@@ -2,9 +2,11 @@
 
 `nanograph-db` is the first-party Node/TypeScript SDK for NanoGraph.
 
-## Media nodes and multimodal embeddings
+## Media nodes and external assets
 
 NanoGraph stores media as external URIs, not blob bytes inside `.nano/`.
+
+The SDK supports media-node storage helpers today. OpenAI embeddings remain text-only, while Gemini can embed text and media sources through NanoGraph's `@embed(...)` workflow.
 
 Typical schema:
 
@@ -13,7 +15,6 @@ node PhotoAsset {
   slug: String @key
   uri: String @media_uri(mime)
   mime: String
-  embedding: Vector(768)? @embed(uri) @index
 }
 
 node Product {
@@ -34,7 +35,6 @@ node PhotoAsset {
   slug: String @key
   uri: String @media_uri(mime)
   mime: String
-  embedding: Vector(768)? @embed(uri) @index
 }
 
 node Product {
@@ -52,8 +52,6 @@ query products_from_image_search($q: String) {
     $product hasPhoto $img
   }
   return { $product.slug as product, $img.slug as image, $img.uri as uri }
-  order { nearest($img.embedding, $q) }
-  limit 5
 }
 `;
 
@@ -66,7 +64,6 @@ await db.loadRows(
       data: {
         slug: "space",
         uri: mediaFile("/absolute/path/space.jpg", "image/jpeg"),
-        embedding: Array(768).fill(0),
       },
     },
     {
@@ -82,12 +79,6 @@ await db.loadRows(
   "overwrite",
 );
 
-process.env.NANOGRAPH_EMBED_PROVIDER = "gemini";
-process.env.NANOGRAPH_EMBED_MODEL = "gemini-embedding-2-preview";
-process.env.GEMINI_API_KEY = "...";
-
-await db.embed({ typeName: "PhotoAsset", property: "embedding", onlyNull: false });
-
 const rows = await db.run(queries, "products_from_image_search", { q: "space scene" });
 ```
 
@@ -97,4 +88,4 @@ const rows = await db.run(queries, "products_from_image_search", { q: "space sce
 - `mediaFile(...)`, `mediaBase64(...)`, and `mediaUri(...)` serialize to NanoGraph's media source forms
 - `describe()` includes `mediaMimeProp` for `@media_uri(...)` properties
 - `embed()` uses the same provider/env setup as the CLI
-- Gemini media support currently follows core engine limits, including image-only multimodal embedding in NanoGraph
+- OpenAI is text-only; use Gemini for built-in media embeddings

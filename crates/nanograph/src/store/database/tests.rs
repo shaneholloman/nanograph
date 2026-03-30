@@ -1,5 +1,9 @@
 use super::maintenance::read_cdc_analytics_state;
 use super::*;
+use crate::store::graph_mirror::{
+    GRAPH_CHANGES_DATASET_DIR, GRAPH_COMMITS_DATASET_DIR, inspect_graph_mirror,
+    read_graph_change_mirror, read_graph_commit_mirror, rebuild_graph_mirror_from_wal,
+};
 use crate::store::lance_io::LANCE_INTERNAL_ID_FIELD;
 use crate::store::lance_io::write_lance_batch_with_mode_and_storage_version;
 use crate::store::manifest::DatasetEntry;
@@ -13,7 +17,7 @@ use lance::Dataset;
 use lance::dataset::WriteMode;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tempfile::TempDir;
 
 fn test_schema_src() -> &'static str {
@@ -379,6 +383,16 @@ fn test_dir(name: &str) -> TempDir {
         .prefix(&format!("nanograph_{}_", name))
         .tempdir()
         .unwrap()
+}
+
+fn graph_commit_table_versions(
+    record: &crate::store::graph_types::GraphCommitRecord,
+) -> BTreeMap<String, u64> {
+    record
+        .table_versions
+        .iter()
+        .map(|version| (version.table_id.as_str().to_string(), version.version))
+        .collect()
 }
 
 fn write_data_file(dir: &TempDir, name: &str, data: &str) -> std::path::PathBuf {
@@ -1595,6 +1609,129 @@ async fn test_doctor_reports_healthy_database() {
             .iter()
             .all(|dataset| dataset.storage_version == "2.2"),
         "expected doctor to report Lance 2.2 storage versions for new datasets"
+    );
+}
+
+#[tokio::test]
+async fn test_graph_mirror_matches_authoritative_wal_after_commit() {
+    let dir = test_dir("graph_mirror_matches_wal");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    let tx_rows = read_tx_catalog_entries(path).unwrap();
+    let cdc_rows = read_visible_cdc_entries(path, 0, None).unwrap();
+    let mirror_commits = read_graph_commit_mirror(path).await.unwrap();
+    let mirror_changes = read_graph_change_mirror(path).await.unwrap();
+
+    assert_eq!(mirror_commits.len(), tx_rows.len());
+    assert_eq!(mirror_changes.len(), cdc_rows.len());
+
+    for (mirror, tx) in mirror_commits.iter().zip(tx_rows.iter()) {
+        assert_eq!(mirror.tx_id.as_str(), tx.tx_id);
+        assert_eq!(mirror.graph_version.value(), tx.db_version);
+        assert_eq!(mirror.committed_at, tx.committed_at);
+        assert_eq!(mirror.op_summary, tx.op_summary);
+        assert_eq!(graph_commit_table_versions(mirror), tx.dataset_versions);
+    }
+
+    for (mirror, cdc) in mirror_changes.iter().zip(cdc_rows.iter()) {
+        assert_eq!(mirror.tx_id.as_str(), cdc.tx_id);
+        assert_eq!(mirror.graph_version.value(), cdc.db_version);
+        assert_eq!(mirror.seq_in_tx, cdc.seq_in_tx);
+        assert_eq!(mirror.op, cdc.op);
+        assert_eq!(mirror.entity_kind, cdc.entity_kind);
+        assert_eq!(mirror.type_name, cdc.type_name);
+        assert_eq!(mirror.entity_key, cdc.entity_key);
+        assert_eq!(mirror.payload, cdc.payload);
+        assert_eq!(mirror.committed_at, cdc.committed_at);
+    }
+}
+
+#[tokio::test]
+async fn test_rebuild_graph_mirror_recreates_missing_datasets() {
+    let dir = test_dir("graph_mirror_rebuild");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    std::fs::remove_dir_all(path.join(GRAPH_COMMITS_DATASET_DIR)).unwrap();
+    std::fs::remove_dir_all(path.join(GRAPH_CHANGES_DATASET_DIR)).unwrap();
+
+    rebuild_graph_mirror_from_wal(path).await.unwrap();
+    let status = inspect_graph_mirror(path).await.unwrap();
+    assert!(status.commits_present);
+    assert!(status.changes_present);
+    assert_eq!(status.latest_commit_version, Some(1));
+    assert_eq!(status.latest_change_version, Some(1));
+}
+
+#[tokio::test]
+async fn test_cleanup_rebuilds_graph_mirror_to_retained_window() {
+    let dir = test_dir("graph_mirror_cleanup");
+    let path = dir.path();
+
+    let db = Database::init(path, keyed_schema_src()).await.unwrap();
+    db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.load_with_mode(keyed_data_upsert(), LoadMode::Merge)
+        .await
+        .unwrap();
+
+    let before = read_graph_commit_mirror(path).await.unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before.last().map(|row| row.graph_version.value()), Some(2));
+
+    db.cleanup(CleanupOptions {
+        retain_tx_versions: 1,
+        retain_dataset_versions: 1,
+    })
+    .await
+    .unwrap();
+
+    let tx_rows = read_tx_catalog_entries(path).unwrap();
+    let mirror_commits = read_graph_commit_mirror(path).await.unwrap();
+    let mirror_changes = read_graph_change_mirror(path).await.unwrap();
+
+    assert_eq!(tx_rows.len(), 1);
+    assert_eq!(mirror_commits.len(), 1);
+    assert_eq!(
+        mirror_commits[0].graph_version.value(),
+        tx_rows[0].db_version
+    );
+    assert!(
+        mirror_changes
+            .iter()
+            .all(|row| row.graph_version.value() == tx_rows[0].db_version)
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_write_failure_does_not_invalidate_commit_and_doctor_warns() {
+    let dir = test_dir("graph_mirror_failure");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    std::fs::write(path.join(GRAPH_COMMITS_DATASET_DIR), "blocker").unwrap();
+
+    db.load(test_data_src()).await.unwrap();
+
+    let tx_rows = read_tx_catalog_entries(path).unwrap();
+    assert_eq!(tx_rows.len(), 1);
+
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
+    assert_eq!(persons.num_rows(), 3);
+
+    let report = db.doctor().await.unwrap();
+    assert!(report.healthy);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("graph mirror"))
     );
 }
 

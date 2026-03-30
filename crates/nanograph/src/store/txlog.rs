@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NanoError, Result};
+use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphTableVersion};
 use crate::store::manifest::GraphManifest;
 
 const WAL_FILENAME: &str = "_wal.jsonl";
@@ -51,36 +52,155 @@ pub(crate) struct LogPruneStats {
     pub(crate) cdc_rows_kept: usize,
 }
 
-impl WalEntry {
-    fn from_manifest(manifest: &GraphManifest, op_summary: &str, changes: &[CdcLogEntry]) -> Self {
-        let dataset_versions = manifest
-            .datasets
-            .iter()
-            .map(|entry| (entry.dataset_path.clone(), entry.dataset_version))
-            .collect();
-        Self {
-            tx_id: manifest.last_tx_id.clone(),
-            db_version: manifest.db_version,
-            dataset_versions,
-            committed_at: manifest.committed_at.clone(),
-            op_summary: op_summary.to_string(),
-            changes: changes.to_vec(),
-        }
-    }
+pub(crate) trait GraphCommitStore {
+    fn read_commits(&self, db_dir: &Path) -> Result<Vec<GraphCommitRecord>>;
+}
 
-    fn tx_catalog_entry(&self) -> TxCatalogEntry {
-        TxCatalogEntry {
-            tx_id: self.tx_id.clone(),
-            db_version: self.db_version,
-            dataset_versions: self.dataset_versions.clone(),
+pub(crate) trait GraphChangeStore {
+    fn read_changes(&self, db_dir: &Path) -> Result<Vec<GraphChangeRecord>>;
+    fn read_visible_changes(
+        &self,
+        db_dir: &Path,
+        from_graph_version_exclusive: u64,
+        to_graph_version_inclusive: Option<u64>,
+    ) -> Result<Vec<GraphChangeRecord>>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct JsonlGraphStore;
+
+impl WalEntry {
+    fn graph_commit_record(&self) -> GraphCommitRecord {
+        GraphCommitRecord {
+            tx_id: self.tx_id.clone().into(),
+            graph_version: self.db_version.into(),
+            table_versions: self
+                .dataset_versions
+                .iter()
+                .map(|(table_id, version)| GraphTableVersion::new(table_id.as_str(), *version))
+                .collect(),
             committed_at: self.committed_at.clone(),
             op_summary: self.op_summary.clone(),
         }
+    }
+
+    fn graph_change_records(&self) -> Vec<GraphChangeRecord> {
+        self.changes
+            .iter()
+            .cloned()
+            .map(graph_change_from_cdc_entry)
+            .collect()
+    }
+}
+
+fn graph_commit_to_tx_catalog_entry(record: &GraphCommitRecord) -> TxCatalogEntry {
+    TxCatalogEntry {
+        tx_id: record.tx_id.as_str().to_string(),
+        db_version: record.graph_version.value(),
+        dataset_versions: record
+            .table_versions
+            .iter()
+            .map(|version| (version.table_id.as_str().to_string(), version.version))
+            .collect(),
+        committed_at: record.committed_at.clone(),
+        op_summary: record.op_summary.clone(),
+    }
+}
+
+fn graph_change_to_cdc_entry(record: GraphChangeRecord) -> CdcLogEntry {
+    CdcLogEntry {
+        tx_id: record.tx_id.as_str().to_string(),
+        db_version: record.graph_version.value(),
+        seq_in_tx: record.seq_in_tx,
+        op: record.op,
+        entity_kind: record.entity_kind,
+        type_name: record.type_name,
+        entity_key: record.entity_key,
+        payload: record.payload,
+        committed_at: record.committed_at,
+    }
+}
+
+fn graph_change_from_cdc_entry(entry: CdcLogEntry) -> GraphChangeRecord {
+    GraphChangeRecord {
+        tx_id: entry.tx_id.into(),
+        graph_version: entry.db_version.into(),
+        seq_in_tx: entry.seq_in_tx,
+        op: entry.op,
+        entity_kind: entry.entity_kind,
+        type_name: entry.type_name,
+        entity_key: entry.entity_key,
+        payload: entry.payload,
+        committed_at: entry.committed_at,
+    }
+}
+
+fn graph_commit_from_manifest(manifest: &GraphManifest, op_summary: &str) -> GraphCommitRecord {
+    GraphCommitRecord {
+        tx_id: manifest.last_tx_id.clone().into(),
+        graph_version: manifest.db_version.into(),
+        table_versions: manifest
+            .datasets
+            .iter()
+            .map(|entry| GraphTableVersion::new(entry.dataset_path.clone(), entry.dataset_version))
+            .collect(),
+        committed_at: manifest.committed_at.clone(),
+        op_summary: op_summary.to_string(),
+    }
+}
+
+fn wal_entry_from_graph_records(
+    commit: &GraphCommitRecord,
+    changes: &[GraphChangeRecord],
+) -> WalEntry {
+    WalEntry {
+        tx_id: commit.tx_id.as_str().to_string(),
+        db_version: commit.graph_version.value(),
+        dataset_versions: commit
+            .table_versions
+            .iter()
+            .map(|version| (version.table_id.as_str().to_string(), version.version))
+            .collect(),
+        committed_at: commit.committed_at.clone(),
+        op_summary: commit.op_summary.clone(),
+        changes: changes
+            .iter()
+            .cloned()
+            .map(graph_change_to_cdc_entry)
+            .collect(),
     }
 }
 
 fn wal_path(db_dir: &Path) -> PathBuf {
     db_dir.join(WAL_FILENAME)
+}
+
+impl GraphCommitStore for JsonlGraphStore {
+    fn read_commits(&self, db_dir: &Path) -> Result<Vec<GraphCommitRecord>> {
+        Ok(read_wal_entries(db_dir)?
+            .into_iter()
+            .map(|entry| entry.graph_commit_record())
+            .collect())
+    }
+}
+
+impl GraphChangeStore for JsonlGraphStore {
+    fn read_changes(&self, db_dir: &Path) -> Result<Vec<GraphChangeRecord>> {
+        Ok(flatten_graph_change_rows(read_wal_entries(db_dir)?))
+    }
+
+    fn read_visible_changes(
+        &self,
+        db_dir: &Path,
+        from_graph_version_exclusive: u64,
+        to_graph_version_inclusive: Option<u64>,
+    ) -> Result<Vec<GraphChangeRecord>> {
+        read_visible_graph_change_records(
+            db_dir,
+            from_graph_version_exclusive,
+            to_graph_version_inclusive,
+        )
+    }
 }
 
 fn repair_wal_log(db_dir: &Path) -> Result<()> {
@@ -120,14 +240,19 @@ pub fn read_wal_entries(db_dir: &Path) -> Result<Vec<WalEntry>> {
 }
 
 pub fn read_tx_catalog_entries(db_dir: &Path) -> Result<Vec<TxCatalogEntry>> {
-    Ok(read_wal_entries(db_dir)?
+    Ok(JsonlGraphStore
+        .read_commits(db_dir)?
         .into_iter()
-        .map(|entry| entry.tx_catalog_entry())
+        .map(|entry| graph_commit_to_tx_catalog_entry(&entry))
         .collect())
 }
 
 pub(crate) fn read_cdc_log_entries(db_dir: &Path) -> Result<Vec<CdcLogEntry>> {
-    Ok(flatten_cdc_rows(read_wal_entries(db_dir)?))
+    Ok(JsonlGraphStore
+        .read_changes(db_dir)?
+        .into_iter()
+        .map(graph_change_to_cdc_entry)
+        .collect())
 }
 
 /// Read CDC rows that are visible through the committed manifest window.
@@ -141,21 +266,11 @@ pub fn read_visible_cdc_entries(
     from_db_version_exclusive: u64,
     to_db_version_inclusive: Option<u64>,
 ) -> Result<Vec<CdcLogEntry>> {
-    let manifest = GraphManifest::read(db_dir)?;
-    reconcile_logs_to_manifest(db_dir, manifest.db_version)?;
-
-    let upper = to_db_version_inclusive
-        .unwrap_or(manifest.db_version)
-        .min(manifest.db_version);
-    if upper <= from_db_version_exclusive {
-        return Ok(Vec::new());
-    }
-
-    let visible = read_wal_entries(db_dir)?
+    Ok(JsonlGraphStore
+        .read_visible_changes(db_dir, from_db_version_exclusive, to_db_version_inclusive)?
         .into_iter()
-        .filter(|entry| entry.db_version > from_db_version_exclusive && entry.db_version <= upper)
-        .collect::<Vec<_>>();
-    Ok(flatten_cdc_rows(visible))
+        .map(graph_change_to_cdc_entry)
+        .collect())
 }
 
 pub(crate) fn commit_manifest_and_logs(
@@ -164,7 +279,22 @@ pub(crate) fn commit_manifest_and_logs(
     cdc_entries: &[CdcLogEntry],
     op_summary: &str,
 ) -> Result<()> {
-    let wal_entry = WalEntry::from_manifest(manifest, op_summary, cdc_entries);
+    let graph_commit = graph_commit_from_manifest(manifest, op_summary);
+    let graph_changes = cdc_entries
+        .iter()
+        .cloned()
+        .map(graph_change_from_cdc_entry)
+        .collect::<Vec<_>>();
+    commit_graph_records_and_manifest(db_dir, &graph_commit, &graph_changes, manifest)
+}
+
+pub(crate) fn commit_graph_records_and_manifest(
+    db_dir: &Path,
+    graph_commit: &GraphCommitRecord,
+    graph_changes: &[GraphChangeRecord],
+    manifest: &GraphManifest,
+) -> Result<()> {
+    let wal_entry = wal_entry_from_graph_records(graph_commit, graph_changes);
     append_wal_entry(db_dir, &wal_entry)?;
     manifest.write_atomic(db_dir)?;
     Ok(())
@@ -226,16 +356,51 @@ pub(crate) fn prune_logs_for_replay_window(
     })
 }
 
-fn flatten_cdc_rows(entries: Vec<WalEntry>) -> Vec<CdcLogEntry> {
-    let mut rows: Vec<CdcLogEntry> = entries
+pub(crate) fn read_visible_graph_commit_records(db_dir: &Path) -> Result<Vec<GraphCommitRecord>> {
+    let manifest = GraphManifest::read(db_dir)?;
+    reconcile_logs_to_manifest(db_dir, manifest.db_version)?;
+    Ok(read_wal_entries(db_dir)?
         .into_iter()
-        .flat_map(|entry| entry.changes.into_iter())
+        .filter(|entry| entry.db_version <= manifest.db_version)
+        .map(|entry| entry.graph_commit_record())
+        .collect())
+}
+
+pub(crate) fn read_visible_graph_change_records(
+    db_dir: &Path,
+    from_graph_version_exclusive: u64,
+    to_graph_version_inclusive: Option<u64>,
+) -> Result<Vec<GraphChangeRecord>> {
+    let manifest = GraphManifest::read(db_dir)?;
+    reconcile_logs_to_manifest(db_dir, manifest.db_version)?;
+
+    let upper = to_graph_version_inclusive
+        .unwrap_or(manifest.db_version)
+        .min(manifest.db_version);
+    if upper <= from_graph_version_exclusive {
+        return Ok(Vec::new());
+    }
+
+    let visible = read_wal_entries(db_dir)?
+        .into_iter()
+        .filter(|entry| {
+            entry.db_version > from_graph_version_exclusive && entry.db_version <= upper
+        })
+        .collect::<Vec<_>>();
+    Ok(flatten_graph_change_rows(visible))
+}
+
+fn flatten_graph_change_rows(entries: Vec<WalEntry>) -> Vec<GraphChangeRecord> {
+    let mut rows: Vec<GraphChangeRecord> = entries
+        .into_iter()
+        .flat_map(|entry| entry.graph_change_records().into_iter())
         .collect();
     rows.sort_by(|a, b| {
-        a.db_version
-            .cmp(&b.db_version)
+        a.graph_version
+            .value()
+            .cmp(&b.graph_version.value())
             .then(a.seq_in_tx.cmp(&b.seq_in_tx))
-            .then(a.tx_id.cmp(&b.tx_id))
+            .then(a.tx_id.as_str().cmp(b.tx_id.as_str()))
     });
     rows
 }
@@ -575,6 +740,51 @@ mod tests {
         let rows_range_2_only = read_visible_cdc_entries(dir.path(), 1, Some(2)).unwrap();
         assert_eq!(rows_range_2_only.len(), 1);
         assert_eq!(rows_range_2_only[0].entity_key, "Bob");
+    }
+
+    #[test]
+    fn jsonl_graph_store_projects_commit_and_change_records() {
+        let dir = TempDir::new().unwrap();
+        let manifest = sample_manifest(1);
+        let cdc = vec![sample_cdc("manifest-1", 1, 0, "Alice")];
+
+        commit_manifest_and_logs(dir.path(), &manifest, &cdc, "test_commit").unwrap();
+
+        let commits = JsonlGraphStore.read_commits(dir.path()).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].tx_id.as_str(), "manifest-1");
+        assert_eq!(commits[0].graph_version.value(), 1);
+        assert_eq!(commits[0].op_summary, "test_commit");
+
+        let changes = JsonlGraphStore.read_changes(dir.path()).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity_key, "Alice");
+        assert_eq!(changes[0].graph_version.value(), 1);
+    }
+
+    #[test]
+    fn visible_graph_change_records_honor_version_window() {
+        let dir = TempDir::new().unwrap();
+
+        commit_manifest_and_logs(
+            dir.path(),
+            &sample_manifest(1),
+            &[sample_cdc("manifest-1", 1, 0, "Alice")],
+            "tx1",
+        )
+        .unwrap();
+        commit_manifest_and_logs(
+            dir.path(),
+            &sample_manifest(2),
+            &[sample_cdc("manifest-2", 2, 0, "Bob")],
+            "tx2",
+        )
+        .unwrap();
+
+        let rows = read_visible_graph_change_records(dir.path(), 1, Some(2)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_key, "Bob");
+        assert_eq!(rows[0].graph_version.value(), 2);
     }
 
     #[test]

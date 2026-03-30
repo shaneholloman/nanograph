@@ -53,7 +53,7 @@ Typed decode overloads are available for `run/check/describe`. `runArrow(...)` r
 - `decodeArrow(_ data: Data) -> Any`
 - `decodeArrow(_:from:) -> T`
 
-## Media nodes and multimodal embeddings
+## Media nodes and external assets
 
 NanoGraph stores media as external URIs. The Swift wrapper now includes:
 
@@ -63,7 +63,6 @@ NanoGraph stores media as external URIs. The Swift wrapper now includes:
 - `LoadRow.node(...)`
 - `LoadRow.edge(...)`
 - `Database.loadRows(_:mode:)`
-- `Database.embed(options:)`
 
 Example:
 
@@ -75,7 +74,6 @@ node PhotoAsset {
   slug: String @key
   uri: String @media_uri(mime)
   mime: String
-  embedding: Vector(768)? @embed(uri) @index
 }
 
 node Product {
@@ -93,8 +91,6 @@ query products_from_image_search($q: String) {
     $product hasPhoto $img
   }
   return { $product.slug as product, $img.slug as image, $img.uri as uri }
-  order { nearest($img.embedding, $q) }
-  limit 5
 }
 """
 
@@ -104,7 +100,6 @@ try db.loadRows([
   .node(type: "PhotoAsset", data: [
     "slug": "space",
     "uri": MediaRef.file("/absolute/path/space.jpg", mimeType: "image/jpeg"),
-    "embedding": Array(repeating: 0.0, count: 768),
   ]),
   .node(type: "Product", data: [
     "slug": "rocket",
@@ -112,15 +107,6 @@ try db.loadRows([
   ]),
   .edge(type: "HasPhoto", from: "rocket", to: "space", data: [:]),
 ], mode: .overwrite)
-
-setenv("NANOGRAPH_EMBED_PROVIDER", "gemini", 1)
-setenv("NANOGRAPH_EMBED_MODEL", "gemini-embedding-2-preview", 1)
-setenv("GEMINI_API_KEY", "...", 1)
-
-let embedResult = try db.embed(EmbedResult.self, options: EmbedOptions(
-  typeName: "PhotoAsset",
-  property: "embedding"
-))
 
 let rows = try db.run(
   querySource: queries,
@@ -130,3 +116,4 @@ let rows = try db.run(
 ```
 
 `describe()` now includes `mediaMimeProp` for `@media_uri(...)` properties, so SDK callers can detect media URI fields and their sibling mime properties.
+OpenAI embeddings remain text-only today. Use Gemini when you want NanoGraph to generate media embeddings from `@media_uri(...)` sources.

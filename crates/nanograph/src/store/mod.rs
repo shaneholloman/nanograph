@@ -1,5 +1,7 @@
 pub mod database;
 pub mod export;
+pub(crate) mod graph_mirror;
+pub(crate) mod graph_types;
 pub(crate) mod lance_io;
 pub mod manifest;
 pub mod metadata;

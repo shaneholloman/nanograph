@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
+use async_trait::async_trait;
 use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
@@ -9,6 +10,7 @@ use lance_file::version::LanceFileVersion;
 use tracing::info;
 
 use crate::error::{NanoError, Result};
+use crate::store::graph_types::{GraphTableId, GraphTableVersion};
 
 pub(crate) const LANCE_INTERNAL_ID_FIELD: &str = "__ng_id";
 pub(crate) const LANCE_INTERNAL_SRC_FIELD: &str = "__ng_src";
@@ -26,6 +28,40 @@ pub(crate) fn logical_node_field_to_lance(field_name: &str) -> &str {
     match field_name {
         "id" => LANCE_INTERNAL_ID_FIELD,
         other => other,
+    }
+}
+
+pub(crate) fn graph_table_id_for_path(path: &Path) -> GraphTableId {
+    GraphTableId(path.to_string_lossy().to_string())
+}
+
+#[async_trait]
+pub(crate) trait TableStore {
+    async fn overwrite(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion>;
+    async fn append(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion>;
+    async fn merge_insert_with_key(
+        &self,
+        path: &Path,
+        pinned_version: &GraphTableVersion,
+        source_batch: RecordBatch,
+        key_prop: &str,
+    ) -> Result<GraphTableVersion>;
+    async fn delete_by_ids(
+        &self,
+        path: &Path,
+        pinned_version: &GraphTableVersion,
+        ids: &[u64],
+    ) -> Result<GraphTableVersion>;
+    async fn latest_version(&self, path: &Path) -> Result<GraphTableVersion>;
+    async fn read_all_batches(&self, version: &GraphTableVersion) -> Result<Vec<RecordBatch>>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct V3TableStore;
+
+impl V3TableStore {
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -115,28 +151,61 @@ fn lance_batch_to_logical(batch: &RecordBatch, kind: LanceDatasetKind) -> Result
 }
 
 pub(crate) async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<u64> {
-    write_lance_batch_with_mode(path, batch, WriteMode::Overwrite).await
+    Ok(
+        write_lance_batch_with_mode_versioned(path, batch, WriteMode::Overwrite)
+            .await?
+            .version,
+    )
 }
 
+#[allow(dead_code)]
 pub(crate) async fn write_lance_batch_with_mode(
     path: &Path,
     batch: RecordBatch,
     mode: WriteMode,
 ) -> Result<u64> {
+    Ok(write_lance_batch_with_mode_versioned(path, batch, mode)
+        .await?
+        .version)
+}
+
+async fn write_lance_batch_with_mode_versioned(
+    path: &Path,
+    batch: RecordBatch,
+    mode: WriteMode,
+) -> Result<GraphTableVersion> {
     let storage_version = if path.exists() || matches!(mode, WriteMode::Append) {
         None
     } else {
         Some(DEFAULT_NEW_DATASET_STORAGE_VERSION)
     };
-    write_lance_batch_with_mode_and_storage_version(path, batch, mode, storage_version).await
+    write_lance_batch_with_mode_and_storage_version_versioned(path, batch, mode, storage_version)
+        .await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn write_lance_batch_with_mode_and_storage_version(
     path: &Path,
     batch: RecordBatch,
     mode: WriteMode,
     storage_version: Option<LanceFileVersion>,
 ) -> Result<u64> {
+    Ok(write_lance_batch_with_mode_and_storage_version_versioned(
+        path,
+        batch,
+        mode,
+        storage_version,
+    )
+    .await?
+    .version)
+}
+
+async fn write_lance_batch_with_mode_and_storage_version_versioned(
+    path: &Path,
+    batch: RecordBatch,
+    mode: WriteMode,
+    storage_version: Option<LanceFileVersion>,
+) -> Result<GraphTableVersion> {
     info!(
         dataset_path = %path.display(),
         rows = batch.num_rows(),
@@ -165,27 +234,47 @@ pub(crate) async fn write_lance_batch_with_mode_and_storage_version(
         .await
         .map_err(|e| NanoError::Lance(format!("write error: {}", e)))?;
 
-    Ok(dataset.version().version)
+    Ok(GraphTableVersion::new(
+        graph_table_id_for_path(path),
+        dataset.version().version,
+    ))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_lance_merge_insert_with_key(
     dataset_path: &Path,
     pinned_version: u64,
     source_batch: RecordBatch,
     key_prop: &str,
 ) -> Result<u64> {
+    Ok(run_lance_merge_insert_with_key_versioned(
+        dataset_path,
+        &GraphTableVersion::new(graph_table_id_for_path(dataset_path), pinned_version),
+        source_batch,
+        key_prop,
+    )
+    .await?
+    .version)
+}
+
+async fn run_lance_merge_insert_with_key_versioned(
+    dataset_path: &Path,
+    pinned_version: &GraphTableVersion,
+    source_batch: RecordBatch,
+    key_prop: &str,
+) -> Result<GraphTableVersion> {
     let kind = lance_dataset_kind(dataset_path);
     let uri = dataset_path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("merge open error: {}", e)))?;
     let dataset = dataset
-        .checkout_version(pinned_version)
+        .checkout_version(pinned_version.version)
         .await
         .map_err(|e| {
             NanoError::Lance(format!(
                 "merge checkout version {} error: {}",
-                pinned_version, e
+                pinned_version.version, e
             ))
         })?;
 
@@ -210,16 +299,34 @@ pub(crate) async fn run_lance_merge_insert_with_key(
         .await
         .map_err(|e| NanoError::Lance(format!("merge execute error: {}", e)))?;
 
-    Ok(merged_dataset.version().version)
+    Ok(GraphTableVersion::new(
+        graph_table_id_for_path(dataset_path),
+        merged_dataset.version().version,
+    ))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_lance_delete_by_ids(
     dataset_path: &Path,
     pinned_version: u64,
     ids: &[u64],
 ) -> Result<u64> {
+    Ok(run_lance_delete_by_ids_versioned(
+        dataset_path,
+        &GraphTableVersion::new(graph_table_id_for_path(dataset_path), pinned_version),
+        ids,
+    )
+    .await?
+    .version)
+}
+
+async fn run_lance_delete_by_ids_versioned(
+    dataset_path: &Path,
+    pinned_version: &GraphTableVersion,
+    ids: &[u64],
+) -> Result<GraphTableVersion> {
     if ids.is_empty() {
-        return Ok(pinned_version);
+        return Ok(pinned_version.clone());
     }
 
     let uri = dataset_path.to_string_lossy().to_string();
@@ -227,12 +334,12 @@ pub(crate) async fn run_lance_delete_by_ids(
         .await
         .map_err(|e| NanoError::Lance(format!("delete open error: {}", e)))?;
     let mut dataset = dataset
-        .checkout_version(pinned_version)
+        .checkout_version(pinned_version.version)
         .await
         .map_err(|e| {
             NanoError::Lance(format!(
                 "delete checkout version {} error: {}",
-                pinned_version, e
+                pinned_version.version, e
             ))
         })?;
 
@@ -246,34 +353,56 @@ pub(crate) async fn run_lance_delete_by_ids(
         .await
         .map_err(|e| NanoError::Lance(format!("delete execute error: {}", e)))?;
 
-    Ok(dataset.version().version)
+    Ok(GraphTableVersion::new(
+        graph_table_id_for_path(dataset_path),
+        dataset.version().version,
+    ))
 }
 
 pub(crate) async fn latest_lance_dataset_version(path: &Path) -> Result<u64> {
+    Ok(latest_lance_dataset_graph_version(path).await?.version)
+}
+
+async fn latest_lance_dataset_graph_version(path: &Path) -> Result<GraphTableVersion> {
     let uri = path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
-    dataset
+    let version = dataset
         .latest_version_id()
         .await
-        .map_err(|e| NanoError::Lance(format!("latest version error: {}", e)))
+        .map_err(|e| NanoError::Lance(format!("latest version error: {}", e)))?;
+    Ok(GraphTableVersion::new(
+        graph_table_id_for_path(path),
+        version,
+    ))
 }
 
 pub(crate) async fn read_lance_batches(path: &Path, version: u64) -> Result<Vec<RecordBatch>> {
+    read_lance_batches_versioned(&GraphTableVersion::new(
+        graph_table_id_for_path(path),
+        version,
+    ))
+    .await
+}
+
+async fn read_lance_batches_versioned(version: &GraphTableVersion) -> Result<Vec<RecordBatch>> {
     info!(
-        dataset_path = %path.display(),
-        dataset_version = version,
+        dataset_path = %version.table_id.as_str(),
+        dataset_version = version.version,
         "reading Lance dataset"
     );
+    let path = Path::new(version.table_id.as_str());
     let uri = path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
     let dataset = dataset
-        .checkout_version(version)
+        .checkout_version(version.version)
         .await
-        .map_err(|e| NanoError::Lance(format!("checkout version {} error: {}", version, e)))?;
+        .map_err(|e| {
+            NanoError::Lance(format!("checkout version {} error: {}", version.version, e))
+        })?;
 
     let kind = lance_dataset_kind(path);
     let scanner = dataset.scan();
@@ -342,4 +471,43 @@ pub(crate) async fn read_lance_projected_batches(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(batches)
+}
+
+#[async_trait]
+impl TableStore for V3TableStore {
+    async fn overwrite(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
+        write_lance_batch_with_mode_versioned(path, batch, WriteMode::Overwrite).await
+    }
+
+    async fn append(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
+        write_lance_batch_with_mode_versioned(path, batch, WriteMode::Append).await
+    }
+
+    async fn merge_insert_with_key(
+        &self,
+        path: &Path,
+        pinned_version: &GraphTableVersion,
+        source_batch: RecordBatch,
+        key_prop: &str,
+    ) -> Result<GraphTableVersion> {
+        run_lance_merge_insert_with_key_versioned(path, pinned_version, source_batch, key_prop)
+            .await
+    }
+
+    async fn delete_by_ids(
+        &self,
+        path: &Path,
+        pinned_version: &GraphTableVersion,
+        ids: &[u64],
+    ) -> Result<GraphTableVersion> {
+        run_lance_delete_by_ids_versioned(path, pinned_version, ids).await
+    }
+
+    async fn latest_version(&self, path: &Path) -> Result<GraphTableVersion> {
+        latest_lance_dataset_graph_version(path).await
+    }
+
+    async fn read_all_batches(&self, version: &GraphTableVersion) -> Result<Vec<RecordBatch>> {
+        read_lance_batches_versioned(version).await
+    }
 }

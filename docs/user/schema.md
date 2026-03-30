@@ -116,7 +116,7 @@ title: String @description("Short human-readable label")
 | `@key` | Primary key for merge/upsert. One per node type. Auto-indexed. Required for edge endpoint resolution via `from`/`to` in JSONL data. |
 | `@unique` | Uniqueness constraint enforced on load/upsert. Multiple per type. Nullable unique allows multiple nulls. |
 | `@index` | Creates an index for the property: scalar index for scalar fields, vector index for `Vector(dim)` fields. |
-| `@embed(source_prop)` | Auto-generates embeddings when the vector field is missing/null during load or backfill. Text sources use text embeddings. `@media_uri(...)` sources use multimodal embeddings. Target must be `Vector(dim)`. See [search.md](search.md#embedding-workflow) and [blobs.md](blobs.md). |
+| `@embed(source_prop)` | Auto-generates embeddings when the vector field is missing/null during load or backfill. Text sources use text embeddings. `@media_uri(...)` sources use Gemini multimodal embeddings when Gemini is configured; OpenAI remains text-only. Target must be `Vector(dim)`. See [search.md](search.md#embedding-workflow) and [blobs.md](blobs.md). |
 | `@media_uri(mime_prop)` | Marks a `String` property as an external media URI and points to the sibling mime property. Use this for image, document, audio, or video asset nodes. See [blobs.md](blobs.md). |
 | `@rename_from("old")` | Tracks property/type renames for schema migration. |
 | `@description("...")` | Optional semantic description for node types, edge types, and properties. Intended for `describe --format json`, SDK introspection, and agent context. |

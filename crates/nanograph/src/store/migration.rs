@@ -16,6 +16,7 @@ use crate::error::{NanoError, Result};
 use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
 use crate::store::graph::DatasetAccumulator;
+use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
@@ -2704,6 +2705,7 @@ async fn write_staged_db(
     manifest.datasets = dataset_entries;
 
     commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
+    let _ = rebuild_graph_mirror_from_wal(path).await;
     Ok(())
 }
 
