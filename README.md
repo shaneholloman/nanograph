@@ -1,5 +1,7 @@
 # nanograph
 
+[![CI](https://github.com/nanograph/nanograph/actions/workflows/ci.yml/badge.svg)](https://github.com/nanograph/nanograph/actions/workflows/ci.yml)
+[![Rust: stable](https://img.shields.io/badge/rust-1.94.1%20stable-orange?logo=rust)](rust-toolchain.toml)
 [![Crates.io](https://img.shields.io/crates/v/nanograph)](https://crates.io/crates/nanograph)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -25,10 +27,10 @@ Built on Rust, Lance, Arrow, and DataFusion.
 brew install nanograph/tap/nanograph
 ```
 
-Or from source (requires [Rust](https://www.rust-lang.org/tools/install) 1.91+ and `protoc`):
+Or from source (requires [Rust](https://www.rust-lang.org/tools/install) `1.94.1` and `protoc`):
 
 ```bash
-cargo install nanograph-cli
+cargo install nanograph-cli --locked
 ```
 
 ### SDKs
@@ -43,7 +45,7 @@ cd examples/starwars
 
 nanograph init
 nanograph load --data starwars.jsonl --mode overwrite
-nanograph check --query starwars.gq
+nanograph lint --query starwars.gq
 nanograph run search "father and son conflict"
 ```
 
