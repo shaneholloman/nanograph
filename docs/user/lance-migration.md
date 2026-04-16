@@ -1,224 +1,166 @@
 ---
-title: Lance Migration
+title: Storage Migration
 slug: lance-migration
 ---
 
-# Lance Storage Format Migration
+# Storage Migration to NamespaceLineage
 
-nanograph 1.0 uses Lance v3, which writes new datasets in Lance storage format `2.2`. Databases created with earlier nanograph versions typically use Lance storage format `2.0`. Both remain readable and operational in nanograph 1.0.
+nanograph `1.2.x` defaults new graphs to `NamespaceLineage`.
 
-Note: "Lance v3" refers to the Lance SDK/library version that nanograph links against, while "format 2.0" and "format 2.2" refer to the on-disk storage format that the SDK reads and writes.
-
-## Why upgrade to v2.2
-
-### Better compression
-
-This is the biggest direct benefit for nanograph today.
-
-nanograph datasets are mostly made of:
-
-- text fields
-- enums and other repetitive categorical values
-- dates and timestamps
-- graph relationship columns
-- vector columns for embeddings
-
-Lance `2.2` improves compression coverage across these kinds of columns. In practice, that means:
-
-- less disk usage
-- cheaper backups and copies
-- less I/O during open, scan, compact, and cleanup operations
-
-### Safe gradual adoption
-
-This is the second major benefit for nanograph.
-
-nanograph 1.0 can:
-
-- create new databases on `2.2`
-- continue opening and operating existing `2.0` databases
-- avoid forcing an in-place file-format migration just to upgrade the CLI/runtime
-
-That makes adoption much less risky. You can move to nanograph 1.0 immediately, keep existing databases working, and decide later whether a logical export/rebuild migration to `2.2` is worth it for your project.
-
-## Checking your current format
+If you still have a legacy database, the supported upgrade path is:
 
 ```bash
-nanograph doctor --verbose
+nanograph storage migrate --db <db>.nano --target lineage-native
 ```
 
-The output includes a storage format column for each tracked dataset. If some datasets show `2.0`, they are still supported in nanograph 1.0. Migration to `2.2` is optional and mainly worth doing when you want the newer default format and its storage-efficiency benefits. If all datasets already show `2.2`, no migration is needed.
+This is a one-shot storage migration. nanograph copies the currently committed graph state into a fresh `NamespaceLineage` database, swaps the database root on success, and keeps the old database as a backup.
 
-## What the migration preserves and what it does not
+## What changed in 1.2
 
-**Preserved:** All node and edge records, schema, property values, and graph structure.
+New graphs no longer treat the old filesystem manifest as the source of truth.
 
-**Not preserved:**
+- Committed graph state now lives in Lance-backed internal tables, centered around `__graph_snapshot`.
+- Transaction windows live in `__graph_tx`.
+- Delete tombstones live in `__graph_deletes`.
+- Inserts and updates are reconstructed from Lance lineage instead of replaying `_wal.jsonl`.
+- Managed imported media is stored in `__blob_store` and exposed as `lanceblob://sha256/...` URIs.
 
-- **Legacy CDC history** — old WAL-style transaction and CDC logs do not survive export/reimport. The new database starts with a fresh lineage-native graph history.
-- **Dataset versions** — Lance version history is reset. Time-travel to previous dataset versions is no longer possible.
-- **Computed embeddings** — vectors from `@embed(...)` fields are stripped during export and regenerated afterward. If using a real embedding provider (`provider = "openai"`), this makes API calls.
+In simple terms: the old `graph.manifest.json` / `_wal.jsonl` mental model is legacy-only now. New graphs commit and replay from Lance-native state.
+
+## When you need to migrate
+
+Run migration when either of these is true:
+
+- `nanograph` tells you the database is legacy storage and prints `nanograph storage migrate --db ... --target lineage-native`
+- you want the new default CDC rail, Lance 4 namespace storage, and managed blob storage
+
+You do not need migration for databases that already use `NamespaceLineage`.
+
+## Recommended target
+
+Use `lineage-native` unless you are doing a very specific intermediate compatibility step.
+
+- `lineage-native` is the current default for new graphs and the recommended destination.
+- `lance-v4` is an older intermediate namespace rail. It remains available, but it is not the recommended steady state for new work.
+
+## What migration preserves
+
+Migration preserves the currently visible graph state:
+
+- nodes
+- edges
+- property values
+- schema files
+- indexes rebuilt for the migrated tables
+- remote media URIs such as `http(s)://`, `s3://`, and other provider-pass-through references
+
+## Consequences of migration
+
+Migration is intentionally not history-preserving.
+
+- Old CDC history does not carry forward. The migrated graph starts a fresh CDC epoch.
+- The migrated `graph_version` restarts from `1`.
+- Old Lance dataset version history is not preserved.
+- Old WAL-era sequencing semantics do not carry forward.
+- Scripts or tools that read or patch `graph.manifest.json` or `_wal.jsonl` must stop doing that for migrated graphs.
+- Managed imported media is rewritten into `__blob_store`; values become `lanceblob://sha256/...` instead of old filesystem-backed managed paths.
+- Unmigrated legacy databases no longer open for normal read/write in the 1.2 line. The CLI fails fast and prints the exact `storage migrate` command to run.
+
+That is the main operational tradeoff: you keep the current graph contents, but you do not keep the old storage-era history.
+
+## Backup behavior
+
+The migrator moves the original database aside before creating the new one.
+
+- Active database after success: `<db>.nano`
+- Automatic backup path: `<db>.nano.v3-backup`
+
+The backup naming is the same whether you migrate from legacy v3 storage or from the intermediate `lance-v4` rail.
+
+Migration refuses to run if the backup path already exists.
 
 ## Migration procedure
 
-The migration creates a fresh database alongside the old one. The old database is never modified until the new one is fully verified.
-
-Substitute `<db>` with the actual database name (e.g., `omni`, `starwars`, `app`).
-
-### 1. Pre-flight
+### 1. Pre-flight checks
 
 ```bash
-# Confirm migration is needed
-nanograph doctor --verbose
-
-# Record current row counts
-nanograph describe --json > /tmp/pre-migration-describe.json
-
-# Back up the database directory
-cp -r <db>.nano <db>.nano.backup
+nanograph doctor --db <db>.nano --verbose
+nanograph describe --db <db>.nano --json > /tmp/pre-migration-describe.json
 ```
 
-Do not skip the backup. If anything goes wrong, `cp -r <db>.nano.backup <db>.nano` restores the original.
+Record the current row counts and keep a note of any managed media types in the graph.
 
-### 2. Export
-
-Export the full graph without embeddings. Embedding vectors are stripped because they will be regenerated cleanly in step 5.
+### 2. Run the migration
 
 ```bash
-nanograph export --db <db>.nano --format jsonl --no-embeddings > <db>-export.jsonl
+nanograph storage migrate --db <db>.nano --target lineage-native
 ```
 
-### 3. Validate the export
+On success, the command reports:
 
-Compare node and edge counts against the live database:
+- `db_path`
+- `backup_path`
+- `graph_version`
+- `node_tables`
+- `edge_tables`
+- `media_uris_rewritten`
+
+`media_uris_rewritten` counts imported managed media values that were moved into `__blob_store`.
+
+### 3. Verify the migrated database
 
 ```bash
-grep -c '"type"' <db>-export.jsonl    # node count
-grep -c '"edge"' <db>-export.jsonl    # edge count
-nanograph describe --db <db>.nano     # compare
+nanograph version --db <db>.nano
+nanograph doctor --db <db>.nano --verbose
+nanograph describe --db <db>.nano --json > /tmp/post-migration-describe.json
+nanograph changes --db <db>.nano --format json
 ```
 
-If the schema has been updated since the last load, some exported records may contain values that are invalid under the current schema (e.g., old enum values). Check the export against the schema and fix any mismatches with targeted `jq` or `sed` before loading. Document what was fixed.
+Validate:
 
-### 4. Create a new database
+- row counts per node and edge type match pre-migration
+- the database opens and is writable
+- `changes` returns lineage-native rows
+- expected managed media values now use `lanceblob://sha256/...`
 
-Initialize from the current schema. Use a temporary name — never overwrite the original until verification is complete.
+Run your normal smoke queries too:
 
 ```bash
-nanograph init --db <db>-v2.nano --schema <schema_path>
+nanograph run --db <db>.nano --query queries.gq --name <query> --param key=value
 ```
 
-Use the schema from `nanograph.toml`'s `schema.default_path`, or from `<db>.nano/schema.pg` if the project does not keep a separate schema file.
+### 4. Keep the backup until you trust the new graph
 
-### 5. Load the exported data
+Do not delete `<db>.nano.v3-backup` immediately. Keep it until:
 
-```bash
-nanograph load --db <db>-v2.nano --data <db>-export.jsonl --mode overwrite
-```
-
-If the load fails with schema validation errors, fix the export (step 3) and retry.
-
-### 6. Regenerate embeddings
-
-If the schema has any `@embed(...)` properties:
-
-```bash
-nanograph embed --db <db>-v2.nano
-```
-
-With `provider = "mock"`, this is instant. With `provider = "openai"`, this makes API calls proportional to the data volume. Scope to a single type with `--type <NodeType>` if needed.
-
-### 7. Verify
-
-```bash
-# Confirm v2.2 format
-nanograph doctor --db <db>-v2.nano --verbose
-
-# Compare row counts
-nanograph describe --db <db>-v2.nano --json > /tmp/post-migration-describe.json
-
-# Integrity check
-nanograph doctor --db <db>-v2.nano
-```
-
-Compare row counts between `/tmp/pre-migration-describe.json` and `/tmp/post-migration-describe.json`. Every node and edge type should match.
-
-Run smoke queries — especially search, traversal, and aggregation:
-
-```bash
-nanograph run search "test query" --db <db>-v2.nano
-nanograph run --db <db>-v2.nano --query queries.gq --name <query> --param key=value
-```
-
-If any check fails, stop. The old database is untouched.
-
-### 8. Swap
-
-Only after all verification passes:
-
-```bash
-mv <db>.nano <db>.nano.old
-mv <db>-v2.nano <db>.nano
-```
-
-If `nanograph.toml` uses `db.default_path`, no config change is needed — the path has not changed.
-
-### 9. Final verification
-
-```bash
-nanograph doctor --verbose
-nanograph describe
-```
-
-### 10. Clean up
-
-Once confident the migration succeeded:
-
-```bash
-rm -rf <db>.nano.backup
-rm -rf <db>.nano.old
-rm <db>-export.jsonl
-rm /tmp/pre-migration-describe.json /tmp/post-migration-describe.json
-```
-
-Keep the backup for at least a day before deleting.
+- smoke queries pass
+- search and embeddings behave correctly
+- media-backed records resolve correctly
+- downstream tools no longer depend on the old WAL/manifest layout
 
 ## Rollback
 
-**Before step 8** (swap): the old database is still in place. Clean up the failed attempt:
+If post-migration verification fails, restore the backup:
 
 ```bash
-rm -rf <db>-v2.nano
-rm <db>-export.jsonl
+mv <db>.nano <db>.nano.failed
+mv <db>.nano.v3-backup <db>.nano
 ```
 
-**After step 8** (swap): restore from backup:
+If the migration command itself fails, nanograph tries to restore the original database automatically.
 
-```bash
-rm -rf <db>.nano
-mv <db>.nano.old <db>.nano
-```
+## Operator notes
 
-## Checklist
+These are the behavior changes that matter most after migration:
 
-- [ ] `doctor --verbose` confirms the current storage format (`2.0` or `2.2`)
-- [ ] Backup created (`<db>.nano.backup`)
-- [ ] Pre-migration row counts saved
-- [ ] Export completed with `--no-embeddings`
-- [ ] Export counts match live database
-- [ ] New database initialized from current schema
-- [ ] Data loaded into new database
-- [ ] Embeddings regenerated (if applicable)
-- [ ] New database shows v2.2 in `doctor --verbose`
-- [ ] Row counts match between old and new
-- [ ] `doctor` passes on new database
-- [ ] Smoke queries return expected results
-- [ ] Databases swapped
-- [ ] Final `doctor` and `describe` pass
-- [ ] Backup and old database cleaned up
+- `changes` is lineage-native for new graphs. Ordering is deterministic, but there is no old `seq_in_tx` contract.
+- `cleanup --retain-tx-versions N` is the main CDC retention control. nanograph derives the necessary Lance history automatically.
+- `compact` and `doctor` operate against the committed Lance snapshot and retained lineage windows.
+- Managed imported media is now database-managed. `NANOGRAPH_MEDIA_ROOT` is legacy input for migration, not the active steady-state storage model.
 
 ## See also
 
 - [Best Practices](best-practices.md)
-- [CLI Reference](cli-reference.md) — `doctor`, `export`, `embed` command details
-- [Search Guide](search.md) — embedding workflow
+- [CLI Reference](cli-reference.md)
+- [Blobs](blobs.md)
+- [Embeddings](embeddings.md)

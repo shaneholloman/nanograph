@@ -469,11 +469,17 @@ brew upgrade nanograph
 
 When something behaves unexpectedly, check the CLI version first.
 
-### Lance storage format
+### Storage generation
 
-nanograph 1.0 uses Lance v3, which writes datasets in storage format v2.2. Databases created with earlier versions use format v2. Both formats are readable, but v2.2 is required for new Lance features. Check with `nanograph doctor --verbose`.
+nanograph `1.2.x` uses `NamespaceLineage` for new graphs. That means committed graph state, CDC windows, and managed blobs now live on Lance-native rails instead of the old `graph.manifest.json` + `_wal.jsonl` layout.
 
-See [Lance Migration](lance-migration.md) for the upgrade procedure and a summary of v2.2 improvements.
+If a database is still on legacy storage, do not try to patch the old files by hand. Run:
+
+```bash
+nanograph storage migrate --db <db>.nano --target lineage-native
+```
+
+See [Lance Migration](lance-migration.md) for what the migration preserves, what it resets, and how rollback works.
 
 ## Agent output
 

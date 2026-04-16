@@ -25,17 +25,17 @@ See [Project Config](config.md) for `nanograph.toml`, `.env.nano`, alias syntax,
 
 ### `version`
 
-Show CLI version and optional database manifest/dataset version info.
+Show CLI version and optional database version information.
 
 ```bash
 nanograph version [--db <db_path>]
 ```
 
-With `--db` or `db.default_path`, includes current manifest `db_version` and per-dataset Lance versions.
+With `--db` or `db.default_path`, includes current `db_version` and per-table Lance versions. On legacy graphs that version comes from `graph.manifest.json`; on new `NamespaceLineage` graphs it comes from the committed graph snapshot stored in Lance.
 
 ### `describe`
 
-Describe schema + manifest summary for a database.
+Describe schema plus the current committed graph summary for a database.
 
 ```bash
 nanograph describe [--db <db_path>] [--format table|json] [--type <TypeName>] [--verbose]
@@ -43,7 +43,7 @@ nanograph describe [--db <db_path>] [--format table|json] [--type <TypeName>] [-
 
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 
-`--type` filters the output down to a single node or edge type. `--verbose` expands the human table view with manifest, schema hash, type IDs, dataset versions, and dataset paths. JSON output includes agent-facing schema metadata such as `description`, `instruction`, derived key properties, unique properties, relationship summaries, and edge endpoint keys.
+`--type` filters the output down to a single node or edge type. `--verbose` expands the human table view with graph version, schema hash, type IDs, dataset versions, and dataset paths. JSON output includes agent-facing schema metadata such as `description`, `instruction`, derived key properties, unique properties, relationship summaries, and edge endpoint keys.
 
 ### `schema-diff`
 
@@ -77,7 +77,7 @@ Create a new database from a schema file.
 nanograph init [--db <db_path>] [--schema <schema.pg>]
 ```
 
-Creates the `<db_path>/` directory with `schema.pg`, `schema.ir.json`, and an empty manifest.
+Creates the `<db_path>/` directory with `schema.pg`, `schema.ir.json`, and an empty database. New graphs default to `NamespaceLineage`, which stores the committed snapshot in Lance-backed internal tables rather than an active filesystem `graph.manifest.json`.
 
 When missing, `init` also scaffolds `nanograph.toml` and `.env.nano` in the inferred project directory shared by the DB path and schema path. `nanograph.toml` is for shared defaults; `.env.nano` is for local secrets like `OPENAI_API_KEY`.
 
@@ -279,7 +279,7 @@ For new graphs, nanograph uses the `NamespaceLineage` storage generation by defa
 
 ### `compact`
 
-Compact manifest-tracked Lance datasets and commit updated pinned versions.
+Compact active Lance tables and commit updated visible versions.
 
 ```bash
 nanograph compact [--db <db_path>] [--target-rows-per-fragment <n>] [--materialize-deletions <bool>] [--materialize-deletions-threshold <f32>]
@@ -300,7 +300,7 @@ For new `NamespaceLineage` graphs, `retain-tx-versions` is the primary retention
 
 ### `doctor`
 
-Validate manifest/dataset/log consistency and graph integrity.
+Validate committed graph metadata, datasets, CDC or lineage state, and graph integrity.
 Also reports the Lance storage format used by each tracked dataset.
 
 ```bash
@@ -311,6 +311,24 @@ Returns non-zero when issues are detected.
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 With `--schema`, `doctor` also compares the current DB schema against the desired schema file and reports drift as part of the health check. This is useful when queries have been updated ahead of the database schema.
 Use `--verbose` to show per-dataset Lance storage formats in human output. JSON output always includes `dataset_storage_formats`.
+
+### `storage migrate`
+
+Run a one-shot storage generation migration for an existing database.
+
+```bash
+nanograph storage migrate [--db <db_path>] --target <lineage-native|lance-v4>
+```
+
+If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+
+- `lineage-native` is the recommended target and the default storage generation for new graphs.
+- `lance-v4` is an intermediate namespace storage rail kept for compatibility workflows.
+- The migrator copies the currently committed graph state only.
+- The migrator keeps the previous database at `<db_path>.v3-backup`.
+- Migrating to `lineage-native` starts a fresh CDC epoch, rewrites imported managed media into `__blob_store`, and moves new change replay onto Lance lineage plus `__graph_deletes`.
+
+See [Storage Migration](lance-migration.md) for the operational consequences and rollback procedure.
 
 ### `cdc-materialize`
 
